@@ -105,6 +105,90 @@ const std::vector<Refusal> Refusals = {
      "image_get_lod requires a pixel or compute shader"},
 };
 
+struct MinLodCase {
+	const char*           name;
+	std::vector<uint32_t> words;
+	bool                  gradients;
+};
+
+const std::vector<MinLodCase> MinLodCases = {
+    {"image-sample-cl", {0xf0840108u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u}, false},
+    {"image-sample-b-cl", {0xf0980108u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u}, false},
+    {"image-sample-d-cl", {0xf08c0108u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u}, true},
+};
+
+struct MinLodScan {
+	bool capability   = false;
+	bool operand      = false;
+	bool query        = false;
+	bool explicit_lod = false;
+	bool gradients    = false;
+};
+
+MinLodScan ScanMinLod(const std::vector<uint32_t>& words) {
+	MinLodScan scan;
+	for (size_t offset = 5; offset < words.size();) {
+		const uint32_t count = words[offset] >> 16u;
+		if (count == 0u || count > words.size() - offset) break;
+		const auto opcode = static_cast<spv::Op>(words[offset] & 0xffffu);
+		scan.capability |= opcode == spv::OpCapability && words[offset + 1u] == spv::CapabilityMinLod;
+		scan.query |= opcode == spv::OpImageQueryLod;
+		const bool sample = opcode == spv::OpImageSampleImplicitLod || opcode == spv::OpImageSampleExplicitLod;
+		const bool dref   = opcode == spv::OpImageSampleDrefImplicitLod || opcode == spv::OpImageSampleDrefExplicitLod;
+		const uint32_t mask_at = dref ? 6u : 5u;
+		if ((sample || dref) && count > mask_at) {
+			const uint32_t mask = words[offset + mask_at];
+			scan.operand |= (mask & spv::ImageOperandsMinLodMask) != 0u;
+			scan.gradients |= (mask & spv::ImageOperandsGradMask) != 0u;
+			scan.explicit_lod |= (opcode == spv::OpImageSampleExplicitLod || opcode == spv::OpImageSampleDrefExplicitLod) &&
+			                     (mask & spv::ImageOperandsLodMask) != 0u;
+		}
+		offset += count;
+	}
+	return scan;
+}
+
+bool MinLodFallback() {
+	bool ok = true;
+	for (const auto& entry: MinLodCases) {
+		for (const bool native: {true, false}) {
+			const std::string what = std::string(entry.name) + (native ? " with" : " without") + " shaderResourceMinLod";
+			auto profile = KytyFuzz::Profile();
+			profile.shader_resource_min_lod = native;
+			std::vector<uint32_t> spirv;
+			std::string           refusal;
+			bool                  emitted = false;
+			KytyFuzz::Run(entry.words, 0x04, 0x00, &refusal, &emitted, &profile, &spirv);
+			if (!emitted) {
+				std::printf("min-lod-fallback: FAILED, %s did not emit SPIR-V: %s\n", what.c_str(), refusal.c_str());
+				ok = false;
+				continue;
+			}
+			std::string message;
+			if (!KytyFuzz::Valid(spirv, message)) {
+				std::printf("min-lod-fallback: FAILED, %s is not valid SPIR-V: %s\n", what.c_str(), message.c_str());
+				ok = false;
+				continue;
+			}
+			const auto scan = ScanMinLod(spirv);
+			bool expected = false;
+			if (native) {
+				expected = scan.capability && scan.operand;
+			} else if (entry.gradients) {
+				expected = !scan.capability && !scan.operand && scan.gradients;
+			} else {
+				expected = !scan.capability && !scan.operand && scan.query && scan.explicit_lod;
+			}
+			if (!expected) {
+				std::printf("min-lod-fallback: FAILED, %s: capability=%d operand=%d query=%d explicit_lod=%d gradients=%d\n",
+				            what.c_str(), scan.capability, scan.operand, scan.query, scan.explicit_lod, scan.gradients);
+				ok = false;
+			}
+		}
+	}
+	return ok;
+}
+
 struct ModeWrite {
 	uint32_t word;
 	uint32_t bits;
@@ -196,6 +280,11 @@ int main(int argc, char** argv) {
 		found = true;
 		if (!FlatOffsets()) return 1;
 		std::printf("flat-offsets: ok\n");
+	}
+	if (argc < 2 || std::string_view(argv[1]) == "min-lod-fallback") {
+		found = true;
+		if (!MinLodFallback()) return 1;
+		std::printf("min-lod-fallback: ok\n");
 	}
 	for (const auto& entry: Cases) {
 		if (argc >= 2 && std::string_view(argv[1]) != entry.name) continue;
