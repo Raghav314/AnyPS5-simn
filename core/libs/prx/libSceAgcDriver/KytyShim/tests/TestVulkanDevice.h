@@ -15,7 +15,7 @@ struct TestVulkanDevice {
 	vk::detail::DynamicLoader loader;
 	Libs::Graphics::GraphicContext graphics;
 
-	const char* Initialize(bool require_tiling = false) {
+	const char* Initialize(bool require_tiling = false, bool sparse_buffers = false) {
 		if (!loader.success()) {
 			return "Vulkan loader unavailable";
 		}
@@ -36,7 +36,7 @@ struct TestVulkanDevice {
 			return "Vulkan device enumeration failed";
 		}
 		for (const auto device : devices.value) {
-			if (InitializeDevice(device, require_tiling)) {
+			if (InitializeDevice(device, require_tiling, sparse_buffers)) {
 				return nullptr;
 			}
 		}
@@ -56,7 +56,7 @@ struct TestVulkanDevice {
 	}
 
 private:
-	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling) {
+	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling, bool sparse_buffers) {
 		vk::PhysicalDeviceVulkan12Properties limits {};
 		vk::PhysicalDeviceVulkan11Properties properties11 {.pNext = &limits};
 		vk::PhysicalDeviceProperties2 properties {.pNext = &properties11};
@@ -117,10 +117,16 @@ private:
 		    .pNext = &features12, .storageBuffer16BitAccess = require_tiling};
 		const vk::PhysicalDeviceVulkan13Features features13 {
 		    .pNext = &features11, .synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE};
+		const bool sparse = sparse_buffers && supported.features.sparseBinding &&
+		                    supported.features.sparseResidencyBuffer &&
+		                    properties.properties.sparseProperties.residencyNonResidentStrict &&
+		                    static_cast<bool>(family->queueFlags & vk::QueueFlagBits::eSparseBinding);
 		const vk::PhysicalDeviceFeatures core_features {
 		    .sampleRateShading = VK_TRUE,
 		    .shaderStorageImageMultisample = supported.features.shaderStorageImageMultisample,
-		    .shaderInt64 = VK_TRUE};
+		    .shaderInt64 = VK_TRUE,
+		    .sparseBinding = sparse ? VK_TRUE : VK_FALSE,
+		    .sparseResidencyBuffer = sparse ? VK_TRUE : VK_FALSE};
 		const float priority = 1.0f;
 		const vk::DeviceQueueCreateInfo queue_info {
 		    .queueFamilyIndex = static_cast<uint32_t>(family - families.begin()),
@@ -145,6 +151,7 @@ private:
 		graphics.queue_family = queue_info.queueFamilyIndex;
 		graphics.device.getQueue(graphics.queue_family, 0, &graphics.queue);
 		graphics.occlusion_queries_enabled = true;
+		graphics.partial_buffers_enabled = sparse;
 		return true;
 	}
 };

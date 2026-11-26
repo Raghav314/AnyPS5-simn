@@ -58,6 +58,7 @@ public:
 #endif
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] bool               InPlace() const noexcept { return m_in_place; }
+	[[nodiscard]] bool               IsSparseResident() const noexcept { return m_sparse_block != 0; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
 		EXIT_IF(m_device_address == 0);
