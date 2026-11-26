@@ -1385,4 +1385,96 @@ bool LoadManifest(std::span<const uint8_t> bytes, PipelineManifest& manifest, ui
 	return true;
 }
 
+std::vector<ComputeRecipeVariant> SynthesizeComputeVariants(const ShaderComputeInputInfo&             base_input,
+                                                            bool                                      queue_dependent,
+                                                            const ShaderRecompiler::IR::Program&      program,
+                                                            const ShaderRecompiler::IR::ResourcePlan& plan,
+                                                            std::span<const ManifestModule>           signatures) {
+	std::vector<ComputeRecipeVariant> variants;
+	const auto add_variant = [&](const ShaderComputeInputInfo& input,
+	                             ShaderRecompiler::IR::ResourceSpecialization shape) {
+		const bool duplicate = std::ranges::any_of(variants, [&](const ComputeRecipeVariant& existing) {
+			return existing.input.async_compute == input.async_compute &&
+			       existing.input.dispatch_thread_dimensions == input.dispatch_thread_dimensions &&
+			       existing.input.dispatch_indirect_threads == input.dispatch_indirect_threads &&
+			       existing.specialization == shape;
+		});
+		if (!duplicate) {
+			variants.push_back({.input = input, .specialization = std::move(shape)});
+		}
+	};
+	const auto roots_fit = [&](const auto& slots, const auto& resources, uint32_t none) {
+		for (size_t i = 0; i < resources.size(); ++i) {
+			if (slots[i].indirect_root == none) continue;
+			const auto source = resources[i].source;
+			if (slots[i].indirect_root != i || source >= plan.descriptor_sources.size() ||
+			    !plan.descriptor_sources[source].indirect_descriptor) {
+				return false;
+			}
+		}
+		return true;
+	};
+	for (const auto& sample: signatures) {
+		const auto* sample_input = std::get_if<ShaderComputeInputInfo>(&sample.input);
+		if (sample.stage != ShaderType::Compute || sample_input == nullptr ||
+		    !ShaderRecompiler::IR::ResourceSpecializationFits(program, sample.specialization)) {
+			continue;
+		}
+		auto shape = sample.specialization;
+		if (!roots_fit(shape.images, plan.info.images, ShaderRecompiler::IR::ImageResource::NoIndirectImage) ||
+		    !roots_fit(shape.samplers, plan.info.samplers, ShaderRecompiler::IR::SamplerResource::NoIndirectSampler) ||
+		    !roots_fit(shape.buffers, plan.info.buffers, ShaderRecompiler::IR::BufferResource::NoIndirectBuffer)) {
+			continue;
+		}
+		ShaderRecompiler::IR::ReadStridesAtRunTime(plan, shape);
+		auto input                       = base_input;
+		input.dispatch_thread_dimensions = sample_input->dispatch_thread_dimensions;
+		input.dispatch_indirect_threads  = sample_input->dispatch_indirect_threads;
+		input.async_compute              = queue_dependent && sample_input->async_compute;
+		add_variant(input, std::move(shape));
+	}
+	if (!variants.empty()) {
+		return variants;
+	}
+	ShaderRecompiler::IR::ResourceSpecialization base;
+	base.buffers.resize(plan.info.buffers.size());
+	const bool has_formatted = std::ranges::any_of(plan.info.buffers, [](const auto& buffer) { return buffer.formatted; });
+	ShaderRecompiler::IR::ReadStridesAtRunTime(plan, base);
+	base.samplers.resize(plan.info.samplers.size());
+	base.images.resize(plan.info.images.size());
+	using Format    = Prospero::BufferFormat;
+	using Numeric   = Prospero::TextureNumericClass;
+	using Dimension = ShaderRecompiler::Decoder::ImageDimension;
+	const std::array<Format, 2> formatted_formats {Format::k32UInt, Format::k32Float};
+	const std::span<const Format> formats = has_formatted ? std::span<const Format>(formatted_formats)
+	                                                      : std::span<const Format>(formatted_formats).first(1);
+	for (const auto format: formats) {
+		if (has_formatted) {
+			for (size_t i = 0; i < base.buffers.size(); ++i) {
+				if (plan.info.buffers[i].formatted) base.buffers[i].descriptor_format = format;
+			}
+		}
+		for (const auto storage: {Numeric::Float, Numeric::Uint, Numeric::Sint}) {
+			for (const auto sampled: {Numeric::Float, Numeric::Uint, Numeric::Sint}) {
+				for (size_t i = 0; i < base.images.size(); ++i) {
+					const auto& resource = plan.info.images[i];
+					auto&       view     = base.images[i];
+					view.dimension       = resource.dimension == Dimension::Unknown ? Dimension::Dim2D : resource.dimension;
+					const bool storage_view = resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+					view.numeric_class      = resource.atomic ? Numeric::Uint : storage_view ? storage : sampled;
+					view.cube               = resource.cube;
+				}
+				auto input          = base_input;
+				input.async_compute = false;
+				add_variant(input, base);
+				if (queue_dependent) {
+					input.async_compute = true;
+					add_variant(input, base);
+				}
+			}
+		}
+	}
+	return variants;
+}
+
 }

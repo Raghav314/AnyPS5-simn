@@ -80,6 +80,18 @@ bool LoadManifest(std::span<const uint8_t> bytes, PipelineManifest& manifest,
 [[nodiscard]] ManifestFloatModes ReadManifestFloatModes(const HW::Shader&             shaders,
                                                         const std::array<uint64_t, 4>& stage_ids);
 
+struct ComputeRecipeVariant {
+	ShaderComputeInputInfo                       input {};
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+};
+
+[[nodiscard]] std::vector<ComputeRecipeVariant> SynthesizeComputeVariants(
+    const ShaderComputeInputInfo&             base_input,
+    bool                                      queue_dependent,
+    const ShaderRecompiler::IR::Program&      program,
+    const ShaderRecompiler::IR::ResourcePlan& plan,
+    std::span<const ManifestModule>           signatures);
+
 }
 
 #endif
