@@ -5,6 +5,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -189,6 +190,112 @@ struct PhiConstant {
 	}
 };
 
+std::optional<bool> BranchTaken(const Block& block, const Block* successor) {
+	const auto& term = block.terminator;
+	if (term.kind != CFG::TerminatorKind::ConditionalBranch || term.true_block == term.false_block) return {};
+	if (term.true_block == successor) return true;
+	if (term.false_block == successor) return false;
+	return {};
+}
+
+class PhiEdgeValue {
+public:
+	Value Resolve(Inst& value, const Block& successor, bool taken) {
+		path[0] = &successor;
+		path[1] = value.Parent();
+		condition = path[1]->condition.Resolve();
+		outcome = taken;
+		return Visit(Value(&value), 2) && !common.IsEmpty() ? common : Value(&value);
+	}
+
+private:
+	std::optional<bool> Evaluate(Value value, size_t at, size_t end) {
+		if (predicate_steps == 0) return {};
+		--predicate_steps;
+		value = value.Resolve();
+		if (IsImmediate(value, Type::U1)) return value.U1();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() == ValueOpcode::UndefU1) return {};
+		size_t definition = at;
+		while (definition < end && path[definition] != inst->Parent()) ++definition;
+		for (size_t i = std::max(at, size_t {2}); i < end && i <= definition; ++i) {
+			if (path[i]->condition.Resolve() == value) {
+				if (const auto fact = BranchTaken(*path[i], path[i - 1])) return fact;
+			}
+		}
+		if (definition == end) return {};
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::Phi:
+				if (definition + 1 == end) return {};
+				for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+					if (inst->PhiBlock(arg) == path[definition + 1])
+						return Evaluate(inst->Arg(arg), definition + 1, end);
+				return {};
+			case ValueOpcode::LogicalNot:
+				if (const auto inner = Evaluate(inst->Arg(0), definition, end)) return !*inner;
+				return {};
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr: {
+				const bool decisive = inst->GetOpcode() == ValueOpcode::LogicalOr;
+				const auto lhs = Evaluate(inst->Arg(0), definition, end);
+				if (lhs == decisive) return decisive;
+				const auto rhs = Evaluate(inst->Arg(1), definition, end);
+				if (rhs == decisive) return decisive;
+				return lhs && rhs ? std::optional<bool>{!decisive} : std::nullopt;
+			}
+			default: return {};
+		}
+	}
+
+	bool Visit(Value value, size_t end) {
+		if (paths_left == 0) return false;
+		--paths_left;
+		if (const auto actual = Evaluate(condition, 1, end); actual && *actual != outcome) return true;
+		value = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::Phi || inst->Parent() != path[end - 1]) {
+			if (value.IsEmpty()) return false;
+			if (common.IsEmpty()) common = value;
+			return common == value;
+		}
+		if (end == path.size() || inst->NumArgs() == 0) return false;
+		const std::span known(path.data(), end);
+		for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+			const auto* predecessor = inst->PhiBlock(arg);
+			if (predecessor == nullptr || std::ranges::find(known, predecessor) != known.end()) return false;
+			path[end] = predecessor;
+			if (!Visit(inst->Arg(arg), end + 1)) return false;
+		}
+		return true;
+	}
+
+	std::array<const Block*, 8> path {};
+	Value  condition;
+	Value  common;
+	bool   outcome = false;
+	size_t paths_left = 24;
+	size_t predicate_steps = 128;
+};
+
+Value IncomingPhiValue(const Inst& phi, size_t arg) {
+	const auto value = Arg(phi, arg);
+	const auto* predecessor = phi.PhiBlock(arg);
+	auto* inst = value.TryInstruction();
+	if (predecessor == nullptr || inst == nullptr || inst->GetOpcode() != ValueOpcode::Phi ||
+	    inst->Parent() != predecessor) return value;
+	const auto taken = BranchTaken(*predecessor, phi.Parent());
+	if (!taken) return value;
+	const auto* guard = predecessor->condition.Resolve().TryInstruction();
+	if (guard == nullptr) return value;
+	switch (guard->GetOpcode()) {
+		case ValueOpcode::Phi:
+		case ValueOpcode::LogicalNot:
+		case ValueOpcode::LogicalAnd:
+		case ValueOpcode::LogicalOr: return PhiEdgeValue{}.Resolve(*inst, *phi.Parent(), *taken);
+		default: return value;
+	}
+}
+
 bool FoldReachablePhis(const BlockList& blocks, FoldWorklist& worklist) {
 	if (worklist.phis.empty()) return false;
 	std::unordered_map<const Block*, const Block*> reachable;
@@ -213,6 +320,7 @@ bool FoldReachablePhis(const BlockList& blocks, FoldWorklist& worklist) {
 
 	std::unordered_map<Inst*, PhiConstant> constants;
 	std::vector<Inst*> phis;
+	std::vector<std::pair<Inst*, Inst*>> dependencies;
 	const auto enabled = [&](const Inst& phi, size_t arg) {
 		const auto edge = reachable.find(phi.PhiBlock(arg));
 		return edge != reachable.end() && (edge->second == nullptr || edge->second == phi.Parent());
@@ -226,39 +334,38 @@ bool FoldReachablePhis(const BlockList& blocks, FoldWorklist& worklist) {
 	for (auto* phi: worklist.phis) {
 		if (phi->GetOpcode() != ValueOpcode::Phi || !reachable.contains(phi->Parent())) continue;
 		PhiConstant state;
-		bool dependent = false;
+		const auto first_dependency = dependencies.size();
 		for (size_t arg = 0; arg < phi->NumArgs() && !state.varying; ++arg) {
 			if (!enabled(*phi, arg)) continue;
-			const auto source = Arg(*phi, arg);
-			const auto* inst = source.TryInstruction();
+			const auto source = IncomingPhiValue(*phi, arg);
+			auto* inst = source.TryInstruction();
 			if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
-				dependent = true;
+				dependencies.emplace_back(inst, phi);
 			} else {
 				state.Merge(source, !source.IsImmediate() || source.IsEmpty());
 			}
 		}
-		if (state.varying) continue;
-		if (dependent) {
-			constants.try_emplace(phi);
+		if (state.varying) {
+			dependencies.resize(first_dependency);
+		} else if (dependencies.size() != first_dependency) {
+			constants.try_emplace(phi, std::move(state));
 			phis.push_back(phi);
 		} else if (!state.value.IsEmpty()) {
 			fold(*phi, state.value);
 		}
 	}
+	for (const auto& [from, to]: dependencies) {
+		auto& state = constants.at(to);
+		const auto source = Value(from).Resolve();
+		if (const auto entry = constants.find(source.TryInstruction()); entry != constants.end()) {
+			entry->second.users.push_back(&state);
+		} else {
+			state.Merge(source, !source.IsImmediate() || source.IsEmpty());
+		}
+	}
 	std::vector<PhiConstant*> pending;
 	for (auto* phi: phis) {
 		auto& state = constants.at(phi);
-		for (size_t arg = 0; arg < phi->NumArgs(); ++arg) {
-			if (!enabled(*phi, arg)) continue;
-			const auto source = Arg(*phi, arg);
-			if (const auto from = constants.find(source.TryInstruction()); from != constants.end()) {
-				from->second.users.push_back(&state);
-			} else if (source.IsImmediate() && !source.IsEmpty()) {
-				state.Merge(source, false);
-			} else {
-				state.Merge({}, true);
-			}
-		}
 		if (state.varying || !state.value.IsEmpty()) pending.push_back(&state);
 	}
 	const auto propagate = [&] {

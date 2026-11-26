@@ -555,6 +555,106 @@ bool MadNotFused() {
 	return ok;
 }
 
+bool CorrelatedPhi() {
+	using namespace KytyFuzz::IR;
+	using Term = KytyFuzz::Recompiler::CFG::TerminatorKind;
+	using Condition = KytyFuzz::Recompiler::CFG::BranchCondition;
+	enum class Case { Correlated, Independent, Bypass, PreviousIteration, Conflict, Undef, UndefPredicate };
+	for (const auto test: {Case::Correlated, Case::Independent, Case::Bypass, Case::PreviousIteration,
+	                        Case::Conflict, Case::Undef, Case::UndefPredicate}) {
+		Program program;
+		program.user_data_count = 2;
+		for (uint32_t id = 0; id < 9; ++id) {
+			auto& block = *program.block_storage.emplace_back(std::make_unique<Block>());
+			block.id = id;
+			program.blocks.push_back(&block);
+		}
+		auto& entry   = *program.blocks[0];
+		auto& header  = *program.blocks[1];
+		auto& test_b  = *program.blocks[2];
+		auto& restored = *program.blocks[3];
+		auto& relay   = *program.blocks[4];
+		auto& join    = *program.blocks[5];
+		auto& restore = *program.blocks[6];
+		auto& latch   = *program.blocks[7];
+		auto& exit    = *program.blocks[8];
+		const auto edge = [](Block& from, Block& yes, Block* no = nullptr, Value condition = {}) {
+			from.terminator.kind = no == nullptr ? Term::Branch : Term::ConditionalBranch;
+			from.terminator.true_block = &yes;
+			from.terminator.false_block = no;
+			from.condition = condition;
+			from.AddBranch(&yes);
+			if (no != nullptr) from.AddBranch(no);
+		};
+		const auto phi = [](Block& block, Type type) -> Inst& {
+			return block.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(type));
+		};
+		const auto emit = [](Block& block, ValueOpcode op, std::initializer_list<Value> args) {
+			return Value(&block.AppendNewInst(op, args));
+		};
+		const auto user = [&](uint32_t index) {
+			return emit(entry, ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(index))});
+		};
+		const auto runtime = user(0);
+		const auto independent = emit(entry, ValueOpcode::INotEqual32, {user(1), Value(0u)});
+		auto& carried = phi(header, Type::U32);
+		auto& counter = phi(header, Type::U32);
+		auto& previous = phi(header, Type::U1);
+		const auto a = Value(&header.AppendNewInst(ValueOpcode::ConditionRef, {independent},
+		                                          static_cast<uint64_t>(Condition::ExecNonZero)));
+		const auto not_a = emit(header, ValueOpcode::LogicalNot, {a});
+		const auto b = test == Case::UndefPredicate ? emit(header, ValueOpcode::UndefU1, {})
+		                                           : emit(header, ValueOpcode::IEqual32, {Value(&counter), Value(0u)});
+		auto selected = b;
+		if (test == Case::Independent) selected = independent;
+		if (test == Case::PreviousIteration) selected = Value(&previous);
+		auto& relay_word = phi(relay, Type::U32);
+		const auto not_b = emit(relay, ValueOpcode::LogicalNot, {selected});
+		auto& word = phi(join, Type::U32);
+		auto& route = phi(join, Type::U1);
+		const auto guard = emit(join, ValueOpcode::LogicalOr, {not_a, Value(&route)});
+		auto& next = phi(latch, Type::U32);
+		const auto next_count = emit(latch, ValueOpcode::IAdd32, {Value(&counter), Value(1u)});
+		const auto repeat = emit(latch, ValueOpcode::INotEqual32, {next_count, Value(2u)});
+		edge(entry, header);
+		edge(header, test_b, &join, a);
+		edge(test_b, restored, &relay, b);
+		edge(restored, relay);
+		edge(relay, join);
+		edge(join, restore, &latch, test == Case::Bypass ? Value(&route) : guard);
+		edge(restore, latch);
+		edge(latch, header, &exit, repeat);
+		carried.AddPhiOperand(&entry, Value(17u));
+		carried.AddPhiOperand(&latch, Value(&next));
+		counter.AddPhiOperand(&entry, Value(0u));
+		counter.AddPhiOperand(&latch, next_count);
+		previous.AddPhiOperand(&entry, Value(true));
+		previous.AddPhiOperand(&latch, b);
+		relay_word.AddPhiOperand(&test_b, runtime);
+		relay_word.AddPhiOperand(&restored, Value(&carried));
+		word.AddPhiOperand(&header, runtime);
+		word.AddPhiOperand(&relay, Value(&relay_word));
+		route.AddPhiOperand(&header, Value(false));
+		route.AddPhiOperand(&relay, not_b);
+		auto restored_word = Value(&carried);
+		if (test == Case::Conflict) restored_word = Value(19u);
+		if (test == Case::Undef) restored_word = emit(restore, ValueOpcode::UndefU32, {});
+		next.AddPhiOperand(&join, Value(&word));
+		next.AddPhiOperand(&restore, restored_word);
+		auto& output = exit.AppendNewInst(ValueOpcode::ReferenceU32, {Value(&next)});
+		ValidateProgram(program);
+		ConstantPropagationPass(program.blocks, 32);
+		RemoveIdentities(program);
+		ValidateProgram(program);
+		const auto result = output.Arg(0);
+		if (test == Case::Correlated ? result != Value(17u) : result.IsImmediate()) {
+			std::printf("correlated-phi: FAILED for case %u\n", static_cast<unsigned>(test));
+			return false;
+		}
+	}
+	return true;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -584,6 +684,17 @@ int main(int argc, char** argv) {
 			return 1;
 		}
 		std::printf("phi-reachability: ok\n");
+	}
+	if (argc >= 2 && std::string_view(argv[1]) == "correlated-phi") {
+		Common::SoftExitScope soft;
+		try {
+			if (!CorrelatedPhi()) return 1;
+		} catch (const std::exception& error) {
+			std::printf("correlated-phi: FAILED: %s\n", error.what());
+			return 1;
+		}
+		std::printf("correlated-phi: ok\n");
+		return 0;
 	}
 	for (const auto& entry: Cases) {
 		if (argc >= 2 && std::string_view(argv[1]) != entry.name) continue;
