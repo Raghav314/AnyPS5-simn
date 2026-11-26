@@ -937,12 +937,12 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size)) {
 		Shim::Fail("KytyShim memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
 	}
-	if (Shim::IsBacked(vaddr, size)) return size;
 	thread_local std::array<RememberedPrefix, 256> remembered {};
 	const auto probe_epoch = g_probe_epoch.load(std::memory_order_seq_cst);
 	const auto backing_epoch = g_backing_epoch.load(std::memory_order_acquire);
 	auto& slot = remembered[((vaddr >> PageBits) ^ (size * 0x9e3779b97f4a7c15ull >> 56u)) & 255u];
 	if (slot.vaddr == vaddr && slot.size == size && slot.probe_epoch == probe_epoch && slot.backing_epoch == backing_epoch) return slot.prefix;
+	if (Shim::IsBacked(vaddr, size)) return size;
 	const auto clamped = MappedPrefix(vaddr, size);
 	if (clamped != 0 && g_probe_epoch.load(std::memory_order_seq_cst) == probe_epoch && g_backing_epoch.load(std::memory_order_acquire) == backing_epoch) {
 		slot = {vaddr, size, clamped, probe_epoch, backing_epoch};
