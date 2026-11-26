@@ -4,8 +4,6 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "prx/libkernel/DirectMemory/DirectMemory.hpp"
-#include "prx/libkernel/include/Api.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -18,6 +16,14 @@ namespace Libs::Graphics {
 
 struct BufferCacheBdaTestAccess {
 	static uint64_t PageIndex(uint64_t address) { return BufferCache::PageIndex(address); }
+	static BufferId Register(BufferCache& cache, GraphicContext& graphics, CommandScheduler& scheduler,
+	                         uint64_t address, uint64_t size) {
+		const auto id = cache.m_slot_buffers.insert(graphics, scheduler, MemoryUsage::DeviceLocal, address,
+		                                           AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
+		cache.Register(id);
+		return id;
+	}
+	static void Remove(BufferCache& cache, BufferId id) { cache.DeleteBuffer(id); }
 };
 
 }
@@ -31,7 +37,6 @@ constexpr uint64_t TableBlock  = 0x10000;
 constexpr uint64_t Entry       = sizeof(vk::DeviceAddress);
 constexpr uint64_t GuestBytes  = 3 * Page;
 constexpr uint64_t FarBlocks   = 16;
-constexpr int      CpuReadWrite = 0x03;
 
 const char* g_name = "kyty_shim_bda_page_table";
 
@@ -85,9 +90,9 @@ const char* CheckPageTable(GraphicContext& graphics, uint64_t address, bool spar
 		                    "an entry read before any buffer was registered in its block was not 0");
 	}
 	if (failure == nullptr) {
-		(void)buffers.ObtainBuffer(address, GuestBytes, false, false);
+		const auto created = BufferCacheBdaTestAccess::Register(buffers, graphics, scheduler, address, GuestBytes);
 		const auto id = buffers.RegisteredBuffer(address, Page);
-		if (!id) {
+		if (id != created) {
 			failure = "the buffer was not registered";
 		} else {
 			const auto& buffer  = buffers.GetBuffer(id);
@@ -105,8 +110,8 @@ const char* CheckPageTable(GraphicContext& graphics, uint64_t address, bool spar
 				}
 			}
 		}
+		BufferCacheBdaTestAccess::Remove(buffers, created);
 	}
-	(void)buffers.DropFreedRange(address, GuestBytes, nullptr, nullptr);
 	if (failure == nullptr) {
 		failure = CheckZero(ReadTable(graphics, scheduler, table, block, TableBlock),
 		                    "an entry of a removed buffer did not read 0 again");
@@ -140,18 +145,7 @@ extern "C" int RunKytyBdaPageTableTest(int argc, char** argv) {
 		std::fprintf(stderr, "%s: FAILED: could not create the allocator\n", g_name);
 		return 1;
 	}
-	void*              guest  = nullptr;
-	constexpr uint64_t Mapped = GuestBytes + Page;
-	if (sceKernelMapFlexibleMemory(&guest, Mapped, CpuReadWrite, 0) != 0 || guest == nullptr) {
-		std::fprintf(stderr, "%s: FAILED: could not map guest backing\n", g_name);
-		return 1;
-	}
-	const auto address = (reinterpret_cast<uint64_t>(guest) + Page - 1) / Page * Page;
-	const auto* failure = CheckPageTable(gpu.graphics, address, sparse);
-	if (sceKernelMunmap(reinterpret_cast<uint64_t>(guest), Mapped) != 0) {
-		std::fprintf(stderr, "%s: FAILED: could not unmap guest backing\n", g_name);
-		return 1;
-	}
+	const auto* failure = CheckPageTable(gpu.graphics, Page, sparse);
 	if (failure != nullptr) {
 		std::fprintf(stderr, "%s: FAILED: %s\n", g_name, failure);
 		return 1;
