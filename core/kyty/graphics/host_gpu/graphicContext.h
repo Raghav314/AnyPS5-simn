@@ -29,6 +29,7 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               partial_buffers_enabled               = false;
 	bool                               host_import_enabled                   = false;
 	uint64_t                           host_import_alignment                 = 0;
 	bool                               compute_subgroup_size_control_enabled = false;

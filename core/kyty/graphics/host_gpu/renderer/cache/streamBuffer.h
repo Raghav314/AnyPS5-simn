@@ -43,6 +43,9 @@ public:
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, uint64_t size,
 	       vk::Buffer imported, vk::DeviceAddress device_address);
+	struct SparseResident {};
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, SparseResident sparse, vk::BufferUsageFlags flags,
+	       uint64_t size);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -74,6 +77,7 @@ public:
 	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
 	              uint64_t destination_offset, uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
+	void Commit(uint64_t offset, uint64_t size);
 
 	bool   is_deleted   = false;
 	int    stream_score = 0;
@@ -86,6 +90,7 @@ protected:
 	[[nodiscard]] CommandScheduler& Scheduler() const noexcept { return *m_scheduler; }
 
 private:
+	void Create(vk::BufferUsageFlags flags);
 	[[nodiscard]] vk::BufferMemoryBarrier Barrier(uint64_t offset, uint64_t size,
 	                                              vk::AccessFlags source,
 	                                              vk::AccessFlags destination) const;
@@ -104,6 +109,10 @@ private:
 	bool                          m_device_local = false;
 #endif
 	std::span<uint8_t>            m_mapped;
+	uint64_t                      m_sparse_block = 0;
+	uint32_t                      m_sparse_types = 0;
+	uint64_t                      m_sparse_size  = 0;
+	std::vector<VmaAllocation>    m_sparse_blocks;
 };
 
 class StreamBuffer final: public Buffer {
