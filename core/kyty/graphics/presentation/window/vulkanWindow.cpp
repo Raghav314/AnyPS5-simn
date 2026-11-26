@@ -307,7 +307,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		check_feature(device_features2.features.shaderImageGatherExtended,
 		              "shaderImageGatherExtended");
-		check_feature(device_features2.features.shaderResourceMinLod, "shaderResourceMinLod");
+		if (device_features2.features.shaderResourceMinLod != VK_TRUE) {
+			LOGF("shaderResourceMinLod is not supported; LOD clamps are emulated in shaders\n");
+		}
 
 		check_feature(device_features2.features.independentBlend, "independentBlend");
 		check_feature(device_features2.features.tessellationShader, "tessellationShader");
@@ -625,6 +627,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.attachment_feedback_loop_enabled = feedback_layout.attachmentFeedbackLoopLayout &&
 	                                            feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled             = maintenance8.maintenance8;
+	graphics.shader_resource_min_lod_enabled  = supported2.features.shaderResourceMinLod == VK_TRUE;
 	graphics.ray_query_enabled                = ray_query_enabled;
 	graphics.robust_buffer_access_enabled =
 	    robustness2.robustBufferAccess2 &&
@@ -643,6 +646,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.conditional_rendering_enabled = conditional_rendering.conditionalRendering;
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
+	LOGF("Vulkan shaderResourceMinLod support: %s\n",
+	     graphics.shader_resource_min_lod_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
 	if (graphics.mesh_shader_enabled) {
@@ -673,7 +678,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		     "tables will not work\n");
 	}
 	device_features.shaderImageGatherExtended            = VK_TRUE;
-	device_features.shaderResourceMinLod                 = VK_TRUE;
+	device_features.shaderResourceMinLod                 = supported2.features.shaderResourceMinLod;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;

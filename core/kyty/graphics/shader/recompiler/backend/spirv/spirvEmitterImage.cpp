@@ -1258,16 +1258,46 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto sampler = samplers[candidate.numeric_class != Prospero::TextureNumericClass::Float];
 			auto sample_operands = operands;
 			auto sample_operand_count = operand_count;
+			auto sample_opcode = opcode;
+			auto sample_min_lod = min_lod;
+			if (sample_min_lod != 0 && !state.profile.shader_resource_min_lod) {
+				if (!explicit_lod) {
+					state.builder.RequireCapability(spv::CapabilityImageQuery);
+					const auto query = state.builder.AllocateId();
+					state.builder.AddFunction(
+					    spv::OpImageQueryLod, TypeF32Vector(state, 2), query,
+					    MakeSampledImage(state, resource, sampler.id, 0u, array_index,
+					                     sampler.dynamic),
+					    CoordF32(ctx, mem, *address, layout.coord,
+					             ImageDimensionInfoFor(candidate.dimension).spatial_components,
+					             candidate.cube, RowCenter(state, candidate.dimension)));
+					auto lod = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), lod, query,
+					                          1u);
+					if (layout.bias != NoImageComponent) {
+						lod = Binary(state, spv::OpFAdd, TypeF32(state), lod,
+						             AddressF32(ctx, mem, *address, layout.bias));
+					}
+					lod = EmitGlsl<GLSLstd450FMax, IR::Type::F32>(state, lod, sample_min_lod);
+					sample_operands      = {};
+					sample_operands[0]   = spv::ImageOperandsLodMask;
+					sample_operands[1]   = lod;
+					sample_operand_count = 2;
+					sample_opcode = dref ? spv::OpImageSampleDrefExplicitLod
+					                     : spv::OpImageSampleExplicitLod;
+				}
+				sample_min_lod = 0;
+			}
 			if (layout.offset != NoImageComponent) {
 				sample_operand_count = std::max(size_t{1}, sample_operand_count);
 				sample_operands[sample_operand_count++] = PackedOffset(
 				    ctx, offset_value, candidate.dimension, sample_operands[0]);
 			}
-			if (min_lod != 0) {
+			if (sample_min_lod != 0) {
 				state.builder.RequireCapability(spv::CapabilityMinLod);
 				sample_operand_count = std::max(size_t{1}, sample_operand_count);
 				sample_operands[0] |= spv::ImageOperandsMinLodMask;
-				sample_operands[sample_operand_count++] = min_lod;
+				sample_operands[sample_operand_count++] = sample_min_lod;
 			}
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
@@ -1276,7 +1306,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto sampled = MakeSampledImage(state, resource, sampler.id, 0u, array_index,
 			                                      sampler.dynamic);
 			const auto sample = state.builder.AllocateId();
-			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
+			state.builder.AddFunction(sample_opcode, result_type, sample, sampled, coord,
 			                          std::span(&dref_value, dref ? 1u : 0u),
 			                          std::span<const uint32_t>(sample_operands).first(sample_operand_count));
 			if (state.mip_stats_variable != 0 && state.mip_stats_records && array_index == 0u &&
