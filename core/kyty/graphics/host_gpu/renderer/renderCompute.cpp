@@ -107,8 +107,7 @@ static bool PrepareNativeRayTracing(RenderContext& context, const CommandRecorde
 				return;
 			}
 			const auto pointer = RayTracing::UserPointer(
-			    each, uint64_t {user[each.user_sgpr]} | (uint64_t {user[each.user_sgpr + 1]} << 32u),
-			    [&](uint64_t address, uint64_t size) { return context.IsMapped(address, size); });
+			    each, user, 0, [&](uint64_t address, uint64_t size) { return context.IsMapped(address, size); });
 			native_rt.Prepare(command, pointer, each, bindings.flattened_srt, context.GetGpu().GetFrameNum(),
 			                  module.info.shader_hash, count_rays, false, index);
 		};

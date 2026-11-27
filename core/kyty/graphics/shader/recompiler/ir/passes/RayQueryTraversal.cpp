@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
+#include "graphics/shader/recompiler/ir/RayQueryHeaderProgram.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryResults.h"
 #include "graphics/shader/recompiler/ir/passes/RayQuerySource.h"
@@ -2264,7 +2265,7 @@ bool DeriveHeaderSource(const Program& program, LaneMaskWalk& w) {
 			source.header_offset = MemoryOf(program, *read).offset;
 			return true;
 		}
-		if (!user || UserRegister(base->high) != *user + 1u) return false;
+		if (!user || UserRegister(base->high) != *user + 1u || base->offset == RayQueryHeaderProgram) return false;
 		source.user_sgpr     = *user;
 		source.header_vsharp = base->offset;
 		source.header_offset = MemoryOf(program, *read).offset;
@@ -5719,7 +5720,8 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 				each.latch  = derived.loops[at].second;
 				for (const auto index: derived.loop_headers[at]) {
 					const auto& named = derived.headers[index];
-					each.headers.push_back({named.user_sgpr, named.header_offset, named.header_vsharp, walk.lane.source.root, walk.lane.source.layout});
+					each.headers.push_back({named.user_sgpr, named.header_offset, named.header_vsharp, walk.lane.source.root, walk.lane.source.layout,
+					                        named.program});
 				}
 				if (each.headers.empty()) {
 					for (auto* bvh: left) {
@@ -5786,12 +5788,13 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		const RayQueryExtraSource extra {source.user_sgpr, source.header_offset, source.header_vsharp, source.root,
 		                                 source.layout};
 		if (std::ranges::find(extra_sources, extra) != extra_sources.end()) return true;
-		const auto same_header = [&](uint32_t user_sgpr, uint32_t header_offset, uint32_t header_vsharp) {
-			return user_sgpr == source.user_sgpr && header_offset == source.header_offset && header_vsharp == source.header_vsharp;
+		const auto same_header = [&](uint32_t user_sgpr, uint32_t header_offset, uint32_t header_vsharp, const std::vector<uint32_t>& program) {
+			return user_sgpr == source.user_sgpr && header_offset == source.header_offset && header_vsharp == source.header_vsharp &&
+			       program.empty();
 		};
-		if (same_header(reference.user_sgpr, reference.header_offset, reference.header_vsharp) ||
+		if (same_header(reference.user_sgpr, reference.header_offset, reference.header_vsharp, {}) ||
 		    std::ranges::any_of(extra_sources, [&](const RayQueryExtraSource& other) {
-			    return same_header(other.user_sgpr, other.header_offset, other.header_vsharp);
+			    return same_header(other.user_sgpr, other.header_offset, other.header_vsharp, other.program);
 		    })) {
 			return false;
 		}
@@ -5801,8 +5804,9 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 	};
 	const auto adopt = [&](Walk& each) {
 		auto&      source = each.Shape().source;
-		const auto same   = [&](const RayQueryExtraSource& a, uint32_t user_sgpr, uint32_t header_offset, uint32_t header_vsharp) {
-			return a.user_sgpr == user_sgpr && a.header_offset == header_offset && a.header_vsharp == header_vsharp;
+		const auto same   = [&](const RayQueryExtraSource& a, uint32_t user_sgpr, uint32_t header_offset, uint32_t header_vsharp,
+		                        const std::vector<uint32_t>& program = {}) {
+			return a.user_sgpr == user_sgpr && a.header_offset == header_offset && a.header_vsharp == header_vsharp && a.program == program;
 		};
 		if (each.headers.empty()) return false;
 		const bool primary = std::ranges::any_of(each.headers, [&](const RayQueryExtraSource& extra) {
@@ -5819,7 +5823,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			}
 			foreign        = true;
 			const auto old = std::ranges::find_if(extra_sources, [&](const RayQueryExtraSource& other) {
-				return same(other, extra.user_sgpr, extra.header_offset, extra.header_vsharp);
+				return same(other, extra.user_sgpr, extra.header_offset, extra.header_vsharp, extra.program);
 			});
 			if (old != extra_sources.end()) {
 				if (old->root != extra.root || !CompatibleRecordLayouts(old->layout, extra.layout)) return false;
