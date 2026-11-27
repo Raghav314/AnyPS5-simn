@@ -6,12 +6,12 @@ on:
   issue_comment:
     types: [created, edited]
   pull_request_target:
-    branches: [AnyKyty, Brainrot]
+    branches: [AnyKyty]
     types: [opened, reopened, synchronize, ready_for_review, labeled]
   schedule:
     - cron: '13,43 * * * *'
   workflow_run:
-    workflows: [AnyKyty, Offline checks, Brainrot]
+    workflows: [AnyKyty, Offline checks, Staged integration]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -75,8 +75,8 @@ jobs:
       (github.event_name == 'schedule' ||
        (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
         (github.event.workflow_run.event == 'pull_request' ||
-         (github.event.workflow_run.event == 'push' && github.event.workflow_run.name == 'Brainrot' &&
-          startsWith(github.event.workflow_run.head_branch, 'test/brainrot-integrate-')))) ||
+         (github.event.workflow_run.event == 'push' && github.event.workflow_run.name == 'Staged integration' &&
+          startsWith(github.event.workflow_run.head_branch, 'test/integrate-')))) ||
        (github.event_name == 'workflow_dispatch' && !inputs.pull_request) ||
        (github.event_name == 'pull_request_target' && github.event.label.name == 'automerge'))
     runs-on: ubuntu-latest

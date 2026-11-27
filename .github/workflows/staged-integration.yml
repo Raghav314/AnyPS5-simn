@@ -1,0 +1,14 @@
+name: Staged integration
+
+on:
+  push:
+    branches: ['test/integrate-*']
+
+permissions:
+  contents: read
+
+jobs:
+  anykyty:
+    uses: ./.github/workflows/anykyty.yml
+  offline:
+    uses: ./.github/workflows/offline-checks.yml

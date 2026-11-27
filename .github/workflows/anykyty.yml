@@ -2,7 +2,7 @@ name: AnyKyty
 
 on:
   push:
-    branches: [AnyKyty, 'test/**']
+    branches: [AnyKyty, 'test/**', '!test/integrate-*']
     paths-ignore:
       - '**.md'
       - LICENSE
@@ -11,6 +11,7 @@ on:
     types: [opened, synchronize, reopened]
   schedule:
     - cron: '17 4 * * *'
+  workflow_call:
   workflow_dispatch:
     inputs:
       pr:

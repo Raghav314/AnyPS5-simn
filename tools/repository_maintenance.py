@@ -12,12 +12,9 @@ from pathlib import Path
 
 OWNER = "simnJS"
 REPO = f"{OWNER}/AnyPS5"
-STAGED_BRANCH = "Brainrot"
-STAGE_PREFIX = "test/brainrot-integrate-"
-PR_WORKFLOWS = {
-    "AnyKyty": ("anykyty.yml", "offline-checks.yml"),
-    "Brainrot": ("brainrot.yml",),
-}
+TARGET_BRANCH = "AnyKyty"
+STAGE_PREFIX = "test/integrate-"
+PR_WORKFLOWS = ("anykyty.yml", "offline-checks.yml")
 BOT = "github-actions[bot]"
 MARKER = "repository-maintenance"
 SCAN = Path(__file__).with_name("public-scan.sh")
@@ -37,7 +34,7 @@ answer grounded in the repository guidance. Avoid replies that merely restate
 the report or repeat an answer already given. On pull requests, comment only
 on actionable defects that can be established from the diff or a clearly
 missing verification that matters for the change. Review the diff against its own
-base branch. Do not suggest retargeting either of the supported branches. Do not
+base branch. Do not suggest retargeting a pull request based on AnyKyty. Do not
 claim to have run tests.
 When follow_up is present, respond to that comment in the ongoing conversation.
 Answer direct questions and acknowledge substantive fixes or test results.
@@ -174,7 +171,7 @@ def review(number, key, words, *, targeted=False):
     if targeted and not is_pull:
         raise RuntimeError("The selected number must be a pull request")
     pull = gh(pull_api(number)) if is_pull else None
-    if pull and (pull["draft"] or pull["base"]["ref"] not in PR_WORKFLOWS):
+    if pull and (pull["draft"] or pull["base"]["ref"] != TARGET_BRANCH):
         if targeted:
             note(f"- #{number} is a draft or targets a branch outside automatic review.")
         return False
@@ -317,7 +314,7 @@ def approved(number, sha):
 
 def ci_passed(number, pull):
     sha = pull["head"]["sha"]
-    for workflow in PR_WORKFLOWS[pull["base"]["ref"]]:
+    for workflow in PR_WORKFLOWS:
         runs = gh(
             f"repos/{REPO}/actions/workflows/{workflow}/runs"
             f"?event=pull_request&head_sha={sha}&per_page=50"
@@ -395,7 +392,7 @@ def stage_passed(number, branch, sha, repo_id):
         note(f"- #{number} has an unexpected commit on its integration branch.")
         return False
     runs = gh(
-        f"repos/{REPO}/actions/workflows/brainrot.yml/runs"
+        f"repos/{REPO}/actions/workflows/staged-integration.yml/runs"
         f"?event=push&head_sha={sha}&branch={branch}&per_page=50"
     )["workflow_runs"]
     matching = [
@@ -416,7 +413,7 @@ def merge(number, words):
     pull = gh(pull_api(number))
     target = pull["base"]["ref"]
     if (
-        pull["state"] != "open" or pull["draft"] or target not in PR_WORKFLOWS
+        pull["state"] != "open" or pull["draft"] or target != TARGET_BRANCH
         or not pull["head"].get("repo") or "automerge" not in {label["name"] for label in pull["labels"]}
     ):
         return
@@ -429,21 +426,11 @@ def merge(number, words):
     if pull["mergeable_state"] == "dirty":
         note(f"- #{number} needs manual conflict resolution.")
         return
-    if pull["mergeable_state"] == "behind" and target != STAGED_BRANCH:
-        try:
-            gh(pull_api(number, "/update-branch"), method="PUT", data={"expected_head_sha": head, "update_method": "rebase"})
-            note(f"- Rebased #{number} onto {target}.")
-        except RuntimeError:
-            note(f"- #{number} could not be rebased automatically.")
-        return
-    mergeable_states = {"clean", "behind"} if target == STAGED_BRANCH else {"clean"}
+    mergeable_states = {"clean", "behind"}
     if pull["mergeable_state"] not in mergeable_states:
         return
     git("fetch", "--quiet", "--no-tags", "origin", base, head)
     fast_forward = git("merge-base", base, head).decode().strip() == base
-    if not fast_forward and target != STAGED_BRANCH:
-        note(f"- #{number} needs to be updated to its target branch before integration.")
-        return
     revision_range = f"{base}..{head}"
     paths = git("log", "-m", "--format=", "--name-only", "-z", revision_range).split(b"\0")
     if any(path.lstrip(b"\n").startswith(b".github/") for path in paths):
@@ -462,10 +449,10 @@ def merge(number, words):
     pr_ci = fast_forward and pull["base"]["sha"] == base and ci_passed(number, pull)
     candidate = head
     if not pr_ci:
-        if target != STAGED_BRANCH:
+        if fast_forward:
             note(f"- #{number} is waiting for successful pull request CI.")
             return
-        candidate = integration_commit(number, base, head, words) if not fast_forward else head
+        candidate = integration_commit(number, base, head, words)
         if not candidate:
             return
     def still_approved():
