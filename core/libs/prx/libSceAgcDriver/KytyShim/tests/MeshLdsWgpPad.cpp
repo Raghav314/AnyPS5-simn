@@ -563,20 +563,20 @@ int DrawMeshLdsWgpPad() {
 		vk::PipelineCacheCreateInfo cache_info {};
 		const auto vk_cache = Checked(device.createPipelineCache(cache_info), "pipeline cache");
 		(void)probe_raw_lds(mesh_mod, vk_cache);
-		vk::Pipeline cached_pipe = nullptr;
-		const auto   lookup_res  = CreateGraphicsPipelineWhole(
-		    graphics, pipeline, key, stages, vk_cache,
-		    vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired, cached_pipe);
-		const bool rejected_uncached =
-		    lookup_res == vk::Result::ePipelineCompileRequired && !cached_pipe;
-		const bool returned_safe_cached =
-		    lookup_res == vk::Result::eSuccess && cached_pipe &&
-		    QueryMeshLdsWgpPadDwords(graphics, cached_pipe, mesh_mod) == 0u;
-		Require(rejected_uncached || returned_safe_cached,
-		        "cache lookup returned an unsafe unpadded mesh pipeline");
-		if (cached_pipe) {
-			device.destroyPipeline(cached_pipe);
-		}
+		const auto check_lookup = [&] {
+			vk::Pipeline cached = nullptr;
+			const auto result = CreateGraphicsPipelineWhole(graphics, pipeline, key, stages, vk_cache,
+			                       vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired, cached);
+			if (result == vk::Result::ePipelineCompileRequired) {
+				Require(!cached, "cache miss returned a pipeline");
+			} else {
+				Require(result == vk::Result::eSuccess && cached &&
+				            QueryMeshLdsWgpPadDwords(graphics, cached, mesh_mod) == 0u,
+				        "cache hit did not return a safe mesh pipeline");
+				device.destroyPipeline(cached);
+			}
+		};
+		check_lookup();
 
 		vk::Pipeline built_pipe = nullptr;
 		const auto   built_res =
@@ -587,15 +587,7 @@ int DrawMeshLdsWgpPad() {
 		        "cached padded pipeline still unsafe");
 		device.destroyPipeline(built_pipe);
 
-		vk::Pipeline hit_pipe = nullptr;
-		const auto   lookup_hit = CreateGraphicsPipelineWhole(
-		    graphics, pipeline, key, stages, vk_cache,
-		    vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired, hit_pipe);
-		Require(lookup_hit == vk::Result::eSuccess && hit_pipe,
-		        "cache lookup failed after padded pipeline was populated into VkPipelineCache");
-		Require(QueryMeshLdsWgpPadDwords(graphics, hit_pipe, mesh_mod) == 0u,
-		        "cache-hit pipeline is unsafe");
-		device.destroyPipeline(hit_pipe);
+		check_lookup();
 		device.destroyPipelineCache(vk_cache);
 	}
 #endif
