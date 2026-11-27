@@ -455,8 +455,7 @@ static void PrepareDrawRayTracing(RenderContext& context, CommandBuffer& buffer,
 		return;
 	}
 	const auto& user    = buffer.GetShaders().GetPs().ps_user_sgpr.value;
-	const auto  pointer = RayTracing::UserPointer(
-	    source, user, 0, [&](uint64_t address, uint64_t size) { return context.IsMapped(address, size); });
+	const auto  pointer = context.RayQueryUserPointer(source, user);
 	const auto frame = static_cast<uint64_t>(context.GetGpu().GetFrameNum());
 	RayTracing::Preparation preparation {.tick          = context.GetCommandScheduler().CurrentTick(),
 	                                     .frame         = frame,
@@ -493,8 +492,7 @@ static void PrepareDrawRayTracing(RenderContext& context, CommandBuffer& buffer,
 			native_rt->InvalidateContext(buffer.Handle(), index + 1);
 			continue;
 		}
-		const auto extra_pointer = RayTracing::UserPointer(
-		    extra, user, 0, [&](uint64_t address, uint64_t size) { return context.IsMapped(address, size); });
+		const auto extra_pointer = context.RayQueryUserPointer(extra, user);
 		native_rt->Prepare(buffer.Handle(), extra_pointer, extra, bindings.flattened_srt, frame, module.info.shader_hash,
 		                   false, false, index + 1);
 	}

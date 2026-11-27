@@ -1548,6 +1548,10 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	if (!m_enabled || context >= MaxContexts) {
 		return;
 	}
+	if (!source.program.empty() && user_pointer == 0) {
+		InvalidateContext(command, context);
+		return;
+	}
 	auto& tlas_object = m_tlases[context];
 	if (tlas_object.handle == nullptr) {
 		CreateTlasObject(tlas_object, m_tlas_capacity);

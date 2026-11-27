@@ -138,14 +138,15 @@ template <class Read>
 				break;
 			}
 			case HeaderOp::Bfe: {
-				const auto count  = pop() & 31u;
-				const auto offset = pop() & 31u;
+				const auto count  = pop();
+				const auto offset = pop();
+				if (offset > 32u || count > 32u - offset) return std::nullopt;
 				value             = (pop() & 0xffffffffu) >> offset & HeaderMask(static_cast<uint32_t>(count));
 				break;
 			}
 			case HeaderOp::Record: {
-				const auto offset = pop();
-				const auto index  = pop();
+				const auto offset = static_cast<uint32_t>(pop());
+				const auto index  = static_cast<uint32_t>(pop());
 				const auto word3  = static_cast<uint32_t>(pop());
 				const auto word2  = static_cast<uint32_t>(pop());
 				const auto base   = pop();
@@ -154,7 +155,13 @@ template <class Read>
 				if (stride == 0u ? offset > word2 || word2 - offset < 4u : index >= word2 || offset > stride || stride - offset < 4u) {
 					return std::nullopt;
 				}
-				value = (base & HeaderMask(48)) + index * stride + offset;
+				const auto mode = (word3 >> 28u) & 3u;
+				const auto byte = uint64_t {index} * stride + offset;
+				if ((word3 >> 30u) != 0 || ((word3 >> 12u) & 0x7fu) == 0u) return std::nullopt;
+				if (mode == 0u && stride == 0u) return std::nullopt;
+				if (mode == 1u && index >= word2) return std::nullopt;
+				if (mode == 3u && byte + 4u > word2) return std::nullopt;
+				value = (base & HeaderMask(48)) + static_cast<uint32_t>(byte);
 				break;
 			}
 		}

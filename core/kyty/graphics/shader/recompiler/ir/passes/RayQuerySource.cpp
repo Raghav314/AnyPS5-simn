@@ -1116,7 +1116,8 @@ private:
 					continue;
 				}
 				if (arg.GetType() == Type::U64) {
-					for (auto& key: keys) key.push_back(Literal | (arg.U64() & ~Literal));
+					const auto operand = (arg.U64() & Literal) != 0 ? m_store.Constant(64, arg.U64()) : Literal | arg.U64();
+					for (auto& key: keys) key.push_back(operand);
 					continue;
 				}
 				for (auto& key: keys) key.push_back(Literal);
@@ -1380,6 +1381,12 @@ private:
 	bool Op(const IR::Atom& a, uint32_t depth) {
 		const auto opcode = a.args[0];
 		if (opcode == Zext && a.args.size() == 2) return Form(static_cast<uint32_t>(a.args[1]), depth);
+		if (opcode == DwordBase && a.args.size() == 2) {
+			if (!Form(static_cast<uint32_t>(a.args[1]), depth)) return false;
+			Constant(~uint64_t {3});
+			Emit(HeaderOp::And);
+			return true;
+		}
 		if (opcode == Base48 && a.args.size() == 2) {
 			if (!Form(static_cast<uint32_t>(a.args[1]), depth)) return false;
 			Emit(HeaderOp::Mask, {48});

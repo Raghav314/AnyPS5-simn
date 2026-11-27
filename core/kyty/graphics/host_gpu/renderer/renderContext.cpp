@@ -576,6 +576,19 @@ bool RenderContext::CacheSelfSizedBuffers(const ShaderStageRuntime& runtime) {
 	return written;
 }
 
+bool RenderContext::RayQueryMemoryReadable(uint64_t address, uint64_t size) {
+	return GuestRange {address, size}.Valid() && m_mapped_ranges.Contains(address, size) &&
+	       !(m_buffer_cache.MayBeGpuModified(address, size) && m_buffer_cache.IsRegionGpuModified(address, size));
+}
+
+uint64_t RenderContext::RayQueryUserPointer(const RayTracing::TlasSource& source, std::span<const uint32_t> user) {
+	std::shared_lock lock(m_mapped_ranges_mutex, std::defer_lock);
+	return RayTracing::UserPointer(source, user, 0, [&](uint64_t address, uint64_t size) {
+		if (!lock.owns_lock()) lock.lock();
+		return RayQueryMemoryReadable(address, size);
+	});
+}
+
 void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 	const auto&            program = runtime.module->info;
 	RayTracing::TlasSource source;
@@ -596,9 +609,7 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime, const Ray
 	const auto& program   = runtime.module->info;
 	const auto& resources = *runtime.resources;
 	const auto readable = [this](uint64_t address, uint64_t size) {
-		return GuestRange {address, size}.Valid() && m_mapped_ranges.Contains(address, size) &&
-		       !(m_buffer_cache.MayBeGpuModified(address, size) &&
-		         m_buffer_cache.IsRegionGpuModified(address, size));
+		return RayQueryMemoryReadable(address, size);
 	};
 	uint64_t    header = 0;
 	const auto& srt    = resources.flattened_srt;
@@ -956,9 +967,7 @@ bool RenderContext::GuestTlasHeader(const ShaderStageRuntime& runtime, const Ray
 	const auto& program   = runtime.module->info;
 	const auto& resources = *runtime.resources;
 	const auto readable = [this](uint64_t address, uint64_t size) {
-		return GuestRange {address, size}.Valid() && m_mapped_ranges.Contains(address, size) &&
-		       !(m_buffer_cache.MayBeGpuModified(address, size) &&
-		         m_buffer_cache.IsRegionGpuModified(address, size));
+		return RayQueryMemoryReadable(address, size);
 	};
 	header_at             = 0;
 	const auto pointer = RayTracing::UserPointer(source, resources.user_data, program.user_data_base, readable);
