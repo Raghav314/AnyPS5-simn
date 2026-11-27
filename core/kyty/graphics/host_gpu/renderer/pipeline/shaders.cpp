@@ -326,74 +326,68 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	                     vk::Result::eSuccess);
 }
 
-uint32_t MeshLdsWgpPadDwords(size_t lds_usage_bytes, size_t cu_lds_bytes, size_t max_pad_bytes) {
-	constexpr size_t Granule           = 1024;
-	constexpr size_t MaxSubgroupsPerCu = 4;
-	constexpr size_t MinFreeCuBytes    = 4096;
-	constexpr size_t MinFreeWgpBytes   = 8192;
-	if (lds_usage_bytes == 0 || cu_lds_bytes < Granule * 4 || max_pad_bytes < Granule) {
-		return 0;
-	}
-	const size_t wgp_lds_bytes = cu_lds_bytes * 2;
-	const auto   align_up      = [](size_t v) { return (v + Granule - 1) & ~(Granule - 1); };
-	const auto   is_safe       = [&](size_t alloc) {
-        if (alloc == 0 || alloc > cu_lds_bytes) {
-            return true;
-        }
-        const size_t cu_waves  = std::min(cu_lds_bytes / alloc, MaxSubgroupsPerCu);
-        const size_t wgp_waves = std::min(wgp_lds_bytes / alloc, MaxSubgroupsPerCu * 2);
-        const size_t cu_free   = cu_lds_bytes - cu_waves * alloc;
-        const size_t wgp_free  = wgp_lds_bytes - wgp_waves * alloc;
-        return cu_free >= MinFreeCuBytes && wgp_free >= MinFreeWgpBytes;
+std::optional<uint32_t> MeshLdsWgpPadDwords(size_t usage, size_t workgroup_limit, size_t max_pad_bytes) {
+	constexpr size_t KiB = 1024;
+	constexpr size_t CuBytes = 64 * KiB;
+	if (usage == 0 || usage > CuBytes || workgroup_limit != CuBytes) return 0;
+	const auto has_reserve = [](size_t allocation, size_t cu_min, size_t wgp_min) {
+		const size_t cu_groups  = std::min(CuBytes / allocation, size_t {4});
+		const size_t wgp_groups = std::min(2 * CuBytes / allocation, size_t {8});
+		return CuBytes - cu_groups * allocation >= cu_min &&
+		       2 * CuBytes - wgp_groups * allocation >= wgp_min;
 	};
-	const size_t base_alloc = align_up(lds_usage_bytes);
-	if (is_safe(base_alloc)) {
-		return 0;
-	}
-	for (size_t pad = Granule; pad <= max_pad_bytes; pad += Granule) {
-		const size_t next_alloc = base_alloc + pad;
-		if (next_alloc > cu_lds_bytes) {
-			break;
-		}
-		if (is_safe(next_alloc)) {
-			return static_cast<uint32_t>(pad / 4);
+	const size_t base = (usage + KiB - 1) & ~(KiB - 1);
+	for (size_t pad = 0; pad <= CuBytes - base; pad += KiB) {
+		if (has_reserve(base + pad, 4 * KiB, 8 * KiB)) {
+			if (pad > max_pad_bytes) return std::nullopt;
+			return static_cast<uint32_t>(pad / sizeof(uint32_t));
 		}
 	}
-	return 0;
+	if (has_reserve(base, 3 * KiB, 3 * KiB)) return 0;
+	return std::nullopt;
 }
 
-uint32_t QueryMeshLdsWgpPadDwords(const GraphicContext& graphics, vk::Pipeline pipeline,
-                                  const ShaderModule& mesh_module, uint32_t existing_pad_dwords) {
-	if (!graphics.amd_shader_info_enabled || graphics.fn_get_shader_info == nullptr || !pipeline) {
-		return 0;
-	}
+std::optional<uint32_t> QueryMeshLdsWgpPadDwords(const GraphicContext& graphics, vk::Pipeline pipeline,
+                                                 const ShaderModule& module, uint32_t existing_pad_dwords,
+                                                 bool allow_missing_statistics) {
 	VkShaderStatisticsInfoAMD stats {};
-	size_t                    stats_size = sizeof(stats);
-	if (graphics.fn_get_shader_info(graphics.device, pipeline, VK_SHADER_STAGE_MESH_BIT_EXT,
-	                                VK_SHADER_INFO_TYPE_STATISTICS_AMD, &stats_size,
-	                                &stats) != VK_SUCCESS ||
-	    stats_size < sizeof(stats)) {
-		return 0;
+	size_t size = sizeof(stats);
+	if (!graphics.fn_get_shader_info || !pipeline) return std::nullopt;
+	const auto result = graphics.fn_get_shader_info(graphics.device, pipeline, VK_SHADER_STAGE_MESH_BIT_EXT,
+	                                                 VK_SHADER_INFO_TYPE_STATISTICS_AMD, &size, &stats);
+	if (result == VK_ERROR_FEATURE_NOT_PRESENT && allow_missing_statistics) return 0;
+	if (result != VK_SUCCESS || size != sizeof(stats)) return std::nullopt;
+	const auto& limits = graphics.mesh_shader_properties;
+	const uint32_t payload = module.mesh_task ? ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount * 4u : 0u;
+	const uint32_t combined = limits.maxMeshPayloadAndSharedMemorySize;
+	const uint32_t limit = std::min(limits.maxMeshSharedMemorySize, combined > payload ? combined - payload : 0u);
+	const uint64_t shared = module.mesh_shared_bytes + uint64_t {existing_pad_dwords} * sizeof(uint32_t);
+	const size_t budget = module.mesh_shared_bytes != 0 && shared < limit ? limit - shared : 0;
+	const auto& usage = stats.resourceUsage;
+	return MeshLdsWgpPadDwords(usage.ldsUsageSizeInBytes, usage.ldsSizePerLocalWorkGroup, budget);
+}
+
+static vk::Result PadMeshPipeline(const GraphicContext& graphics, const ShaderModule& module,
+                                  vk::PipelineShaderStageCreateInfo& mesh_stage, vk::PipelineCache cache,
+                                  const vk::GraphicsPipelineCreateInfo& info, vk::Pipeline& pipeline) {
+	uint32_t total_pad = 0;
+	for (unsigned attempt = 0;; ++attempt) {
+		const auto pad = QueryMeshLdsWgpPadDwords(graphics, pipeline, module, total_pad, total_pad == 0);
+		if (pad == 0) return vk::Result::eSuccess;
+		graphics.device.destroyPipeline(pipeline, nullptr);
+		pipeline = nullptr;
+		if (!pad || attempt == 2) return vk::Result::eErrorInitializationFailed;
+		total_pad += *pad;
+		const uint32_t length = ShaderRecompiler::Spirv::MeshAllocationBaseDwords + total_pad;
+		const vk::SpecializationMapEntry entry {.constantID = ShaderRecompiler::Spirv::MeshAllocationLengthSpecId,
+		                                        .offset = 0, .size = sizeof(length)};
+		const vk::SpecializationInfo spec {.mapEntryCount = 1, .pMapEntries = &entry,
+		                                   .dataSize = sizeof(length), .pData = &length};
+		mesh_stage.pSpecializationInfo = &spec;
+		const auto result = graphics.device.createGraphicsPipelines(cache, 1, &info, nullptr, &pipeline);
+		mesh_stage.pSpecializationInfo = nullptr;
+		if (result != vk::Result::eSuccess) return result;
 	}
-	const auto& limits       = graphics.mesh_shader_properties;
-	size_t      shared_limit = limits.maxMeshSharedMemorySize;
-	if (mesh_module.mesh_task) {
-		constexpr size_t PayloadBytes = ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount * 4u;
-		const size_t     payload_budget = limits.maxMeshPayloadAndSharedMemorySize > PayloadBytes
-		                                      ? limits.maxMeshPayloadAndSharedMemorySize - PayloadBytes
-		                                      : 0;
-		shared_limit = std::min(shared_limit, payload_budget);
-	}
-	const size_t base_shared_bytes = mesh_module.mesh_shared_bytes != 0
-	                                     ? mesh_module.mesh_shared_bytes
-	                                     : stats.resourceUsage.ldsUsageSizeInBytes;
-	const size_t shared_bytes = base_shared_bytes + static_cast<size_t>(existing_pad_dwords) * 4u;
-	if (shared_limit <= shared_bytes) {
-		return 0;
-	}
-	return MeshLdsWgpPadDwords(stats.resourceUsage.ldsUsageSizeInBytes,
-	                           stats.resourceUsage.ldsSizePerLocalWorkGroup,
-	                           shared_limit - shared_bytes);
 }
 
 #if defined(ANYPS5_KYTY)
@@ -614,57 +608,10 @@ public:
 		const auto create = [&](vk::PipelineCreateFlags create_flags) {
 			pipeline_info.flags = create_flags;
 			const auto result = m_graphics.device.createGraphicsPipelines(cache, 1, &pipeline_info, nullptr, &out);
-			if (result != vk::Result::eSuccess || !mesh || m_stages[3] == nullptr || !out) {
-				return result;
+			if (result == vk::Result::eSuccess && m_graphics.fn_get_shader_info && mesh && m_stages[3]) {
+				return PadMeshPipeline(m_graphics, *m_stages[0], shader_stages[0], cache, pipeline_info, out);
 			}
-			vk::PipelineShaderStageCreateInfo* mesh_stage = nullptr;
-			for (uint32_t i = 0; i < shader_stage_count; i++) {
-				if (shader_stages[i].stage == vk::ShaderStageFlagBits::eMeshEXT) {
-					mesh_stage = &shader_stages[i];
-					break;
-				}
-			}
-			if (mesh_stage == nullptr) {
-				return result;
-			}
-			uint32_t total_pad = 0;
-			for (int attempt = 0; attempt < 2; attempt++) {
-				const uint32_t pad = QueryMeshLdsWgpPadDwords(m_graphics, out, *m_stages[0], total_pad);
-				if (pad == 0) {
-					return vk::Result::eSuccess;
-				}
-				total_pad += pad;
-				const uint32_t padded_dwords =
-				    ShaderRecompiler::Spirv::MeshAllocationBaseDwords + total_pad;
-				const vk::SpecializationMapEntry map_entry {
-				    .constantID = ShaderRecompiler::Spirv::MeshAllocationLengthSpecId,
-				    .offset     = 0,
-				    .size       = sizeof(padded_dwords)};
-				const vk::SpecializationInfo spec_info {.mapEntryCount = 1,
-				                                        .pMapEntries   = &map_entry,
-				                                        .dataSize      = sizeof(padded_dwords),
-				                                        .pData         = &padded_dwords};
-				mesh_stage->pSpecializationInfo = &spec_info;
-				vk::Pipeline padded             = nullptr;
-				const auto   padded_result      = m_graphics.device.createGraphicsPipelines(
-				    cache, 1, &pipeline_info, nullptr, &padded);
-				mesh_stage->pSpecializationInfo = nullptr;
-				if (padded_result == vk::Result::eSuccess && padded) {
-					m_graphics.device.destroyPipeline(out, nullptr);
-					out = padded;
-					continue;
-				}
-				if (padded) {
-					m_graphics.device.destroyPipeline(padded, nullptr);
-				}
-				if (create_flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired) {
-					m_graphics.device.destroyPipeline(out, nullptr);
-					out = nullptr;
-					return padded_result;
-				}
-				return vk::Result::eSuccess;
-			}
-			return vk::Result::eSuccess;
+			return result;
 		};
 		return CreateAuditedPipeline(m_graphics, "graphics", PipelineCache::GraphicsPipelineKeyHash {}(m_key),
 		                             flags, out, create);
@@ -1075,51 +1022,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 		                                                 &pipeline.pipeline);
 	}
+	if (result == vk::Result::eSuccess && graphics.fn_get_shader_info && mesh && pixel) {
+		result = PadMeshPipeline(graphics, vertex, shader_stages[0], driver_cache, pipeline_info, pipeline.pipeline);
+	}
 	if (result != vk::Result::eSuccess) {
 		EXIT("vkCreateGraphicsPipelines failed: %s, %s 0x%016" PRIx64 ", hs 0x%016" PRIx64
 		     ", ds 0x%016" PRIx64 ", ps 0x%016" PRIx64 "\n",
 		     vk::to_string(result).c_str(), mesh ? "ms" : "vs", hash(0), hash(1), hash(2), hash(3));
-	}
-	if (mesh && pixel != nullptr && pipeline.pipeline) {
-		vk::PipelineShaderStageCreateInfo* mesh_stage = nullptr;
-		for (uint32_t i = 0; i < shader_stage_count; i++) {
-			if (shader_stages[i].stage == vk::ShaderStageFlagBits::eMeshEXT) {
-				mesh_stage = &shader_stages[i];
-				break;
-			}
-		}
-		uint32_t total_pad = 0;
-		for (int attempt = 0; mesh_stage != nullptr && attempt < 2; attempt++) {
-			const uint32_t pad = QueryMeshLdsWgpPadDwords(graphics, pipeline.pipeline, vertex, total_pad);
-			if (pad == 0) {
-				break;
-			}
-			total_pad += pad;
-			const uint32_t padded_dwords =
-			    ShaderRecompiler::Spirv::MeshAllocationBaseDwords + total_pad;
-			const vk::SpecializationMapEntry map_entry {
-			    .constantID = ShaderRecompiler::Spirv::MeshAllocationLengthSpecId,
-			    .offset     = 0,
-			    .size       = sizeof(padded_dwords)};
-			const vk::SpecializationInfo spec_info {.mapEntryCount = 1,
-			                                        .pMapEntries   = &map_entry,
-			                                        .dataSize      = sizeof(padded_dwords),
-			                                        .pData         = &padded_dwords};
-			mesh_stage->pSpecializationInfo = &spec_info;
-			vk::Pipeline padded             = nullptr;
-			const auto   padded_result      = graphics.device.createGraphicsPipelines(
-			    driver_cache, 1, &pipeline_info, nullptr, &padded);
-			mesh_stage->pSpecializationInfo = nullptr;
-			if (padded_result == vk::Result::eSuccess && padded) {
-				graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
-				pipeline.pipeline = padded;
-				continue;
-			}
-			if (padded) {
-				graphics.device.destroyPipeline(padded, nullptr);
-			}
-			break;
-		}
 	}
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);

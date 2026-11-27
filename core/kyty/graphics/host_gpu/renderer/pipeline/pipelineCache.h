@@ -362,13 +362,12 @@ struct OptimizedGraphicsPipeline {
                                                                   std::span<const uint32_t> spirv,
                                                                   vk::Device            device);
 
-[[nodiscard]] bool     SmallColorTargetDraw(const HW::Context& context);
-[[nodiscard]] bool     RecordsNoMipStats(const ShaderStageRuntime& stage);
-[[nodiscard]] uint32_t MeshLdsWgpPadDwords(size_t lds_usage_bytes, size_t cu_lds_bytes,
-                                           size_t max_pad_bytes);
-[[nodiscard]] uint32_t QueryMeshLdsWgpPadDwords(const GraphicContext& graphics, vk::Pipeline pipeline,
-                                                const ShaderModule& mesh_module,
-                                                uint32_t            existing_pad_dwords = 0);
+[[nodiscard]] bool SmallColorTargetDraw(const HW::Context& context);
+[[nodiscard]] bool RecordsNoMipStats(const ShaderStageRuntime& stage);
+[[nodiscard]] std::optional<uint32_t> MeshLdsWgpPadDwords(size_t usage, size_t workgroup_limit, size_t max_pad_bytes);
+[[nodiscard]] std::optional<uint32_t> QueryMeshLdsWgpPadDwords(const GraphicContext& graphics, vk::Pipeline pipeline,
+                                                            const ShaderModule& module, uint32_t existing_pad_dwords = 0,
+                                                            bool allow_missing_statistics = false);
 
 struct DrawTargets {
 	RenderDepthInfo depth;

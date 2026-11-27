@@ -397,7 +397,7 @@ bool PipelineLibraries::Link(PipelineCache::Pipeline& pipeline, const GraphicsPi
 	const auto started = std::chrono::steady_clock::now();
 	pipeline.pipeline  = LinkGraphicsPipeline(m_graphics, pipeline.pipeline_layout, key, linked);
 	m_link_ns.fetch_add(Elapsed(started), std::memory_order_relaxed);
-	if (mesh && stages[3] != nullptr && pipeline.pipeline &&
+	if (m_graphics.fn_get_shader_info && mesh && stages[3] != nullptr && pipeline.pipeline &&
 	    QueryMeshLdsWgpPadDwords(m_graphics, pipeline.pipeline, *stages[0]) != 0) {
 		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
 		pipeline.pipeline = nullptr;

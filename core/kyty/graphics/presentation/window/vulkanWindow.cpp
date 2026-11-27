@@ -570,11 +570,6 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	LOGF("Vulkan fragment shader pixel interlock: %s\n",
 	     graphics.fragment_shader_pixel_interlock_enabled ? "true" : "false");
 #endif
-	graphics.amd_shader_info_enabled =
-	    HasExtension(available_extensions, VK_AMD_SHADER_INFO_EXTENSION_NAME);
-	if (graphics.amd_shader_info_enabled) {
-		add(VK_AMD_SHADER_INFO_EXTENSION_NAME);
-	}
 	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
 
 	auto features12                     = WindowContext::RequiredVulkan12Features();
@@ -609,6 +604,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.subgroup_supported_operations = properties11.subgroupSupportedOperations;
 	graphics.physical_device_properties = properties2.properties;
 	graphics.driver_id                  = driver_properties.driverID;
+	const bool mesh_lds_padding = KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && graphics.mesh_shader_enabled &&
+	                              NeedsMeshLdsPadding(properties2.properties.vendorID, properties2.properties.deviceID,
+	                                                  graphics.driver_id) && add(VK_AMD_SHADER_INFO_EXTENSION_NAME);
 	graphics.max_push_descriptors       = push_descriptor.maxPushDescriptors;
 	graphics.mesh_shader_properties     = mesh_properties;
 	LOGF("Select device: %s\n", graphics.physical_device_properties.deviceName.data());
@@ -878,12 +876,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	vk::Device device = nullptr;
 	RequireVulkanSuccess(physical_device.createDevice(&create.get(), nullptr, &device),
 	                     "vkCreateDevice");
-	if (graphics.amd_shader_info_enabled) {
+	if (mesh_lds_padding) {
 		graphics.fn_get_shader_info =
 		    reinterpret_cast<PFN_vkGetShaderInfoAMD>(device.getProcAddr("vkGetShaderInfoAMD"));
-		if (graphics.fn_get_shader_info == nullptr) {
-			graphics.amd_shader_info_enabled = false;
-		}
 	}
 	return device;
 }

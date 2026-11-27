@@ -91,7 +91,7 @@ int NoDevice(const char* why) {
 	return 77;
 }
 
-Recompiler::CompileResult CompileMeshWithLds(uint32_t lds_dwords, uint32_t host_subgroup_size) {
+Recompiler::CompileResult CompileMeshWithLds(uint32_t lds_dwords, uint32_t host_subgroup_size, bool pad) {
 	std::vector<uint32_t> code(MeshWithLdsCode.begin(), MeshWithLdsCode.end());
 	code.push_back(0xbf810000u);
 
@@ -113,7 +113,7 @@ Recompiler::CompileResult CompileMeshWithLds(uint32_t lds_dwords, uint32_t host_
 	vertex.mesh.fast_launch           = false;
 
 	std::array<uint32_t, 2>    user_data {};
-	Recompiler::Spirv::Profile profile {};
+	Recompiler::Spirv::Profile profile {.mesh_lds_padding = pad};
 	Recompiler::CompileOptions options {};
 	options.stage             = ShaderType::Mesh;
 	options.wave_size         = 64u;
@@ -150,9 +150,14 @@ Recompiler::CompileResult CompileMeshWithLds(uint32_t lds_dwords, uint32_t host_
 }
 
 void VerifyCodegenAndSizing() {
+	static_assert(NeedsMeshLdsPadding(0x1002, 0x73bf, vk::DriverId::eAmdProprietary));
+	static_assert(!NeedsMeshLdsPadding(0x10de, 0x2702, vk::DriverId::eNvidiaProprietary));
+	static_assert(!NeedsMeshLdsPadding(0x10de, 0x73bf, vk::DriverId::eAmdProprietary));
+	static_assert(!NeedsMeshLdsPadding(0x1002, 0x73bf, vk::DriverId::eMesaRadv));
+	static_assert(!NeedsMeshLdsPadding(0x1002, 0x744c, vk::DriverId::eAmdProprietary));
 	for (const uint32_t subgroup: {32u, 64u}) {
 		constexpr uint32_t LdsDwords = 3200u;
-		const auto         compiled  = CompileMeshWithLds(LdsDwords, subgroup);
+		const auto         compiled  = CompileMeshWithLds(LdsDwords, subgroup, true);
 		const auto&        words     = compiled.spirv;
 
 		std::map<uint32_t, uint32_t>               spec_ids;
@@ -201,6 +206,11 @@ void VerifyCodegenAndSizing() {
 		Require(found_spec_workgroup_array,
 		        "mesh SPIR-V missing Workgroup array sized by OpSpecConstant SpecId 0 = 2");
 
+		const auto ordinary = CompileMeshWithLds(LdsDwords, subgroup, false);
+		for (size_t i = 5; i < ordinary.spirv.size(); i += ordinary.spirv[i] >> spv::WordCountShift) {
+			Require((ordinary.spirv[i] & spv::OpCodeMask) != spv::OpSpecConstant,
+			        "unaffected profile specialized the mesh allocation");
+		}
 		const uint32_t expected_wg_bytes =
 		    (LdsDwords + Recompiler::Spirv::MeshAllocationBaseDwords) * 4u;
 		const uint32_t got_wg_bytes = Recompiler::Spirv::MeshWorkgroupBytes(words);
@@ -234,21 +244,26 @@ void VerifyCodegenAndSizing() {
 	Require(MeshLdsWgpPadDwords(24064u, CuLds, MaxPad) == 0u, "24 KB granule should not pad");
 	Require(MeshLdsWgpPadDwords(0u, CuLds, MaxPad) == 0u, "zero LDS should not pad");
 	Require(MeshLdsWgpPadDwords(17920u, 0u, MaxPad) == 0u, "zero CU LDS should not pad");
-	Require(MeshLdsWgpPadDwords(17920u, CuLds, 512u) == 0u, "insufficient max_pad should not pad");
-	Require(MeshLdsWgpPadDwords(31744u, CuLds, 1024u) == 0u, "31 KB with 1 KB cap should not pad");
-	Require(MeshLdsWgpPadDwords(63488u, CuLds, MaxPad) == 0u, "62 KB near CU cap should not pad");
+	Require(!MeshLdsWgpPadDwords(17920u, CuLds, 512u), "insufficient max_pad should not pad");
+	Require(!MeshLdsWgpPadDwords(31744u, CuLds, 1024u), "31 KB with 1 KB cap should not pad");
+	Require(!MeshLdsWgpPadDwords(63488u, CuLds, MaxPad), "62 KB cannot reach a safe granule");
+
+	Require(MeshLdsWgpPadDwords(61u * 1024u, CuLds, MaxPad) == 0u, "61 KB measured safe at the CU limit");
 
 	for (size_t kb = 1; kb <= 60; kb++) {
 		const size_t   base = kb * 1024u;
-		const uint32_t pad  = MeshLdsWgpPadDwords(base, CuLds, MaxPad);
+		const auto result = MeshLdsWgpPadDwords(base, CuLds, MaxPad);
+		Require(result.has_value(), "no usable allocation for bucket " + std::to_string(kb));
+		const uint32_t pad = *result;
 		const auto [cu_free, wgp_free] = free_bytes(base + static_cast<size_t>(pad) * 4u);
 		Require(cu_free >= 4096u && wgp_free >= 8192u,
 		        "bucket " + std::to_string(kb) + " KB after pad=" + std::to_string(pad) +
 		            " left cu_free=" + std::to_string(cu_free) + " wgp_free=" + std::to_string(wgp_free));
-		if (pad == 0u) {
-			const auto [orig_cu, orig_wgp] = free_bytes(base);
-			Require(orig_cu >= 4096u && orig_wgp >= 8192u,
-			        "unsafe bucket " + std::to_string(kb) + " KB returned pad=0");
+		if (pad != 0u) {
+			const size_t bytes = static_cast<size_t>(pad) * sizeof(uint32_t);
+			Require(MeshLdsWgpPadDwords(base, CuLds, bytes) == pad &&
+			            !MeshLdsWgpPadDwords(base, CuLds, bytes - 1u),
+			        "incorrect padding at the shared-memory limit for bucket " + std::to_string(kb));
 		}
 	}
 }
@@ -347,7 +362,9 @@ int DrawMeshLdsWgpPad() {
 		selected_mesh_props = mesh_props;
 		family              = static_cast<uint32_t>(graphics - families.begin());
 		subgroup            = props11.subgroupSize;
-		has_amd_shader_info = has_ext(VK_AMD_SHADER_INFO_EXTENSION_NAME);
+		has_amd_shader_info = KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS &&
+		                      NeedsMeshLdsPadding(physical_props.vendorID, physical_props.deviceID, driver_props.driverID) &&
+		                      has_ext(VK_AMD_SHADER_INFO_EXTENSION_NAME);
 		has_cache_control   = v13_features.pipelineCreationCacheControl == VK_TRUE;
 		if (!software) break;
 	}
@@ -432,7 +449,7 @@ int DrawMeshLdsWgpPad() {
 	if (has_amd_shader_info) {
 		graphics.fn_get_shader_info =
 		    reinterpret_cast<PFN_vkGetShaderInfoAMD>(device.getProcAddr("vkGetShaderInfoAMD"));
-		graphics.amd_shader_info_enabled = graphics.fn_get_shader_info != nullptr;
+		Require(graphics.fn_get_shader_info != nullptr, "AMD shader statistics entry point missing");
 	}
 
 	constexpr uint32_t Side   = 16u;
@@ -464,7 +481,7 @@ int DrawMeshLdsWgpPad() {
 	key.static_params.color_comb_fcn[0]        = static_cast<uint32_t>(Prospero::BlendOp::kAdd);
 
 	const auto make_mesh_module = [&](uint32_t lds_dwords) -> ShaderModule {
-		auto         compiled = CompileMeshWithLds(lds_dwords, subgroup);
+		auto         compiled = CompileMeshWithLds(lds_dwords, subgroup, graphics.fn_get_shader_info != nullptr);
 		ShaderModule mod {};
 		mod.info.stage        = ShaderType::Mesh;
 		mod.info.shader_hash  = 0x6d6573686c647300ull ^ lds_dwords;
@@ -477,102 +494,29 @@ int DrawMeshLdsWgpPad() {
 	};
 
 	const auto probe_raw_lds = [&](const ShaderModule& mesh_mod, vk::PipelineCache cache) {
-		vk::PushConstantRange push_range {
-		    vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment, 0u,
-		    Recompiler::IR::NativePushConstantSize};
-		vk::DescriptorSetLayoutCreateInfo dsl_info {};
-		const auto dsl = Checked(device.createDescriptorSetLayout(dsl_info), "probe dsl");
-		vk::PipelineLayoutCreateInfo pl_info {};
-		pl_info.setLayoutCount         = 1u;
-		pl_info.pSetLayouts            = &dsl;
-		pl_info.pushConstantRangeCount = 1u;
-		pl_info.pPushConstantRanges    = &push_range;
-		const auto pl = Checked(device.createPipelineLayout(pl_info), "probe layout");
-
-		std::array<vk::PipelineShaderStageCreateInfo, 2> stages {};
-		stages[0] = {.stage = vk::ShaderStageFlagBits::eMeshEXT, .module = mesh_mod.module, .pName = "main"};
-		stages[1] = {.stage = vk::ShaderStageFlagBits::eFragment, .module = pixel_mod.module, .pName = "main"};
-
-		vk::PipelineViewportDepthClipControlCreateInfoEXT dcc {};
-		vk::PipelineViewportStateCreateInfo               vp {};
-		vp.pNext = &dcc;
-		vk::PipelineRasterizationDepthClipStateCreateInfoEXT dce {};
-		dce.depthClipEnable = VK_TRUE;
-		vk::PipelineRasterizationStateCreateInfo rs {};
-		rs.depthClampEnable = VK_TRUE;
-		rs.polygonMode      = vk::PolygonMode::eFill;
-		rs.pNext            = &dce;
-		vk::PipelineMultisampleStateCreateInfo ms {};
-		ms.rasterizationSamples = vk::SampleCountFlagBits::e1;
-		ms.minSampleShading     = 1.0f;
-		vk::PipelineColorBlendAttachmentState cba {};
-		cba.colorWriteMask      = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-		                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
-		cba.srcColorBlendFactor = vk::BlendFactor::eOne;
-		cba.dstColorBlendFactor = vk::BlendFactor::eZero;
-		cba.colorBlendOp        = vk::BlendOp::eAdd;
-		cba.srcAlphaBlendFactor = vk::BlendFactor::eOne;
-		cba.dstAlphaBlendFactor = vk::BlendFactor::eZero;
-		cba.alphaBlendOp        = vk::BlendOp::eAdd;
-		vk::PipelineColorBlendStateCreateInfo cb {};
-		cb.attachmentCount = 1u;
-		cb.pAttachments    = &cba;
-		const std::array dyn {
-		    vk::DynamicState::eViewportWithCount,
-		    vk::DynamicState::eScissorWithCount,
-		    vk::DynamicState::eLineWidth,
-		    vk::DynamicState::eCullMode,
-		    vk::DynamicState::eFrontFace,
-		    vk::DynamicState::eDepthTestEnable,
-		    vk::DynamicState::eDepthWriteEnable,
-		    vk::DynamicState::eDepthCompareOp,
-		    vk::DynamicState::eDepthBiasEnable,
-		    vk::DynamicState::eDepthBias,
-		    vk::DynamicState::eStencilTestEnable,
-		    vk::DynamicState::eStencilOp,
-		    vk::DynamicState::eStencilCompareMask,
-		    vk::DynamicState::eStencilReference,
-		    vk::DynamicState::eStencilWriteMask,
-		    vk::DynamicState::eBlendConstants,
-		    vk::DynamicState::eDepthBoundsTestEnable,
-		    vk::DynamicState::eDepthBounds,
-		};
-		vk::PipelineDynamicStateCreateInfo ds {};
-		ds.dynamicStateCount = static_cast<uint32_t>(dyn.size());
-		ds.pDynamicStates    = dyn.data();
-		vk::PipelineRenderingCreateInfo ri {};
-		ri.colorAttachmentCount    = 1u;
-		ri.pColorAttachmentFormats = &Format;
-		vk::GraphicsPipelineCreateInfo pci {};
-		pci.pNext               = &ri;
-		pci.stageCount          = static_cast<uint32_t>(stages.size());
-		pci.pStages             = stages.data();
-		pci.pViewportState      = &vp;
-		pci.pRasterizationState = &rs;
-		pci.pMultisampleState   = &ms;
-		pci.pColorBlendState    = &cb;
-		pci.pDynamicState       = &ds;
-		pci.layout              = pl;
-
-		const auto pipe = Checked(device.createGraphicsPipeline(cache, pci), "probe pipeline");
+		const std::array<const ShaderModule*, 4> stages {&mesh_mod, nullptr, nullptr, &pixel_mod};
+		PipelineCache::Pipeline layout {};
+		layout.native_bindings = true;
+		CreateGraphicsPipelineLayout(graphics, layout, key, stages);
+		const auto query = std::exchange(graphics.fn_get_shader_info, nullptr);
+		vk::Pipeline pipe;
+		Checked(CreateGraphicsPipelineWhole(graphics, layout, key, stages, cache, {}, pipe), "probe pipeline");
+		graphics.fn_get_shader_info = query;
 		VkShaderStatisticsInfoAMD stats {};
-		size_t                    stats_size = sizeof(stats);
-		uint32_t                  pad        = 0;
-		if (graphics.amd_shader_info_enabled) {
-			pad = QueryMeshLdsWgpPadDwords(graphics, pipe, mesh_mod);
-			(void)graphics.fn_get_shader_info(device, pipe, VK_SHADER_STAGE_MESH_BIT_EXT,
-			                                  VK_SHADER_INFO_TYPE_STATISTICS_AMD, &stats_size, &stats);
-		}
+		size_t size = sizeof(stats);
+		Require(query(device, pipe, VK_SHADER_STAGE_MESH_BIT_EXT, VK_SHADER_INFO_TYPE_STATISTICS_AMD,
+		              &size, &stats) == VK_SUCCESS && size == sizeof(stats), "mesh statistics unavailable");
+		const auto pad = QueryMeshLdsWgpPadDwords(graphics, pipe, mesh_mod);
 		device.destroyPipeline(pipe);
-		device.destroyPipelineLayout(pl);
-		device.destroyDescriptorSetLayout(dsl);
-		return std::pair<uint32_t, size_t> {pad, stats.resourceUsage.ldsUsageSizeInBytes};
+		device.destroyPipelineLayout(layout.pipeline_layout);
+		device.destroyDescriptorSetLayout(layout.descriptor_set_layout);
+		return std::pair {pad.value_or(0), stats.resourceUsage.ldsUsageSizeInBytes};
 	};
 
 	ShaderModule mesh_mod {};
 	uint32_t     probe_pad = 0;
 	size_t       probe_lds = 0;
-	if (graphics.amd_shader_info_enabled) {
+	if (graphics.fn_get_shader_info) {
 		for (const uint32_t candidate_dwords: {3200u, 3328u, 3456u, 3584u, 3712u, 3840u, 3968u, 4096u}) {
 			auto candidate = make_mesh_module(candidate_dwords);
 			const auto [pad, lds] = probe_raw_lds(candidate, nullptr);
@@ -597,8 +541,8 @@ int DrawMeshLdsWgpPad() {
 	Require(pipeline.pipeline != nullptr, "CreatePipelineInternal returned null pipeline");
 
 	size_t padded_lds = 0;
-	if (graphics.amd_shader_info_enabled) {
-		const uint32_t remaining = QueryMeshLdsWgpPadDwords(graphics, pipeline.pipeline, mesh_mod);
+	if (graphics.fn_get_shader_info) {
+		const auto remaining = QueryMeshLdsWgpPadDwords(graphics, pipeline.pipeline, mesh_mod);
 		VkShaderStatisticsInfoAMD stats {};
 		size_t                    stats_size = sizeof(stats);
 		Require(graphics.fn_get_shader_info(device, pipeline.pipeline, VK_SHADER_STAGE_MESH_BIT_EXT,
@@ -608,14 +552,14 @@ int DrawMeshLdsWgpPad() {
 		padded_lds = stats.resourceUsage.ldsUsageSizeInBytes;
 		Require(remaining == 0u,
 		        "built mesh pipeline still in unsafe WGP LDS bucket: lds=" +
-		            std::to_string(padded_lds) + " remaining_pad=" + std::to_string(remaining));
+		            std::to_string(padded_lds) + " remaining_pad=" + std::to_string(remaining.value_or(UINT32_MAX)));
 		Require(padded_lds >= probe_lds + static_cast<size_t>(probe_pad) * 4u,
 		        "built mesh pipeline LDS did not grow as expected: probe=" +
 		            std::to_string(probe_lds) + " padded=" + std::to_string(padded_lds));
 	}
 
 #if defined(ANYPS5_KYTY)
-	if (graphics.amd_shader_info_enabled && has_cache_control) {
+	if (graphics.fn_get_shader_info && has_cache_control) {
 		vk::PipelineCacheCreateInfo cache_info {};
 		const auto vk_cache = Checked(device.createPipelineCache(cache_info), "pipeline cache");
 		(void)probe_raw_lds(mesh_mod, vk_cache);
@@ -775,7 +719,7 @@ int DrawMeshLdsWgpPad() {
 	push[0] = 3u;
 	command.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
 	                      Recompiler::IR::NativePushConstantSize, push.data());
-	command.drawMeshTasksEXT(1024u, 1u, 1u);
+	command.drawMeshTasksEXT(1u, 1u, 1u);
 	command.endRendering();
 
 	image_barrier(vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eTransferSrcOptimal,
@@ -833,7 +777,7 @@ int DrawMeshLdsWgpPad() {
 	instance.destroy();
 
 	std::printf("%s_draw: ok, subgroup=%u amd_shader_info=%s lds=%zu->%zu pad=%u on %s\n", Name,
-	            subgroup, graphics.amd_shader_info_enabled ? "on" : "off", probe_lds, padded_lds,
+	            subgroup, graphics.fn_get_shader_info ? "on" : "off", probe_lds, padded_lds,
 	            probe_pad, gpu_name.c_str());
 	return 0;
 }

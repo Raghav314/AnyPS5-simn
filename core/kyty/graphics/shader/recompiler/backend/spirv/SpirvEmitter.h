@@ -34,6 +34,7 @@ struct Profile {
 	bool subgroup_quad = true;
 	uint32_t subgroup_stages = ~0u;
 	bool shader_resource_min_lod = true;
+	bool mesh_lds_padding = false;
 };
 
 inline constexpr Profile DefaultProfile {};
