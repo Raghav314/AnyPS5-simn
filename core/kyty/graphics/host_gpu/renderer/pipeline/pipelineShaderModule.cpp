@@ -152,7 +152,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .subgroup_ballot     = bool(operations & vk::SubgroupFeatureFlagBits::eBallot),
 	        .subgroup_shuffle    = bool(operations & vk::SubgroupFeatureFlagBits::eShuffle),
 	        .subgroup_quad       = bool(operations & vk::SubgroupFeatureFlagBits::eQuad),
-	        .subgroup_stages     = SubgroupStages(graphics.subgroup_supported_stages)};
+	        .subgroup_stages     = SubgroupStages(graphics.subgroup_supported_stages),
+	        .shader_resource_min_lod = graphics.shader_resource_min_lod_enabled};
 }
 
 bool PipelineCache::ResolveTessellationLayout(const HW::ShaderRegisters& sh, const ShaderParams& ls,

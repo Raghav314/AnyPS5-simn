@@ -113,6 +113,54 @@ const std::vector<Refusal> Refusals = {
      "image_get_lod requires a pixel or compute shader"},
 };
 
+struct MinLodCase {
+	const char*           name;
+	std::vector<uint32_t> words;
+	bool                  clamped;
+};
+
+const std::vector<MinLodCase> MinLodCases = {
+    {"image-sample", {0xf0800108u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u}, false},
+    {"image-sample-cl", {0xf0840108u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u}, true},
+    {"image-sample-b-cl", {0xf0980108u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u}, true},
+    {"image-sample-d-cl", {0xf08c0108u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u}, true},
+};
+
+bool HasMinLodCapability(std::span<const uint32_t> words) {
+	for (size_t offset = 5; offset < words.size();) {
+		const uint32_t count = words[offset] >> 16u;
+		if (count == 0u || count > words.size() - offset) return false;
+		if ((words[offset] & 0xffffu) == spv::OpCapability && count == 2u &&
+		    words[offset + 1u] == spv::CapabilityMinLod) return true;
+		offset += count;
+	}
+	return false;
+}
+
+bool MinLodFeature() {
+	for (const auto& entry: MinLodCases) {
+		for (const bool native: {true, false}) {
+			auto profile = KytyFuzz::Profile();
+			profile.shader_resource_min_lod = native;
+			std::vector<uint32_t> spirv;
+			std::string           refusal;
+			bool                  emitted = false;
+			KytyFuzz::Run(entry.words, 0x04, 0x00, &refusal, &emitted, &profile, &spirv);
+			if (entry.clamped && !native) {
+				if (!emitted && refusal.find("requires shaderResourceMinLod") != std::string::npos) continue;
+			} else {
+				std::string message;
+				if (emitted && KytyFuzz::Valid(spirv, message) &&
+				    HasMinLodCapability(spirv) == entry.clamped) continue;
+			}
+			std::printf("min-lod-feature: FAILED, %s, shaderResourceMinLod=%d: %s\n",
+			            entry.name, native, refusal.c_str());
+			return false;
+		}
+	}
+	return true;
+}
+
 struct ModeWrite {
 	uint32_t word;
 	uint32_t bits;
@@ -695,6 +743,11 @@ int main(int argc, char** argv) {
 		}
 		std::printf("correlated-phi: ok\n");
 		return 0;
+	}
+	if (argc < 2 || std::string_view(argv[1]) == "min-lod-feature") {
+		found = true;
+		if (!MinLodFeature()) return 1;
+		std::printf("min-lod-feature: ok\n");
 	}
 	for (const auto& entry: Cases) {
 		if (argc >= 2 && std::string_view(argv[1]) != entry.name) continue;
