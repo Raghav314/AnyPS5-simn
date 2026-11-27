@@ -194,6 +194,13 @@ std::string readFile(const std::filesystem::path& path) {
     return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
 }
 
+void writeFile(const std::filesystem::path& path, std::string_view contents) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    stream << contents;
+    if (!stream) throw std::runtime_error("could not write synthetic cache file");
+}
+
 std::map<std::string, std::string> cacheFiles(const std::filesystem::path& directory) {
     std::map<std::string, std::string> files;
     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
@@ -453,7 +460,7 @@ int rtStatsCache(const std::filesystem::path& tool, const std::filesystem::path&
         std::cerr << "RT statistics cache replay files: " << root << '\n';
         printTail(store_seed.log);
         if (store_seed.log.find("asks for native ray tracing") != std::string::npos ||
-            (std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr && vulkanUnavailable(store_seed))) return 77;
+            vulkanUnavailable(store_seed)) return 77;
         throw std::runtime_error("the normal shader-store seed replay did not complete");
     }
     const auto store = root / "store" / "_PipelineCache";
@@ -461,6 +468,10 @@ int rtStatsCache(const std::filesystem::path& tool, const std::filesystem::path&
     require(std::filesystem::is_regular_file(default_store), "the normal run did not save a shader store", store_seed);
     const auto store_bytes = readFile(default_store);
     require(!store_bytes.empty(), "the normal shader store is empty", store_seed);
+    const auto normal_driver = (std::filesystem::path("_PipelineCache") / "PREP00001").string();
+    const auto stats_driver = (std::filesystem::path("_PipelineCache") / "rt-stats" / "PREP00001").string();
+    require(store_seed.log.find("Vulkan pipeline cache: initializing " + normal_driver) != std::string::npos,
+            "the normal run did not select the normal Vulkan pipeline cache", store_seed);
     const auto normal_store_files = cacheFiles(store);
 
     setVariable("KYTY_RT_STATS", "1");
@@ -470,6 +481,7 @@ int rtStatsCache(const std::filesystem::path& tool, const std::filesystem::path&
                 cacheFiles(store) == normal_store_files &&
                 std::filesystem::is_regular_file(store / "rt-stats" / "PREP00001.shaders") &&
                 readFile(store / "rt-stats" / "PREP00001.shaders") != store_bytes &&
+                store_stats.log.find("Vulkan pipeline cache: initializing " + stats_driver) != std::string::npos &&
                 count(store_stats.log, BuildLine) != 0,
             "the statistics run changed the normal shader or Vulkan pipeline cache", store_stats);
 
@@ -484,9 +496,16 @@ int rtStatsCache(const std::filesystem::path& tool, const std::filesystem::path&
     setVariable("ANYPS5_NO_SHADER_CACHE", "1");
     setVariable("KYTY_PIPELINE_MANIFEST", "1");
     setVariable("KYTY_RECORD_PIPELINE_MANIFEST", "1");
-    const auto manifest_seed = run("manifest", "normal-seed", false);
-    require(manifest_seed.completed, "the normal manifest seed replay did not complete", manifest_seed);
     const auto cache = root / "manifest" / "_PipelineCache";
+    const auto normal_use = cache / "PREP00001_01.00.use";
+    const auto stats_use = cache / "rt-stats" / "PREP00001_01.00.use";
+    writeFile(normal_use, "# kyty shader use order v1\nS\n1111111111111111\n");
+    const auto manifest_seed = run("manifest", "normal-seed", false);
+    require(manifest_seed.completed &&
+                manifest_seed.log.find("1 shaders used in 1 earlier sessions go first (" +
+                                       (std::filesystem::path("_PipelineCache") / normal_use.filename()).string()) !=
+                    std::string::npos,
+            "the normal manifest run did not read its use order", manifest_seed);
     const auto default_manifest = cache / "PREP00001_01.00.kpm";
     const auto default_code = cache / "PREP00001_01.00.code";
     require(std::filesystem::is_regular_file(default_manifest) && std::filesystem::is_regular_file(default_code),
@@ -495,10 +514,15 @@ int rtStatsCache(const std::filesystem::path& tool, const std::filesystem::path&
     const auto normal_manifest_files = cacheFiles(cache);
     const auto code_bytes = readFile(default_code);
 
+    writeFile(stats_use, "# kyty shader use order v1\nS\n2222222222222222\n");
     setVariable("KYTY_RT_STATS", "1");
     const auto manifest_stats = run("manifest", "stats", false);
     require(manifest_stats.completed && manifest_stats.dump == manifest_seed.dump &&
                 cacheFiles(cache) == normal_manifest_files &&
+                manifest_stats.log.find("1 shaders used in 1 earlier sessions go first (" +
+                                        (std::filesystem::path("_PipelineCache") / "rt-stats" /
+                                         stats_use.filename()).string()) != std::string::npos &&
+                manifest_stats.log.find("Vulkan pipeline cache: initializing " + stats_driver) != std::string::npos &&
                 readFile(default_manifest) == manifest_bytes && readFile(default_code) == code_bytes &&
                 std::filesystem::is_regular_file(cache / "rt-stats" / "PREP00001_01.00.kpm") &&
                 std::filesystem::is_regular_file(cache / "rt-stats" / "PREP00001_01.00.code"),
