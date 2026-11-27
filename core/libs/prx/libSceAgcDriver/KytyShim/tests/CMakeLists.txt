@@ -823,6 +823,10 @@ if(NOT ANYPS5_ENABLE_ASAN AND NOT ANYPS5_ENABLE_TSAN)
             $<TARGET_FILE:agc_frame_replay> --prepared)
     set_tests_properties(kyty_shim_prepared_variant_first_use PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
             PASS_REGULAR_EXPRESSION "kyty_shim_prepared_variant_first_use: ok")
+    add_test(NAME kyty_shim_rt_stats_cache_isolation COMMAND kyty_shim_generic_compute_replay_tests
+            $<TARGET_FILE:agc_frame_replay> --rt-stats-cache)
+    set_tests_properties(kyty_shim_rt_stats_cache_isolation PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "kyty_shim_rt_stats_cache_isolation: ok")
 endif()
 add_test_executable(kyty_shim_packed_unorm_blend_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/PackedUnormBlend.cpp
@@ -904,7 +908,8 @@ if(WIN32)
             kyty_shim_cross_queue_early_label kyty_shim_cross_queue_recycled_label_own_tick
             APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
     if(NOT ANYPS5_ENABLE_ASAN AND NOT ANYPS5_ENABLE_TSAN)
-        set_property(TEST kyty_shim_prepared_variant_first_use APPEND PROPERTY ENVIRONMENT_MODIFICATION
+        set_property(TEST kyty_shim_prepared_variant_first_use kyty_shim_rt_stats_cache_isolation
+                APPEND PROPERTY ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
     endif()
 endif()

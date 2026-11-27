@@ -928,6 +928,7 @@ void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, boo
 
 std::string PipelineCacheTitleId();
 std::filesystem::path ShaderStorePath();
+std::filesystem::path PipelineCacheDirectory();
 uint64_t ShaderStoreBuildStamp();
 std::string StoreMismatch(std::span<const uint8_t> bytes, std::span<const uint8_t> header, uint64_t current_stamp);
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics, uint64_t stamp);
