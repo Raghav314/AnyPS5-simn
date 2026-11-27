@@ -1151,11 +1151,11 @@ uint32_t LoadIndirectScalarBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                            Unary(state, spv::OpUConvert, TypeU64(state),
 	                                  EmitUMax32(state, stride, ConstantU32(state, 1))),
 	                            Unary(state, spv::OpUConvert, TypeU64(state), ctx.Arg(handle, 2)));
-	const auto  offset = Binary(state, spv::OpBitwiseAnd, TypeU64(state),
-	                            Binary(state, spv::OpIAdd, TypeU64(state),
-	                                   Unary(state, spv::OpUConvert, TypeU64(state), ctx.Arg(inst, 1)),
-	                                   ConstantU64(state, ctx.Memory(inst).offset)),
-	                            ConstantU64(state, ~uint64_t {3}));
+	const auto  offset = Binary(state, spv::OpIAdd, TypeU64(state),
+	                            Unary(state, spv::OpUConvert, TypeU64(state),
+	                                  Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	                                         ctx.Arg(inst, 1), ConstantU32(state, ~3u))),
+	                            ConstantU64(state, ctx.Memory(inst).offset & ~3u));
 	const auto  end =
 	    Binary(state, spv::OpIAdd, TypeU64(state), offset, ConstantU64(state, sizeof(uint32_t)));
 	const auto scalar_address = [&]() {
@@ -2677,25 +2677,15 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	mem.kind           = IR::ResourceKind::ScalarBuffer;
 	const auto offset = inst.Arg(1).Resolve();
 	const auto static_index = offset.IsImmediate()
-	                              ? static_cast<uint32_t>((uint64_t {offset.U32()} + mem.offset) >> 2u)
+	                              ? (offset.U32() >> 2u) + (mem.offset >> 2u)
 	                              : 0u;
 	auto index = offset.IsImmediate()
 	                 ? ConstantU32(state, static_index)
 	                 : Binary(state, spv::OpShiftRightLogical, TypeU32(state), ctx.Arg(inst, 1),
 	                          ConstantU32(state, 2));
-	if (!offset.IsImmediate() && mem.offset != 0u) {
-		if ((mem.offset & 3u) != 0u) {
-			const auto low = Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(inst, 1),
-			                        ConstantU32(state, 3));
-			const auto carry = Binary(state, spv::OpIAdd, TypeU32(state), low,
-			                          ConstantU32(state, mem.offset));
-			index = Binary(state, spv::OpIAdd, TypeU32(state), index,
-			               Binary(state, spv::OpShiftRightLogical, TypeU32(state), carry,
-			                      ConstantU32(state, 2)));
-		} else {
-			index = Binary(state, spv::OpIAdd, TypeU32(state), index,
-			               ConstantU32(state, mem.offset >> 2u));
-		}
+	if (!offset.IsImmediate() && mem.offset >= 4u) {
+		index = Binary(state, spv::OpIAdd, TypeU32(state), index,
+		               ConstantU32(state, mem.offset >> 2u));
 	}
 	const auto storage_load = [&]() {
 		const auto access  = PrepareMemoryResourceAccess(state, mem);

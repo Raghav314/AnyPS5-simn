@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
+#include "graphics/shader/recompiler/ir/passes/RayQueryTraversal.h"
 
 #include <array>
 #include <cstdint>
@@ -148,6 +149,37 @@ void NodeCountFacts() {
            "the BLAS fact changes bit 31 only");
 }
 
+void WaveScalarReadKindFacts() {
+    IR::Program program;
+    program.memory_info.push_back({.kind = IR::ResourceKind::ScalarBuffer, .offset = 0u});
+    IR::Block block;
+    const auto read = [&](IR::Value offset) -> IR::Inst& {
+        return block.AppendNewInst(IR::ValueOpcode::ReadConstBuffer, {IR::Value(0u), offset});
+    };
+    auto& carried = block.AppendNewInst(IR::ValueOpcode::IAdd32, {IR::Value(3u), IR::Value(1u)});
+    Expect(IR::WaveScalarReadKind(program, read(IR::Value(&carried))) == IR::RayQueryResultKind::Word,
+           "a carry inside the register operand selects the second word");
+    auto& dynamic = block.AppendNewInst(IR::ValueOpcode::GetUserData, {IR::Value(static_cast<IR::ScalarReg>(0u))});
+    auto& unknown = block.AppendNewInst(IR::ValueOpcode::IAdd32, {IR::Value(&dynamic), IR::Value(1u)});
+    Expect(!IR::WaveScalarReadKind(program, read(IR::Value(&unknown))),
+           "an unknown register residue cannot identify a wave result word");
+    auto& aligned = block.AppendNewInst(IR::ValueOpcode::ShiftLeftLogical32, {IR::Value(&dynamic), IR::Value(3u)});
+    auto& first = block.AppendNewInst(IR::ValueOpcode::IAdd32, {IR::Value(&aligned), IR::Value(1u)});
+    auto& second = block.AppendNewInst(IR::ValueOpcode::IAdd32, {IR::Value(&aligned), IR::Value(4u)});
+    Expect(IR::WaveScalarReadKind(program, read(IR::Value(&first))) == IR::RayQueryResultKind::Node,
+           "a proven aligned register plus one selects the first word");
+    Expect(IR::WaveScalarReadKind(program, read(IR::Value(&second))) == IR::RayQueryResultKind::Word,
+           "a proven aligned register plus four selects the second word");
+    auto& masked = block.AppendNewInst(IR::ValueOpcode::BitwiseAnd32, {IR::Value(&dynamic), IR::Value(~7u)});
+    auto& masked_second = block.AppendNewInst(IR::ValueOpcode::IAdd32, {IR::Value(&masked), IR::Value(4u)});
+    Expect(IR::WaveScalarReadKind(program, read(IR::Value(&masked_second))) == IR::RayQueryResultKind::Word,
+           "masking the register low bits proves the second word");
+    auto& condition = block.AppendNewInst(IR::ValueOpcode::INotEqual32, {IR::Value(&dynamic), IR::Value(0u)});
+    auto& selected = block.AppendNewInst(IR::ValueOpcode::SelectU32, {IR::Value(&condition), IR::Value(&aligned), IR::Value(5u)});
+    Expect(!IR::WaveScalarReadKind(program, read(IR::Value(&selected))),
+           "a selected aligned or unaligned register remains unclassified");
+}
+
 void TriangleIndexSpirv() {
     namespace Emit = Spirv::Emitter;
     const IR::Value unused(0u);
@@ -194,6 +226,7 @@ int main() {
     EmptyWalks();
     Modes();
     NodeCountFacts();
+    WaveScalarReadKindFacts();
     TriangleIndexSpirv();
     if (failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

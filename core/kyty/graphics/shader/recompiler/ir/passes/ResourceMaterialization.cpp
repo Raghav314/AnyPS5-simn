@@ -670,7 +670,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		    (base & AddressMask & ~uint64_t {3}) + (offset & ~uint64_t {3}), bytes));
 	};
 	const auto scalar_buffer_offset = [&](uint64_t offset) {
-		return (offset + indirect.table_immediate) & ~uint64_t {3};
+		return (offset & ~uint64_t {3}) + (indirect.table_immediate & ~3u);
 	};
 	const auto normalization_failed = [&](uint64_t offset, uint32_t key, uint64_t step,
 	                                      std::string_view key_kind) {
@@ -1116,10 +1116,12 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) return false;
 			if (!indirect.selector_first.IsEmpty() && !WalkedValue(program, indirect.selector_first, first_key))
 				return false;
+			const auto first_offset = indirect.indexed
+			    ? uint64_t {indirect.table_offset} + indirect.table_immediate
+			    : scalar_buffer_offset(indirect.table_offset);
 			if (indirect.table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||
 			    (indirect.selector_first.IsEmpty() && key_count != 0u &&
-			         uint64_t {indirect.table_offset} + indirect.table_immediate +
-			         uint64_t {key_count - 1u} * indirect.table_stride + descriptor_bytes >
+			         first_offset + uint64_t {key_count - 1u} * indirect.table_stride + descriptor_bytes >
 			             UINT32_MAX + 1ull)) {
 				return false;
 			}

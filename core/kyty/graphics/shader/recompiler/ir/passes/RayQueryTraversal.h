@@ -1,8 +1,10 @@
 #pragma once
 
+#include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <array>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -13,6 +15,8 @@ struct Program;
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 [[nodiscard]] uint32_t TraceTraversalsWithRayQueries(Program& program);
+
+[[nodiscard]] std::optional<RayQueryResultKind> WaveScalarReadKind(const Program& program, const Inst& read);
 
 constexpr uint32_t OracleImprovementMask = 1u << 1;
 

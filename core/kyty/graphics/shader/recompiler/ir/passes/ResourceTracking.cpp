@@ -608,9 +608,8 @@ public:
 						offset = emit(ValueOpcode::ISub32, {dynamic, Value(indirect.table_offset)});
 						valid = emit(ValueOpcode::ULessThanEqual32, {Value(indirect.table_offset), dynamic});
 					} else {
-						const auto sum = emit(ValueOpcode::IAdd32, {read.Arg(1), Value(memory.offset)});
-						offset = emit(ValueOpcode::BitwiseAnd32, {sum, Value(~3u)});
-						valid = emit(ValueOpcode::ULessThanEqual32, {read.Arg(1), sum});
+						offset = emit(ValueOpcode::IAdd32, {dynamic, Value(memory.offset & ~3u)});
+						valid = emit(ValueOpcode::ULessThanEqual32, {dynamic, offset});
 					}
 				}
 				key = emit(ValueOpcode::SelectU32, {valid, offset, Value(UINT32_MAX)});
@@ -2707,8 +2706,8 @@ private:
 		if (memory == nullptr || memory->offset > INT32_MAX ||
 		    !MemoryIndexBelongsTo(memory_index, *read)) return false;
 		const bool affine = MatchTableOffset(read->Arg(1), index, offset, stride) &&
-		    ((offset | stride | memory->offset) & 3u) == 0u &&
-		    uint64_t {offset} + memory->offset <= UINT32_MAX;
+		    (stride & 3u) == 0u &&
+		    uint64_t {offset & ~3u} + (memory->offset & ~3u) <= UINT32_MAX;
 		if (affine) {
 			workgroup_axis = WorkgroupAxis(index, &first);
 			const auto* bound = BoundedLoop(index, read->Parent());
@@ -2768,14 +2767,10 @@ private:
 		}
 		if (require_bound && count.IsEmpty() && workgroup_axis == UINT32_MAX && !rows) return false;
 		if (!MakeRuntimeTableSource(*read, material_source)) return false;
-		if (memory->kind == ResourceKind::ScalarBuffer &&
-		    uint64_t {offset} + memory->offset > UINT32_MAX) return false;
+		if (uint64_t {offset & ~3u} + (memory->offset & ~3u) > UINT32_MAX) return false;
 		selector.source = InternSource(material_source);
 		selector.stride = stride;
-		selector.offset = memory->kind == ResourceKind::ScalarBuffer
-		    ? static_cast<uint32_t>((uint64_t {offset} + memory->offset) &
-		                            (byte_bias.IsEmpty() ? ~uint64_t {3} : UINT32_MAX))
-		    : offset + (memory->offset & ~3u);
+		selector.offset = (offset & ~3u) + (memory->offset & ~3u);
 		indirect.selector = std::move(selector);
 		indirect.selector_byte_bias = byte_bias;
 		indirect.key_count = count;
@@ -3219,8 +3214,8 @@ private:
 		Value table_guard;
 		const uint32_t alignment_mask = allow_fixed ? ~3u : UINT32_MAX;
 		const auto physical_offset = [&](uint32_t offset, uint32_t immediate, ResourceKind kind) {
-			return allow_fixed && kind == ResourceKind::ScalarBuffer
-			    ? (uint64_t {offset} + immediate) & ~uint64_t {3}
+			return kind == ResourceKind::ScalarBuffer || kind == ResourceKind::ScalarAddress
+			    ? uint64_t {offset & ~3u} + (immediate & ~3u)
 			    : uint64_t {offset & alignment_mask} + (immediate & alignment_mask);
 		};
 		for (uint32_t dword = 0; dword < plan.read_dwords; ++dword) {
@@ -3375,8 +3370,8 @@ private:
 			    !EquivalentValue(m_program, low->Arg(1), high->Arg(1)) ||
 			    !AvailableBefore(*low, *pointer) || !AvailableBefore(*high, *pointer) ||
 			    !MatchTableOffset(low->Arg(1), key, indirect.table_offset, indirect.table_stride) ||
-			    ((uint64_t {indirect.table_offset} + low_memory->offset) & ~uint64_t {3}) + 4u !=
-			        ((uint64_t {indirect.table_offset} + high_memory->offset) & ~uint64_t {3}) ||
+			    uint64_t {indirect.table_offset & ~3u} + (low_memory->offset & ~3u) + 4u !=
+			        uint64_t {indirect.table_offset & ~3u} + (high_memory->offset & ~3u) ||
 			    indirect.table_stride < 8u || (indirect.table_stride & 3u) != 0u ||
 			    !SetExactTableMaximum(key, indirect) ||
 			    (key.TryInstruction() != nullptr && !AvailableBefore(*key.Instruction(), handle)) ||
@@ -3583,16 +3578,16 @@ private:
 			if (memory == nullptr || memory->kind != ResourceKind::ScalarAddress ||
 			    !ImmediateU32(read->Arg(1), immediate) || memory->offset > INT32_MAX) return false;
 			const auto* current = read->Arg(0).Resolve().TryInstruction();
-			const auto offset = immediate + memory->offset;
-			if (current == nullptr || current->GetOpcode() != ValueOpcode::GetAddressResource ||
+			const auto offset = uint64_t {immediate & ~3u} + (memory->offset & ~3u);
+			if (offset > UINT32_MAX || current == nullptr || current->GetOpcode() != ValueOpcode::GetAddressResource ||
 			    current->NumArgs() < 2u ||
-			    (dword == 0u ? (offset & 3u) != 0u
-			                 : !EquivalentValue(m_program, Value(const_cast<Inst*>(pointer)),
-			                                    Value(const_cast<Inst*>(current))) ||
-			                       offset != record_offset + dword * 4u)) return false;
+			    (dword != 0u &&
+			     (!EquivalentValue(m_program, Value(const_cast<Inst*>(pointer)),
+			                       Value(const_cast<Inst*>(current))) ||
+			      offset != uint64_t {record_offset} + dword * 4u))) return false;
 			if (dword == 0u) {
 				pointer = current;
-				record_offset = offset;
+				record_offset = static_cast<uint32_t>(offset);
 			}
 			record_reads[dword] = read;
 		}
@@ -3616,8 +3611,8 @@ private:
 		    !EquivalentValue(m_program, low->Arg(0), high->Arg(0)) ||
 		    !EquivalentValue(m_program, low->Arg(1), high->Arg(1)) ||
 		    !MatchTableOffset(low->Arg(1), row_key, indirect.table_offset, indirect.table_stride) ||
-		    ((uint64_t {indirect.table_offset} + low_memory->offset) & ~uint64_t {3}) + 4u !=
-		        ((uint64_t {indirect.table_offset} + high_memory->offset) & ~uint64_t {3}) ||
+		    uint64_t {indirect.table_offset & ~3u} + (low_memory->offset & ~3u) + 4u !=
+		        uint64_t {indirect.table_offset & ~3u} + (high_memory->offset & ~3u) ||
 		    row_key.IsEmpty() || indirect.table_stride < 8u || (indirect.table_stride & 3u) != 0u ||
 		    !MakeRuntimeTableSource(*low, table_source) || table_source.dword_count != 4u) return false;
 		indirect.table_immediate = low_memory->offset;
@@ -3631,12 +3626,12 @@ private:
 				functions = body.aliases;
 			}
 		}
-		if (uint64_t {element_offset} + element_immediate > UINT32_MAX) return false;
+		if (uint64_t {element_offset & ~3u} + (element_immediate & ~3u) > UINT32_MAX) return false;
 		indirect.pointer_table = DescriptorSource::IndirectDescriptor::PointerTable {
 		    .offset = record_offset,
 		    .buffer = true,
 		    .element_stride = element_stride,
-		    .element_offset = (element_offset + element_immediate) & ~3u,
+		    .element_offset = (element_offset & ~3u) + (element_immediate & ~3u),
 		    .function = function,
 		    .functions = std::move(functions)};
 		DescriptorSource source;
@@ -3784,6 +3779,7 @@ private:
 			plan.retain_reads = true;
 		} else if (table_source.dword_count == 2u) {
 			if (table_mask != UINT32_MAX) return false;
+			indirect.table_offset &= ~3u;
 			auto guarded_count = UnsignedBoundOnEntry(key, handle.Parent());
 			if (guarded_count.IsEmpty()) guarded_count = UnsignedResourceBound(key, handle);
 			if (guarded_count.IsEmpty()) guarded_count = UnsignedBoundOnEntry(key, handle.Parent(), true);
@@ -3854,7 +3850,6 @@ private:
 				else if (!ProgramLoopCount(key, indirect))
 					return false;
 			}
-			if ((table_offset & 3u) != 0u) return false;
 		} else {
 			const auto* address = !plan.table_indexed && plan.reads[0] != nullptr
 			                          ? plan.reads[0]->Arg(1).Resolve().TryInstruction() : nullptr;
@@ -3862,7 +3857,9 @@ private:
 			uint32_t    key_memory_index = 0;
 			const auto* key_memory =
 			    key_read != nullptr ? ScalarReadMemory(*key_read, key_memory_index) : nullptr;
-			const auto table_base = uint64_t {table_offset} + table_immediate;
+			const auto table_base = plan.table_indexed
+			    ? uint64_t {table_offset} + table_immediate
+			    : uint64_t {table_offset & ~3u} + (table_immediate & ~3u);
 			const bool table_array =
 			    !sampler && indirect.workgroup_axis == UINT32_MAX && table_stride == 32u &&
 			    (key_memory == nullptr || key_memory->offset <= INT32_MAX) &&
@@ -4603,11 +4600,12 @@ private:
 			    (table != nullptr &&
 			     !EquivalentValue(m_program, Value(const_cast<Inst*>(table)),
 			                      Value(const_cast<Inst*>(current)))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset, stride) || stride != 16u ||
-			    memory->offset > UINT32_MAX - offset) {
+			    !MatchTableOffset(read->Arg(1), current_key, offset, stride) || stride != 16u) {
 				return false;
 			}
-			offset += memory->offset;
+			const auto aligned = uint64_t {offset & ~3u} + (memory->offset & ~3u);
+			if (aligned > UINT32_MAX) return false;
+			offset = static_cast<uint32_t>(aligned);
 			if (dword == 0u) {
 				key          = current_key;
 				table_offset = offset;

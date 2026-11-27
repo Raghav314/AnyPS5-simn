@@ -247,29 +247,46 @@ int main(int argc, char** argv) {
             std::cerr << test.name << ": " << failure << '\n';
             printTail(scalar.log);
         }
-        constexpr std::array combined_cases {
-            OffsetCase{Case{"combined offset in bounds", Input, 8u, 3u}, 1u, 4u},
-            OffsetCase{Case{"combined offset outside", Input, 4u, 3u}, 1u, 4u},
-            OffsetCase{Case{"combined offset without carry", Input, 8u, 2u}, 1u, 0u},
+        constexpr std::array alignment_cases {
+            OffsetCase{Case{"separate offset in bounds", Input, 8u, 3u}, 1u, 0u},
+            OffsetCase{Case{"separate offset at bound", Input, 4u, 3u}, 1u, 0u},
+            OffsetCase{Case{"separate offset without carry", Input, 8u, 2u}, 1u, 0u},
         };
-        for (std::size_t index = 0; index < combined_cases.size(); ++index) {
-            const auto& offset_case = combined_cases[index];
-            auto combined_words = ScalarWords;
-            combined_words[1] = 0x10000000u | offset_case.immediate;
-            auto single_words = ScalarWords;
-            single_words[1] = 0xfa000000u | offset_case.equivalent;
-            const auto combined = replay(tool, root / ("combined-" + std::to_string(index)), offset_case.test,
-                                         combined_words);
-            const auto single = replay(tool, root / ("single-" + std::to_string(index)), offset_case.test,
-                                       single_words);
-            if (combined.completed && single.completed && combined.frame == single.frame) {
+        for (std::size_t index = 0; index < alignment_cases.size(); ++index) {
+            const auto& offset_case = alignment_cases[index];
+            auto offset_words = ScalarWords;
+            offset_words[1] = 0x10000000u | offset_case.immediate;
+            auto reference_words = ScalarWords;
+            reference_words[1] = 0xfa000000u | offset_case.equivalent;
+            const auto offset = replay(tool, root / ("offset-" + std::to_string(index)), offset_case.test,
+                                       offset_words);
+            const auto reference = replay(tool, root / ("reference-" + std::to_string(index)), offset_case.test,
+                                          reference_words);
+            if (offset.completed && reference.completed && offset.frame == reference.frame) {
                 std::cout << offset_case.test.name << ": ok\n";
                 continue;
             }
             ++failures;
-            std::cerr << offset_case.test.name << ": combining the register and immediate offsets changed the scalar load\n";
-            printTail(combined.log);
-            printTail(single.log);
+            std::cerr << offset_case.test.name << ": separate register and immediate alignment changed the scalar load\n";
+            printTail(offset.log);
+            printTail(reference.log);
+        }
+        const Case raw_case{"separate raw address offsets", Input, 0x100u, 3u};
+        auto raw_words = ScalarWords;
+        raw_words[0] = 0xf4000400u;
+        raw_words[1] = 0x10000001u;
+        raw_words[2] = 0xf4000440u;
+        auto buffer_words = ScalarWords;
+        buffer_words[1] = 0xfa000000u;
+        const auto raw = replay(tool, root / "raw-offset", raw_case, raw_words);
+        const auto buffer = replay(tool, root / "buffer-reference", raw_case, buffer_words);
+        if (raw.completed && buffer.completed && raw.frame == buffer.frame) {
+            std::cout << raw_case.name << ": ok\n";
+        } else {
+            ++failures;
+            std::cerr << raw_case.name << ": separate raw address alignment changed the scalar load\n";
+            printTail(raw.log);
+            printTail(buffer.log);
         }
         if (failures != 0) return 1;
         std::filesystem::remove_all(root);
