@@ -825,6 +825,32 @@ void ProtectOwned(int protection) {
     GuestArena::GuestArenaNoteHostProtection_nid_no_patch(g_copyFaults.owned, Page, false);
 }
 
+void TestClampRememberedUntilViewChange() {
+    constexpr std::size_t bytes = Page * 4;
+    constexpr auto offset = 11u;
+    void* heap = GuestArena::GuestArenaAllocate_nid_postfix(bytes, Page);
+    Require(heap != nullptr);
+    const auto address = Address(heap) + offset;
+    const auto size = bytes - offset;
+    const auto expect = [&](std::uint64_t mapped) {
+        for (int i = 0; i < 4; ++i) Require(Memory::ClampRangeSize(address, size) == mapped);
+        std::uint64_t other = 0;
+        std::thread([&] { other = Memory::ClampRangeSize(address, size); }).join();
+        Require(other == mapped);
+    };
+    GuestArena::GuestArenaCommit_nid_postfix(heap, Page, 0x04, Page);
+    expect(Page - offset);
+    GuestArena::GuestArenaCommit_nid_postfix(heap, bytes, 0x04, bytes);
+    expect(size);
+    GuestArena::GuestArenaReset_nid_postfix(static_cast<std::uint8_t*>(heap) + Page * 2, Page * 2);
+    expect(Page * 2 - offset);
+    GuestArena::GuestArenaCommit_nid_postfix(heap, bytes, 0x04, bytes);
+    expect(size);
+    GuestArena::GuestArenaReset_nid_postfix(heap, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(heap, bytes);
+    std::printf("clamped range 0x%llx: the remembered mapped length follows every commit and reset, on this thread and another\n", static_cast<unsigned long long>(address));
+}
+
 void TestGuestCopyOut() {
     void* owned = nullptr;
     void* sealed = nullptr;
@@ -1258,6 +1284,7 @@ int main() {
     TestHeapBlockEvicted();
     TestHostView();
     TestUnreportedPrivateMemory();
+    TestClampRememberedUntilViewChange();
     TestGuestCopyOut();
     TestNoCrossWaitWithGpuThread();
     PrintTransparentHugePagePolicy();
