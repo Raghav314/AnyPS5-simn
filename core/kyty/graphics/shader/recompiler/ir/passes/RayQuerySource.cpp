@@ -2325,13 +2325,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 			if (index != UINT32_MAX && std::ranges::find(list, index) == list.end()) list.push_back(index);
 		}
 	}
-	for (const auto& site: sites) {
-		if (std::ranges::none_of(walks.loops, [&](const auto& loop) {
-			    return InLoop(program, site.bvh->Parent(), loop.first, loop.second);
-		    })) {
-			return Refuse("an intersection is outside every top-level walk");
-		}
-	}
+	if (walks.loops.empty()) return Refuse("no intersection starts a top-level walk");
 	node_counts.insert(node_counts.begin(), layout.node_count_80);
 	std::vector<uint32_t> candidates;
 	for (const auto& [root, distance]: roots) {
