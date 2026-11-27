@@ -45,10 +45,11 @@ Recheck earlier findings against the current diff when it is included. If
 the diff is incomplete, distinguish reported results from what you can verify.
 You can still acknowledge an update or answer a question grounded in the
 discussion. Keep acknowledgements brief; skip empty updates or thanks alone.
-Use plain Markdown without mentions, links, or HTML. Choose exactly one action.
-'reply' posts body. 'approve' applies to a pull request whose complete diff you
-checked and found correct, complete, and consistent with the project guidance;
-body is a short public note. 'reject' applies to a pull request with a blocking
+Use plain Markdown without mentions, links, or HTML. Choose exactly one action
+and submit it by calling the maintenance tool exactly once. 'reply' posts body.
+'approve' applies to a pull request whose complete diff you checked and found
+correct, complete, and consistent with the project guidance; body is a short
+public note. 'reject' applies to a pull request with a blocking
 defect; body states the defect and the fix. 'close' ends a thread that is spam,
 an exact duplicate, or cannot be acted on; body is a short reason. 'escalate'
 and 'skip' use an empty body. Never approve without the complete diff or because
@@ -116,15 +117,16 @@ def model_review(context, key):
         "https://api.anthropic.com/v1/messages",
         data=json.dumps({
             "model": "claude-sonnet-5-5",
-            "max_tokens": 900,
+            "max_tokens": 4096,
             "system": INSTRUCTIONS,
             "messages": [{"role": "user", "content": json.dumps(context, ensure_ascii=False)}],
             "tools": [{
                 "name": "maintenance",
                 "description": "Publish the triage decision for this thread.",
                 "input_schema": schema,
+                "strict": True,
             }],
-            "tool_choice": {"type": "tool", "name": "maintenance"},
+            "tool_choice": {"type": "auto"},
         }).encode(),
         headers={
             "x-api-key": key,
