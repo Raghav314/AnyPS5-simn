@@ -345,13 +345,20 @@ ViewState& State() {
 	return *state;
 }
 
-std::atomic<uint64_t> g_probe_epoch {0};
 std::atomic<uint64_t> g_probe_calls {0};
-std::atomic<bool> g_any_probe {false};
+#ifndef _WIN32
+std::atomic<uint64_t> g_probe_epoch {0};
+std::mutex g_probe_mutex;
+bool g_any_probe = false;
+#endif
 
-void ForgetProbes(uint64_t start, uint64_t size) {
+void ForgetProbes([[maybe_unused]] uint64_t start, [[maybe_unused]] uint64_t size) {
+#ifndef _WIN32
+	GuestDeliveryLock lock(g_probe_mutex);
 	g_probe_epoch.fetch_add(1, std::memory_order_seq_cst);
-	if (g_any_probe.load(std::memory_order_seq_cst)) Pages().ClearProbes(start, start + size);
+	if (g_any_probe) Pages().ClearProbes(start, start + size);
+	g_probe_epoch.fetch_add(1, std::memory_order_seq_cst);
+#endif
 }
 
 std::atomic<uint64_t> g_backing_epoch {0};
@@ -577,14 +584,20 @@ uint64_t ReadablePrefix(uint64_t start, uint64_t end) {
 			remote[count++] = {reinterpret_cast<void*>(static_cast<std::uintptr_t>(page)), 1};
 		}
 		const auto epoch = g_probe_epoch.load(std::memory_order_seq_cst);
-		g_any_probe.store(true, std::memory_order_seq_cst);
 		g_probe_calls.fetch_add(1, std::memory_order_relaxed);
 		const iovec local {sink.data(), count};
 		const auto read = ReadOwnMemory(local, remote.data(), count);
 		const auto known_end = std::min(read + 1u, count);
-		for (size_t i = 0; i < known_end; ++i) pages.StoreProbe(reinterpret_cast<std::uintptr_t>(remote[i].iov_base), i < read);
+		{
+			GuestDeliveryLock lock(g_probe_mutex);
+			if ((epoch & 1u) == 0u && g_probe_epoch.load(std::memory_order_seq_cst) == epoch) {
+				g_any_probe = true;
+				for (size_t i = 0; i < known_end; ++i) {
+					pages.StoreProbe(reinterpret_cast<std::uintptr_t>(remote[i].iov_base), i < read);
+				}
+			}
+		}
 		const auto probed_end = (reinterpret_cast<std::uintptr_t>(remote[known_end - 1u].iov_base) | HostPageMask) + 1u;
-		if (g_probe_epoch.load(std::memory_order_seq_cst) != epoch) pages.ClearProbes(cursor, probed_end);
 		if (read < count) return reinterpret_cast<std::uintptr_t>(remote[read].iov_base) - start;
 		cursor = probed_end;
 	}
@@ -1008,6 +1021,7 @@ bool IsFullyMapped(uint64_t vaddr, uint64_t size) {
 
 namespace {
 
+#ifndef _WIN32
 struct RememberedPrefix {
 	uint64_t vaddr = 0;
 	uint64_t size = 0;
@@ -1015,6 +1029,7 @@ struct RememberedPrefix {
 	uint64_t probe_epoch = ~uint64_t {0};
 	uint64_t backing_epoch = ~uint64_t {0};
 };
+#endif
 
 }
 
@@ -1022,16 +1037,23 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size)) {
 		Shim::Fail("KytyShim memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
 	}
+#ifndef _WIN32
 	thread_local std::array<RememberedPrefix, 256> remembered {};
 	const auto probe_epoch = g_probe_epoch.load(std::memory_order_seq_cst);
 	const auto backing_epoch = g_backing_epoch.load(std::memory_order_acquire);
 	auto& slot = remembered[((vaddr >> PageBits) ^ (size * 0x9e3779b97f4a7c15ull >> 56u)) & 255u];
-	if (slot.vaddr == vaddr && slot.size == size && slot.probe_epoch == probe_epoch && slot.backing_epoch == backing_epoch) return slot.prefix;
+	const bool stable = (probe_epoch & 1u) == 0u;
+	if (stable && slot.vaddr == vaddr && slot.size == size && slot.probe_epoch == probe_epoch &&
+	    slot.backing_epoch == backing_epoch) return slot.prefix;
+#endif
 	if (Shim::IsBacked(vaddr, size)) return size;
 	const auto clamped = MappedPrefix(vaddr, size);
-	if (clamped != 0 && g_probe_epoch.load(std::memory_order_seq_cst) == probe_epoch && g_backing_epoch.load(std::memory_order_acquire) == backing_epoch) {
+#ifndef _WIN32
+	if (stable && clamped != 0 && g_probe_epoch.load(std::memory_order_seq_cst) == probe_epoch &&
+	    g_backing_epoch.load(std::memory_order_acquire) == backing_epoch) {
 		slot = {vaddr, size, clamped, probe_epoch, backing_epoch};
 	}
+#endif
 	if (clamped == size) return size;
 	if (clamped == 0) {
 		Shim::Fail("KytyShim memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
