@@ -69,6 +69,8 @@ def gh(path, *, pages=False, method="GET", data=None):
         status = re.search(r"HTTP (\d{3})", result.stderr)
         code = status.group(1) if status else "unknown"
         raise RuntimeError(f"GitHub request failed ({code})")
+    if method == "DELETE" and not result.stdout.strip():
+        return None
     return json.loads(result.stdout)
 
 
@@ -409,6 +411,15 @@ def stage_passed(number, branch, sha, repo_id):
     return True
 
 
+def delete_integration_branches(number):
+    prefix = f"heads/{STAGE_PREFIX}{number}-"
+    refs = paginated(f"repos/{REPO}/git/matching-refs/{prefix}")
+    for item in refs:
+        ref = item["ref"].removeprefix("refs/")
+        if re.fullmatch(re.escape(prefix) + r"[0-9a-f]{40}-[0-9a-f]{40}", ref):
+            gh(f"repos/{REPO}/git/refs/{ref}", method="DELETE")
+
+
 def merge(number, words):
     pull = gh(pull_api(number))
     target = pull["base"]["ref"]
@@ -474,6 +485,7 @@ def merge(number, words):
             return
     push_with_lease(target, candidate, base)
     note(f"- Integrated the approved revision of #{number}.")
+    delete_integration_branches(number)
 
 
 def run(mode):
