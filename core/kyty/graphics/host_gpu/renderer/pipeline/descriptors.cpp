@@ -2794,10 +2794,6 @@ void RenderExecutor::CommitTemplateBindings(CommandBuffer& buffer, const Pipelin
 	                                           m_commit_data.data(), m_commit_data.size());
 }
 
-[[gnu::noinline]] static uint64_t BufferMapCheckFloor(uint64_t address, uint64_t size) noexcept {
-	return GuestRange {address, size}.Valid() ? uint64_t {1} << 30u : 0;
-}
-
 [[gnu::noinline]] static bool NullBufferNoticed(uint64_t shader_hash) noexcept {
 	return !Common::HackNotice::Report("V# outside guest memory bound as a null buffer",
 	                                   "RenderExecutor::FindBuffers", shader_hash, 0);
@@ -2851,7 +2847,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool
 				    (graphics.StorageMinAlignment() - 1);
 				size = std::min(std::min(size, uint64_t {256} * 1024 * 1024), limit);
 			}
-			if (size >= BufferMapCheckFloor(address, size) || descriptor.NumRecords() == UINT32_MAX) {
+			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX ||
+			    !GuestRange {address, size}.Valid()) {
 #if defined(ANYPS5_KYTY)
 				if (!Libs::LibKernel::Memory::IsFullyMapped(address, 1)) {
 					if (!NullBufferNoticed(program.shader_hash)) {
