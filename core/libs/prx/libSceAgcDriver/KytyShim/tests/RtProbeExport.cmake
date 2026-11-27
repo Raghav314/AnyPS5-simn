@@ -105,7 +105,7 @@ requireLine("program ${cacheOnlyHash} stage=cs wave=64 group=8,8,1 lds=8192 scra
 set(stopped "status=stop bvh=0 native=0 oracle=0 lane=0 empty=0 emulated=0 spirv=none[^\n]* phase=translate stop=shader_resource_tracking:[^\n]*buffer_descriptor_is_not_a_valid_runtime_value[^\n]*\n")
 requireLine("program ${stoppingHash} stage=cs wave=32 group=8,8,1 lds=8192 scratch=16384 modules=0 source=code ${stopped}")
 requireLine("program ${stoppingHash} stage=cs wave=64 group=8,8,1 lds=8192 scratch=16384 modules=0 source=code ${stopped}")
-requireLine("summary records=4 manifest_modules=3 manifest_skipped=0 code_only=2 programs=5 intersections=3 missing_code=1 unreadable=0 undecodable=0 truncated=0 seconds=")
+requireLine("summary records=4 manifest_modules=3 manifest_skipped=0 code_only=2 programs=5 intersections=3 code_only_wave_known=0 missing_code=1 unreadable=0 undecodable=0 truncated=0 seconds=")
 if(stdout MATCHES "program ${plainHash}")
     message(FATAL_ERROR "kyty_rt_probe --all listed a program without BVH intersections\n${stdout}")
 endif()

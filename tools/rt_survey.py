@@ -513,7 +513,7 @@ def render_text(document, limit=60):
     ]
     labels = (
         ("manifest", "Programs the game ran (pipeline manifest, inputs as the game set them)"),
-        ("code", "Programs only in the code cache (inputs guessed, both wave sizes tried)"),
+        ("code", "Programs only in the code cache (inputs guessed; wave size read from the code, both tried when the code does not show it)"),
     )
     for source, label in labels:
         part = totals["bySource"][source]

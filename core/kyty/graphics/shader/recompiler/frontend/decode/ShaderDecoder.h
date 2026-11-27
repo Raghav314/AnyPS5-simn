@@ -942,6 +942,7 @@ struct Program {
 Family GetInstructionFamily(uint32_t word);
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 Program DecodeFrontProgram(std::span<const uint32_t> front);
+[[nodiscard]] uint32_t ExecWaveSize(const Program& program);
 void DecodeProgram(std::span<const uint32_t> code, Program& program,
                    std::span<const LongBranch> long_branches = {});
 bool IsConditionalBranch(Opcode opcode);

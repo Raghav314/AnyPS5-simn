@@ -402,6 +402,21 @@ void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Inst
 	}
 }
 
+uint32_t ExecWaveSize(const Program& program) {
+	bool narrow = false;
+	bool wide   = false;
+	for (const auto& inst: program.instructions) {
+		if (inst.dst.kind == OperandKind::ExecHi) return 64u;
+		const auto name = magic_enum::enum_name(inst.opcode);
+		if (!name.starts_with("S_")) continue;
+		if (inst.dst.kind != OperandKind::ExecLo && name.find("SAVEEXEC") == std::string_view::npos) continue;
+		const bool pair = name.find("_B64") != std::string_view::npos;
+		narrow = narrow || (!pair && name.ends_with("_B32"));
+		wide   = wide || pair;
+	}
+	return narrow == wide ? 0u : narrow ? 32u : 64u;
+}
+
 Program DecodeFrontProgram(std::span<const uint32_t> front) {
 	Program  result;
 	uint32_t front_words = 0;
