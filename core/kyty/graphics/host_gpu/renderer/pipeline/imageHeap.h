@@ -65,6 +65,10 @@ private:
 		}
 	};
 
+	struct SlotDemand {
+		uint64_t insertions = 0;
+		size_t   required   = 0;
+	};
 	enum class State : uint8_t { Live, Stale, Buried };
 
 	struct View;
@@ -104,6 +108,7 @@ private:
 		size_t                       changed_begin = 0;
 		size_t                       changed_end   = 0;
 		size_t                       order         = 0;
+		SlotDemand                   demand;
 		bool                         overflowed    = false;
 		bool                         released      = false;
 	};
@@ -135,8 +140,9 @@ private:
 	void     Watch(const Memory& memory, size_t begin, size_t end);
 	void     Unwatch(const Memory& memory);
 	void     Drop(Memory& memory);
-	void     UpdateProbes(View& view, uint64_t begin, uint64_t end);
-	void     UpdateProbe(View& view, uint64_t probe);
+	bool     UpdateProbes(View& view, uint64_t begin, uint64_t end);
+	std::pair<Key, uint32_t> ReadProbe(View& view, uint64_t probe, bool update_dead);
+	void     ReleaseView(View& view);
 	void     Assign(View& view, size_t slot, uint32_t entry);
 	void     Assign(List& list, size_t slot, uint32_t entry);
 	template <typename Owner>
@@ -156,6 +162,10 @@ private:
 	void     TakeChanges();
 	ImageId  CurrentImage(const Image::HeapChange& change);
 	uint32_t Allocate(bool may_fail);
+	size_t   FreeSlots(bool table) const;
+	size_t   ReclaimSlots(bool table);
+	void     ReclaimCompleted(uint64_t tick);
+	bool     CouldFit(const SlotDemand& demand, size_t available) const;
 	void     Resize(Memory& memory, uint64_t base, uint64_t size);
 	void     WriteDescriptors();
 
@@ -177,6 +187,8 @@ private:
 	std::vector<uint32_t>                             m_marked;
 	std::vector<Use>                                  m_visits;
 	std::unordered_map<Key, uint32_t, KeyHash>        m_index;
+	uint64_t                                          m_insertions = 0;
+	uint64_t                                          m_reclaim_tick = 0;
 	std::vector<uint32_t>                             m_free;
 	std::vector<uint32_t>                             m_pending;
 	std::vector<uint32_t>                             m_released;
