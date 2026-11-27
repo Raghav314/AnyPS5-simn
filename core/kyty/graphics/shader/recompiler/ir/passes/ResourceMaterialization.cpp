@@ -1386,16 +1386,44 @@ bool MaterializeImageTable(const ResourcePlan& program,
 	image.table_capacity       = ImageTableCapacity(slots.size());
 	image.table_mapping_offset = mapping_offsets[table_index];
 	image.table_entry_mask     = entry_mask;
-	snapshot.images[image_index] = {.dword_count = 8u};
+	const auto& table_snapshot = **found;
+	struct Exemplar {
+		uint64_t                                slots_id = 0;
+		std::weak_ptr<const ImageTableSnapshot>  snapshot;
+		Decoder::ImageDimension                 dimension = Decoder::ImageDimension::Unknown;
+		bool                                    cube = false;
+		uint32_t                                slot = UINT32_MAX;
+	};
+	static thread_local std::array<Exemplar, 8> exemplars;
+	static thread_local unsigned next_exemplar = 0;
+	const bool remember = table_snapshot.slots_id != 0 && slots.size() >= 32;
+	if (remember) {
+		for (const auto& example: exemplars) {
+			if (example.slots_id != table_snapshot.slots_id || example.dimension != root.dimension ||
+			    example.cube != root.cube || example.snapshot.lock().get() != &table_snapshot) {
+				continue;
+			}
+			snapshot.images[image_index] =
+			    example.slot == UINT32_MAX ? DescriptorValue {.dword_count = 8u} : slots[example.slot];
+			return true;
+		}
+	}
+	uint32_t slot = UINT32_MAX;
 	for (const bool float_only: {true, false}) {
-		const auto exemplar = std::ranges::find_if(slots, [&](const DescriptorValue& slot) {
-			return TableExemplar(root, slot, float_only);
+		const auto exemplar = std::ranges::find_if(slots, [&](const DescriptorValue& value) {
+			return TableExemplar(root, value, float_only);
 		});
 		if (exemplar != slots.end()) {
-			snapshot.images[image_index] = *exemplar;
+			slot = static_cast<uint32_t>(exemplar - slots.begin());
 			break;
 		}
 	}
+	snapshot.images[image_index] = slot == UINT32_MAX ? DescriptorValue {.dword_count = 8u} : slots[slot];
+	if (remember) {
+		exemplars[next_exemplar++ % exemplars.size()] =
+		    {table_snapshot.slots_id, *found, root.dimension, root.cube, slot};
+	}
+
 	return true;
 }
 
