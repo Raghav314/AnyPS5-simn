@@ -476,6 +476,14 @@ void CodeWaveSize() {
     constexpr uint32_t mov_exec_hi  = 0xbeff0300u;
     constexpr uint32_t and_exec_lo  = 0x877e007eu;
     constexpr uint32_t and_exec     = 0x87fe007eu;
+    constexpr uint32_t count_bits   = 0xbefe1000u;
+    constexpr uint32_t replicate    = 0xbefe3b00u;
+    constexpr uint32_t shift_i64    = 0x91fe007eu;
+    constexpr uint32_t cmp_exec_hi  = 0xd4c2007fu;
+    constexpr uint32_t cmp_sources  = 0x00020501u;
+    Expect(wave({cmp_exec_hi, cmp_sources}) == 0u, "a vector comparison destination does not establish a scalar mask width");
+    Expect(wave({count_bits}) == 32u && wave({replicate}) == 64u, "mixed-type scalar operations use their destination width");
+    Expect(wave({shift_i64}) == 64u && wave({count_bits, shift_i64}) == 0u, "signed scalar writes participate in width inference");
     Expect(wave({mov_exec_lo, saveexec_b32}) == 32u, "code that writes exec with 32-bit operations is wave32");
     Expect(wave({mov_exec, saveexec_b64}) == 64u, "code that writes exec with 64-bit operations is wave64");
     Expect(wave({saveexec_b32}) == 32u && wave({saveexec_b64}) == 64u, "a saveexec alone decides the width");

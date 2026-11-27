@@ -538,12 +538,9 @@ int RunSurvey(const SurveySettings& settings) {
             rows.push_back(std::move(row));
             continue;
         }
-        std::vector<std::uint32_t> waves {64u, 32u};
-        if (decoded->wave != 0) {
-            waves = {decoded->wave};
-            ++sized;
-        }
-        for (const std::uint32_t wave: waves) {
+        if (decoded->wave != 0) ++sized;
+        for (const std::uint32_t wave: {64u, 32u}) {
+            if (decoded->wave != 0 && decoded->wave != wave) continue;
             Prepared guess{DefaultComputeModule(wave), {}, {}};
             guess.module.code_hash = entry->hash;
             Prepare(guess, settings, {});
