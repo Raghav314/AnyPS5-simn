@@ -1248,6 +1248,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands[1] = AddressF32(ctx, mem, *address, layout.bias);
 			operand_count = 2;
 		}
+		if (min_lod != 0 && !state.profile.shader_resource_min_lod) {
+			ctx.Fail(inst, "requires shaderResourceMinLod for a shader LOD clamp");
+		}
 		if (layout.offset != NoImageComponent && !offset_value.IsImmediate() &&
 		    !state.profile.maintenance8) {
 			ctx.Fail(inst, "requires maintenance8 for a dynamic sample texel offset");
