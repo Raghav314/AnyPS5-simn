@@ -130,7 +130,7 @@ def ask_model(context, key, model, final):
     }
     payload = {
         "model": model,
-        "max_tokens": 4096,
+        "max_tokens": 12000 if final else 8000,
         "system": INSTRUCTIONS + (FINAL_REVIEWER if final else FIRST_REVIEWER),
         "messages": [{"role": "user", "content": json.dumps(context, ensure_ascii=False)}],
         "tools": [{
@@ -152,7 +152,7 @@ def ask_model(context, key, model, final):
             "content-type": "application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=240 if final else 150) as response:
+    with urllib.request.urlopen(request, timeout=360 if final else 150) as response:
         result = json.load(response)
     for part in result.get("content", []):
         if part.get("type") == "tool_use" and part.get("name") == "maintenance":
