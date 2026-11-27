@@ -316,11 +316,15 @@ private:
 		std::array<uint32_t, 8> dwords {};
 		TableElementResolution* element = nullptr;
 		uint32_t                version_slot = UINT32_MAX;
+		uint32_t                run_end      = 0;
 	};
 	struct TableResolution {
 		ShaderRecompiler::IR::ImageResource root;
 		uint64_t                            last_use   = 0;
 		uint64_t                            generation = 0;
+		uint64_t                            slots_id = 0;
+		uint32_t                            matching_slots = 0;
+		uint32_t                            grouped_slots = 0;
 		TableElements                       elements;
 		std::vector<TableSlot>              slots;
 	};

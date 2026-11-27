@@ -1284,6 +1284,7 @@ void RenderExecutor::RetireTableResolution(TableResolution& table) {
 	}
 	table.elements.clear();
 	table.slots.clear();
+	table.slots_id = 0;
 }
 
 void RenderExecutor::TrimTableResolutions() {
@@ -1815,6 +1816,7 @@ void RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderI
 				element  = &ResolveTableElement(resolution, value, stamp);
 				resolved = true;
 			}
+			resolution.slots_id = 0;
 			memo = {value.dwords, element, element->version_slot};
 		}
 		const auto version_slot = memo.version_slot;
@@ -2397,23 +2399,64 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		if (resolution.slots.size() < root.table_capacity) {
 			resolution.slots.resize(root.table_capacity);
 		}
-		for (uint32_t slot = 0; slot < root.table_capacity; slot++) {
-			const auto& value =
-			    slot != 0u && slot < table.slots.size() ? table.slots[slot] : null_value;
-			table_state->values.push_back(value);
-			auto& memo = resolution.slots[slot];
-			if (memo.element != nullptr && memo.dwords == value.dwords) {
-				auto& element = *memo.element;
-				if (element.prepared_stamp != stamp) {
-					(void)ResolveTableElement(resolution, value, stamp, &element);
-				}
-				add(element, value);
-			} else {
-				auto& element = ResolveTableElement(resolution, value, stamp);
-				memo          = {value.dwords, &element, element.version_slot};
-				add(element, value);
+		const auto present = std::min<size_t>(root.table_capacity, std::max<size_t>(1, table.slots.size()));
+		const auto first_slot = prepared.table_slots.size();
+		const auto visit = [&](TableElementResolution& element, const auto& value) {
+			if (element.prepared_stamp != stamp) {
+				(void)ResolveTableElement(resolution, value, stamp, &element);
 			}
+			add(element, value);
+		};
+		if (table.slots_id != 0 && resolution.slots_id == table.slots_id &&
+		    present <= resolution.matching_slots) {
+			if (present > resolution.grouped_slots) {
+				for (size_t first = 0; first < present;) {
+					auto& head = resolution.slots[first];
+					size_t end = first + 1;
+					while (end < present && resolution.slots[end].element == head.element) {
+						++end;
+					}
+					head.run_end = static_cast<uint32_t>(end);
+					first = end;
+				}
+				resolution.grouped_slots = static_cast<uint32_t>(present);
+			}
+			for (size_t first = 0; first < present;) {
+				const auto& memo = resolution.slots[first];
+				const auto& value = first != 0 ? table.slots[first] : null_value;
+				visit(*memo.element, value);
+				const auto end = std::min<size_t>(memo.run_end, present);
+				if (end > first + 1) {
+					prepared.table_slots.insert(prepared.table_slots.end(), end - first - 1,
+					                            memo.element->prepared_index);
+				}
+				first = end;
+			}
+		} else {
+			for (size_t slot = 0; slot < present; ++slot) {
+				const auto& value = slot != 0 ? table.slots[slot] : null_value;
+				auto& memo = resolution.slots[slot];
+				if (memo.element != nullptr && memo.dwords == value.dwords) {
+					visit(*memo.element, value);
+				} else {
+					auto& element = ResolveTableElement(resolution, value, stamp);
+					memo          = {value.dwords, &element, element.version_slot};
+					add(element, value);
+				}
+			}
+			resolution.slots_id = table.slots_id;
+			resolution.matching_slots = static_cast<uint32_t>(present);
+			resolution.grouped_slots = 0;
 		}
+		const auto padding = root.table_capacity - present;
+		const auto null_index = prepared.table_slots[first_slot];
+		prepared.table_slots.insert(prepared.table_slots.end(), padding, null_index);
+		auto& values = table_state->values;
+		values.push_back(null_value);
+		if (present > 1) {
+			values.insert(values.end(), table.slots.begin() + 1, table.slots.begin() + present);
+		}
+		values.insert(values.end(), padding, null_value);
 	});
 	if (!same_program || prepared.samplers.size() != program.info.samplers.size() ||
 	    prepared.last_samplers != snapshot.samplers) {
