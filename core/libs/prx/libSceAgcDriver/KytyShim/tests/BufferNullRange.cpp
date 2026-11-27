@@ -44,7 +44,8 @@ constexpr std::array<std::uint32_t, 7> CopyWords{
 using Sharp = std::array<std::uint32_t, 4>;
 
 enum class Variant { Zero, Bound, Logged, Small, Straddle, RawFour, RawSix, RawSoffset, StructuredZero, StructuredNext,
-                     IndexedZero, IndexedNext, IndexedWrap, NoStore, StoreZero, StoreNext, AtomicZero, AtomicNext };
+                     StructuredBound, IndexCarry, OffsetCarry, IndexedZero, IndexedNext, IndexedWrap, NoStore, StoreZero,
+                     StoreNext, AtomicZero, AtomicNext };
 
 struct Case {
     const char* name;
@@ -63,6 +64,9 @@ constexpr std::array Cases{
     Case{"raw-soffset", Variant::RawSoffset, false},
     Case{"structured-zero", Variant::StructuredZero, false},
     Case{"structured-next", Variant::StructuredNext, false},
+    Case{"structured-bound", Variant::StructuredBound, false},
+    Case{"index-carry", Variant::IndexCarry, false},
+    Case{"offset-carry", Variant::OffsetCarry, false},
     Case{"indexed-zero", Variant::IndexedZero, false},
     Case{"indexed-next", Variant::IndexedNext, false},
     Case{"indexed-wrap", Variant::IndexedWrap, false},
@@ -104,8 +108,15 @@ Sharp sourceSharp(Variant variant) {
         case Variant::RawSix: return sharp(Input, 6u);
         case Variant::RawSoffset: return sharp(Input, 4u);
         case Variant::StructuredZero:
+        case Variant::StructuredBound:
+        case Variant::OffsetCarry:
         case Variant::IndexedZero:
         case Variant::IndexedWrap: return sharp(Input, Lanes, 4u);
+        case Variant::IndexCarry: {
+            auto descriptor = sharp(Input, Lanes, 4u);
+            descriptor[3] |= 1u << 23u;
+            return descriptor;
+        }
         case Variant::StructuredNext:
         case Variant::IndexedNext: {
             auto descriptor = sharp(Input, Lanes + 1u, 4u);
@@ -151,6 +162,15 @@ void writeShader(std::span<std::byte> memory, Variant variant) {
     std::vector<std::uint32_t> code(CopyWords.begin(), CopyWords.end());
     if (variant == Variant::RawSoffset) code[2] = 0x84000201u;
     if (variant == Variant::StructuredZero || variant == Variant::StructuredNext) code[1] |= 4u;
+    if (variant == Variant::StructuredBound) {
+        code[1] = 0xe0302000u;
+        code[2] = 0x80000200u;
+    }
+    if (variant == Variant::IndexCarry || variant == Variant::OffsetCarry) {
+        code.insert(code.begin() + 1, 0x7e0602c1u);
+        code[2] = variant == Variant::IndexCarry ? 0xe0302000u : 0xe0301001u;
+        code[3] = 0x80000203u;
+    }
     if (variant == Variant::IndexedZero || variant == Variant::IndexedNext) {
         code[1] = 0xe0302004u;
         code[2] = 0x80000200u;
@@ -298,6 +318,8 @@ int main(int argc, char** argv) {
                                       : "unexpected null-buffer notice";
             } else if (test.variant == Variant::Bound && result.frame == zero_frame) {
                 failure = "the bound V# did not copy its source";
+            } else if (test.variant == Variant::StructuredBound && result.frame != bound_frame) {
+                failure = "an in-range structured buffer did not copy its source";
             } else if (test.notice && result.frame != zero_frame) {
                 failure = "a null buffer did not read as zero";
             } else if ((test.variant == Variant::RawFour || test.variant == Variant::StructuredNext ||
@@ -305,6 +327,7 @@ int main(int argc, char** argv) {
                        result.frame == zero_frame) {
                 failure = "an in-range buffer did not copy its source";
             } else if ((test.variant == Variant::RawSoffset || test.variant == Variant::StructuredZero ||
+                        test.variant == Variant::IndexCarry || test.variant == Variant::OffsetCarry ||
                         test.variant == Variant::IndexedZero || test.variant == Variant::IndexedWrap) &&
                        result.frame != zero_frame) {
                 failure = "an out-of-range buffer did not read as zero";

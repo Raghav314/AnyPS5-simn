@@ -525,16 +525,25 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	    Binary(state, spv::OpISub, TypeU32(state), available, ConstantU32(state, 1u)),
 	    EmitUMax32(state, stride, ConstantU32(state, 1u)));
 	auto index = ctx.Arg(inst, 1);
-	if ((buffer.packed_stride & (1u << 20u)) != 0u)
+	auto in_bounds = payload_in_bounds;
+	if ((buffer.packed_stride & (1u << 20u)) != 0u) {
+		const auto original = index;
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
-	auto in_bounds = AndCondition(state, payload_in_bounds,
+		in_bounds = AndCondition(state, in_bounds,
+		                         Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), index, original));
+	}
+	const auto original_offset = ctx.Arg(inst, 2);
+	const auto offset = mem.offset == 0u ? original_offset
+	    : Binary(state, spv::OpIAdd, TypeU32(state), original_offset,
+	             ConstantU32(state, mem.offset));
+	if (mem.offset != 0u)
+		in_bounds = AndCondition(state, in_bounds,
+		                         Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), offset, original_offset));
+	in_bounds = AndCondition(state, in_bounds,
 	    AndCondition(state,
 	        Binary(state, spv::OpUGreaterThan, TypeBool(state), bytes, resource.byte_offset),
 	        Binary(state, spv::OpULessThanEqual, TypeBool(state), index, last_record)));
 	if (!structured) return in_bounds;
-	const auto offset = mem.offset == 0u ? ctx.Arg(inst, 2)
-	    : Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 2),
-	             ConstantU32(state, mem.offset));
 	const auto offset_in_bounds = payload_bytes == 0u
 	    ? Binary(state, spv::OpULessThan, TypeBool(state), offset, stride)
 	    : AndCondition(state,
