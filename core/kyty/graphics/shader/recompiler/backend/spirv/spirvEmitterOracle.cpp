@@ -57,11 +57,10 @@ struct Call {
 	uint32_t has        = 0;
 };
 
-LaneVariables QueryLane(EmitterState& s, uint32_t half) {
+LaneVariables QueryLane(EmitterState& s, uint32_t half, bool multi) {
 	LaneVariables lane;
 	lane.query = s.oracle.lanes[half].query;
 	lane.state = s.oracle.lanes[half].state;
-	const bool multi = s.oracle.multi;
 	lane.nodes       = multi ? s.oracle.lanes[half].nodes : s.oracle.nodes;
 	lane.slots       = multi ? s.oracle.lanes[half].slots : s.oracle.slots;
 	return lane;
@@ -250,7 +249,7 @@ uint32_t EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto first  = NodeAddress(s, Load(s, wide, s.oracle.header), Wide(s, root));
 	const auto again  = Binary(s, spv::OpIAdd, wide, first, ConstantU64(s, 64));
 	const auto slack  = ConstantF32Value(s, 1.0001f);
-	const bool multi  = s.oracle.multi;
+	const bool multi  = s.oracle.multi && (inst.Flags<uint32_t>() & IR::BvhIntersectOracleMulti) != 0;
 	struct Bound {
 		uint32_t valid = 0;
 		uint32_t first = 0;
@@ -273,7 +272,7 @@ uint32_t EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst) {
 	for (uint32_t half = 0; half < s.lane_count; half++) {
 		auto&       c    = calls[half];
 		const auto& vars = s.oracle.lanes[half];
-		const auto  lane = QueryLane(s, half);
+		const auto  lane = QueryLane(s, half, multi);
 		c.descriptor     = ctx.HalfArg(inst, 0, half);
 		c.node           = ctx.HalfArg(*ray, 0, half);
 		c.wide           = node_words == 2u ? PackU64(s, c.node, ctx.HalfArg(*ray, 1, half)) : Wide(s, c.node);

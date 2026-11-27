@@ -2313,6 +2313,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	}
 	std::vector<std::array<size_t, 5>> picks;
 	for (size_t source = 0; source < named_sources.size(); ++source) {
+		if (!accepted[source]) continue;
 		for (size_t count = 0; count < node_counts.size(); ++count) {
 			for (size_t tlas_root = 0; tlas_root < tops.size(); ++tlas_root) {
 				for (size_t root = 0; root < candidates.size() && picks.size() < 4096; ++root) {

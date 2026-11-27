@@ -5798,17 +5798,16 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			if (adopt(walk)) return false;
 			extra_sources = std::move(bound);
 			walk.foreign  = false;
-		}
-		if (shares(walk) || separate(walk)) {
 			const auto primary = [&](const RayQueryExtraSource& named) {
 				return named.user_sgpr == reference.user_sgpr && named.header_offset == reference.header_offset && named.header_vsharp == reference.header_vsharp;
 			};
-			if (walk.kind == Kind::Universal && !walk.headers.empty() && std::ranges::none_of(walk.headers, primary)) {
-				LOGF("%s universal ray tracing: hash=0x%016llx binds a walk that starts from another tree to the primary tree\n", compute ? "CS" : "PS",
+			if (!walk.headers.empty() && std::ranges::none_of(walk.headers, primary)) {
+				LOGF("%s universal ray tracing: hash=0x%016llx keeps a walk over an incompatible tree on the guest\n", compute ? "CS" : "PS",
 				     static_cast<unsigned long long>(program.shader_hash));
+				return true;
 			}
-			return false;
 		}
+		if (shares(walk) || separate(walk)) return false;
 		const auto kept = std::ranges::count_if(intersections, [&](const Inst* bvh) { return InLoop(program, bvh->Parent(), walk.header, walk.latch); });
 		LOGF("%s universal ray tracing: hash=0x%016llx keeps %zu intersections on the guest walk: another walk of the program names another source or layout\n",
 		     compute ? "CS" : "PS", static_cast<unsigned long long>(program.shader_hash), static_cast<size_t>(kept));
