@@ -41,7 +41,12 @@ Recheck earlier findings against the current diff when it is included. If
 the diff is incomplete, distinguish reported results from what you can verify.
 You can still acknowledge an update or answer a question grounded in the
 discussion. Keep acknowledgements brief; skip empty updates or thanks alone.
-Use plain Markdown without mentions, links, or HTML. Choose exactly one action
+Use plain Markdown without mentions, links, or HTML. A body is discarded when it
+exceeds 1500 characters or contains the characters @, < or >, a URL, or a closing
+square bracket followed by an opening bracket or parenthesis. Name identifiers in
+backticks without template arguments, arrows, or chained indexes, and write
+comparisons in words.
+Choose exactly one action
 and submit it by calling the maintenance tool exactly once. 'reply' posts body.
 'approve' applies to a pull request whose complete diff you checked and found
 correct, complete, and consistent with the project guidance; body is a short
@@ -269,8 +274,10 @@ def review(number, key, words, *, targeted=False):
     if action == "approve" and "diff" not in context:
         action = "reject"
         body = "The complete diff was unavailable, so this revision could not be approved."
-    if not public_reply(body) or not safe_for_publication(body.encode(), words):
-        note(f"- Publication checks blocked a drafted reply on #{number}.")
+    well_formed = public_reply(body)
+    if not well_formed or not safe_for_publication(body.encode(), words):
+        reason = "scan" if well_formed else "format"
+        note(f"- Publication checks blocked a drafted reply on #{number} ({reason}, {len(body)} characters).")
         return True
     latest = gh(issue_api(number))
     if (
