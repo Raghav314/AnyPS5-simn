@@ -38,11 +38,12 @@ void Require(bool condition, const char* message) {
 	std::exit(EXIT_FAILURE);
 }
 
-constexpr std::array Consumer {
-    0x7e040208u,
+constexpr auto MakeConsumer(uint32_t materialIndexSource, uint32_t activeLanes) {
+	return std::array {
+    0x7e040200u | materialIndexSource,
     0x7e0a0280u,
     0x4a060491u,
-    0xbefe03ffu, 0x55555555u,
+    0xbefe03ffu, activeLanes,
     0xe03c2038u, 0x80000402u,
     0xbf8c0000u,
     0x360a0affu, Mask,
@@ -52,7 +53,11 @@ constexpr std::array Consumer {
     0xbf8c0000u,
     0xe0102000u, 0x80040300u,
     0xbf810000u,
-};
+	};
+}
+
+constexpr auto Consumer = MakeConsumer(8u, 0x55555555u);
+constexpr auto MixedLaneConsumer = MakeConsumer(256u, (1u << 1) | (1u << 2));
 
 Sharp Buffer(uint64_t base, uint32_t stride, uint32_t records) {
 	return {static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32u) | (stride << 16u), records,
@@ -234,6 +239,15 @@ int Gpu() {
 	};
 	install(base, producer);
 	install(base + 0x100, Consumer);
+	install(base + 0x200, MixedLaneConsumer);
+	const auto mixedMaterials = materials + 0x400, mixedTable = table + 0x400, mixedOutput = output + 0x400;
+	Data mixed(mixedOutput);
+	mixed.materials[Field / 4] = 3;
+	mixed.materials[(MaterialStride + Field) / 4] = 0xaa000002u;
+	mixed.materials[(2 * MaterialStride + Field) / 4] = 0xbb000005u;
+	Memory::WriteBacking(mixedMaterials, mixed.materials.data(), sizeof(mixed.materials));
+	Memory::WriteBacking(mixedTable, mixed.table.data(), sizeof(mixed.table));
+	Memory::WriteBacking(mixedOutput, mixed.output.data(), sizeof(mixed.output));
 
 	RenderContext context(gpu.graphics);
 	context.InitializeGpu(nullptr);
@@ -271,6 +285,18 @@ int Gpu() {
 		expected[1] = expected[3] = 18;
 		Require(Memory::TryReadBacking(output, data.output.data(), sizeof(data.output)) && data.output == expected,
 		        "selected output, inactive lane, OOB key/index, stale target, or neighboring canary differs");
+		shaders.SetCsShader({.data_addr = base + 0x200, .num_thread_x = 32, .num_thread_y = 1,
+		                     .num_thread_z = 1, .wave_size = 32, .user_sgpr = 8});
+		set(0, Buffer(mixedMaterials, MaterialStride, Keys.size()));
+		set(4, Buffer(mixedTable, sizeof(Sharp), TableRows));
+		cp.DispatchDirect(1, 1, 1, Mode);
+		cache.ReadMemory(mixedOutput, sizeof(mixed.output));
+		auto mixedExpected = mixed.output;
+		mixedExpected[2] = 18;
+		mixedExpected[3] = 19;
+		Require(Memory::TryReadBacking(mixedOutput, mixed.output.data(), sizeof(mixed.output)) &&
+		            mixed.output == mixedExpected,
+		        "mixed active lanes did not both store through the first active lane's descriptor");
 		context.UnmapMemory(base, Bytes);
 		context.GetCommandScheduler().Finish();
 	});
