@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
+#include "../src/ShaderCachePolicy.hpp"
 
 #include <algorithm>
 #include <array>
@@ -334,14 +335,15 @@ struct Replay {
     std::string frame;
 };
 
-Replay replay(const std::filesystem::path& tool, const std::filesystem::path& root, const Case& test) {
+Replay replay(const std::filesystem::path& tool, const std::filesystem::path& root, const Case& test,
+              std::string_view options = "--cold-pipelines") {
     const auto directory = root / test.name;
     std::filesystem::create_directories(directory);
     makeCapture(directory / "capture", test.variant);
     const auto log = directory / "replay.log";
     const auto frames = directory / "frames";
     const auto command = quote(tool) + " " + quote(directory / "capture") +
-                         " --strict --no-synthesize --repeat 1 --cold-pipelines --frames " + quote(frames) + " > " +
+                         " --strict --no-synthesize --repeat 1 " + std::string(options) + " --frames " + quote(frames) + " > " +
                          quote(log) + " 2>&1";
     std::fflush(nullptr);
 #ifdef _WIN32
@@ -379,12 +381,41 @@ void printVulkanDiagnostics(std::string_view log) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 2) throw std::runtime_error("usage: kyty_shim_depth_target_alias_tests <agc_frame_replay>");
-        const std::filesystem::path tool = argv[1];
+        const bool restored = argc == 3 && std::string_view(argv[2]) == "--restored";
+        if (argc != 2 && !restored) throw std::runtime_error("usage: kyty_shim_depth_target_alias_tests <agc_frame_replay> [--restored]");
+        if (restored && !KytyShim::ResolveShaderCacheEnabled(true, std::getenv("ANYPS5_NO_SHADER_CACHE"))) {
+            std::cout << "kyty_shim_restored_graphics_wait requires the on-disk shader cache\n";
+            return 77;
+        }
+        const auto tool = std::filesystem::absolute(argv[1]);
         const auto root = std::filesystem::temp_directory_path() /
                           ("kyty-depth-target-alias-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(root);
         const bool vulkan_required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
+        if (restored) {
+            const auto original = std::filesystem::current_path();
+            std::filesystem::create_directories(root / "app0" / "sce_sys");
+            std::ofstream(root / "app0" / "sce_sys" / "param.json") << "{\"titleId\":\"TEST00001\",\"appVersion\":\"01.00\"}\n";
+            std::filesystem::current_path(root);
+            const auto seed = replay(tool, root / "seed", Cases.front(), "");
+            printVulkanDiagnostics(seed.log);
+            if (!seed.completed) {
+                printTail(seed.log);
+                return vulkan_required ? 1 : 77;
+            }
+            const auto warm = replay(tool, root / "warm", Cases.front(), "--wait-manifest");
+            printVulkanDiagnostics(warm.log);
+            std::filesystem::current_path(original);
+            if (!warm.completed || warm.frame != seed.frame ||
+                warm.log.find("pipeline handles to resolve") == std::string::npos ||
+                warm.log.find(", 0 pipeline handles to resolve") != std::string::npos) {
+                printTail(warm.log);
+                return 1;
+            }
+            std::filesystem::remove_all(root);
+            std::cout << "kyty_shim_restored_graphics_wait: ok\n";
+            return 0;
+        }
         std::string control_frame;
         std::string stencil_filled_frame;
         std::string retiled_seed_frame;

@@ -704,8 +704,12 @@ add_dependencies(kyty_shim_depth_target_alias_tests agc_frame_replay)
 add_test(NAME kyty_shim_depth_target_alias COMMAND kyty_shim_depth_target_alias_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_depth_target_alias PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_depth_target_alias: ok")
+add_test(NAME kyty_shim_restored_graphics_wait COMMAND kyty_shim_depth_target_alias_tests $<TARGET_FILE:agc_frame_replay> --restored)
+set_tests_properties(kyty_shim_restored_graphics_wait PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        ENVIRONMENT "KYTY_PIPELINE_MANIFEST=1"
+        PASS_REGULAR_EXPRESSION "kyty_shim_restored_graphics_wait: ok")
 if(WIN32)
-    set_property(TEST kyty_shim_depth_target_alias APPEND PROPERTY
+    set_property(TEST kyty_shim_depth_target_alias kyty_shim_restored_graphics_wait APPEND PROPERTY
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
 endif()
 

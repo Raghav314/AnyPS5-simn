@@ -241,6 +241,7 @@ struct PipelineCache::ManifestState {
 	uint32_t                              pipelines        = 0;
 	uint32_t                              pipelines_known  = 0;
 	uint32_t                              pipelines_failed = 0;
+	size_t                                restored_graphics = 0;
 	uint32_t                              compute          = 0;
 	uint32_t                              compute_cached   = 0;
 	uint32_t                              compute_failed   = 0;
@@ -781,6 +782,7 @@ void PipelineCache::OpenManifest() {
 	}
 #if defined(ANYPS5_KYTY)
 	ManifestState::PrioritizeRestoredCompute(m_restore_jobs);
+	state.restored_graphics = std::ranges::count(m_restore_jobs, false, &AsyncPipelineJob::compute);
 #endif
 	state.startup_total = static_cast<uint32_t>(state.warm_modules.size() + state.warm_pipelines.size() +
 	                                            m_restore_jobs.size());
@@ -3376,7 +3378,8 @@ bool PipelineCache::WaitForManifestCompletion(std::chrono::milliseconds timeout)
 		                      state.module_jobs.empty() && state.pipeline_jobs.empty() &&
 		                      state.large_compute.empty() && m_restore_jobs.empty() && state.running == 0 &&
 		                      state.built + state.found + state.failed == state.warm_modules.size() &&
-		                      state.pipelines + state.pipelines_known + state.pipelines_failed == state.warm_pipelines.size() &&
+		                      state.pipelines + state.pipelines_known + state.pipelines_failed ==
+		                          state.warm_pipelines.size() + state.restored_graphics &&
 		                      std::ranges::all_of(state.missing_code, [](uint8_t missing) { return missing == 0; });
 		if (complete) {
 			return state.failed == 0 && state.pipelines_failed == 0 && state.compute_failed == 0 &&
@@ -3406,7 +3409,7 @@ void PipelineCache::ManifestProgress(bool force) {
 		waiting += missing != 0 ? 1u : 0u;
 	}
 	const auto modules   = state.warm_modules.size();
-	const auto pipelines = state.warm_pipelines.size();
+	const auto pipelines = state.warm_pipelines.size() + state.restored_graphics;
 	if (!idle && !force) {
 		ManifestLog("Pipeline manifest: {}/{} modules, {}/{} pipelines ({} modules wait for "
 		            "their shaders) at {:.1f} s",
