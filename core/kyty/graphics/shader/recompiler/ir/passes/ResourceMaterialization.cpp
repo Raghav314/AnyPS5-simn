@@ -2547,6 +2547,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		} else if (!swizzle) {
 			packed_stride &= ~(3u << 16u);
 		}
+		if (stride != 0u && descriptor.OutOfBounds() == 0u) packed_stride |= StructuredBufferBounds;
+		if (descriptor.OutOfBounds() == 3u) packed_stride |= ExactBufferBounds;
 		auto& buffer         = specialization.buffers[i];
 		buffer.packed_stride = packed_stride;
 		buffer.descriptor_format =
@@ -2724,6 +2726,8 @@ bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& sn
 		} else if (!swizzle) {
 			packed_stride &= ~(3u << 16u);
 		}
+		if (stride != 0u && descriptor.OutOfBounds() == 0u) packed_stride |= StructuredBufferBounds;
+		if (descriptor.OutOfBounds() == 3u) packed_stride |= ExactBufferBounds;
 		auto& buffer              = specialization.buffers[i];
 		buffer.packed_stride      = packed_stride;
 		buffer.descriptor_format  = base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
