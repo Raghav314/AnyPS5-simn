@@ -185,6 +185,9 @@ bool PipelineCache::ReadRecord(std::span<const uint8_t> frame_bytes, StoreRecord
 			record.plan_loaded = ShaderRecompiler::IR::LoadResourcePlan(plan, record.plan);
 			module.module      = CompileSPV(spirv, m_graphics.device);
 			module.spirv_words = static_cast<uint32_t>(spirv.size());
+			if (module.info.stage == ShaderType::Mesh) {
+				module.mesh_shared_bytes = ShaderRecompiler::Spirv::MeshWorkgroupBytes(spirv);
+			}
 			if (!plain_spirv.empty()) {
 				module.plain = MakePlainModule(module, plain_spirv, m_graphics.device);
 				if (module.plain == nullptr) {

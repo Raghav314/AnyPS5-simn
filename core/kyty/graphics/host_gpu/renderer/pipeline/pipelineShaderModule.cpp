@@ -260,7 +260,8 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
 		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
 	} else if (key.stage == ShaderType::Mesh) {
-		module.mesh_task = options.input_info.vertex->indirect_draw;
+		module.mesh_task         = options.input_info.vertex->indirect_draw;
+		module.mesh_shared_bytes = ShaderRecompiler::Spirv::MeshWorkgroupBytes(result.spirv);
 	} else if (key.stage == ShaderType::Compute) {
 		module.guest_traversal = RayTracing::NativeTraversals() && !options.native_ray_tracing;
 	}

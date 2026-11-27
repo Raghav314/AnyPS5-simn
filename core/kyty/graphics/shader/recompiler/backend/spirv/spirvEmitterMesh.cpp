@@ -1,5 +1,9 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include <limits>
+#include <unordered_map>
+#include <unordered_set>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
@@ -116,7 +120,14 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 		    MeshArray(state, layer ? spv::StorageClassWorkgroup : spv::StorageClassPrivate, type,
 		              layer ? mesh.max_vertices : state.lane_count);
 	}
-	state.mesh_allocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2);
+	const auto allocation_length =
+	    state.builder.Constant(spv::OpSpecConstant, TypeU32(state), MeshAllocationBaseDwords);
+	state.builder.AddAnnotation(spv::OpDecorate, allocation_length, spv::DecorationSpecId,
+	                            MeshAllocationLengthSpecId);
+	const auto allocation_array =
+	    state.builder.Type(spv::OpTypeArray, TypeU32(state), allocation_length);
+	state.mesh_allocation = state.builder.DefineGlobalVariable(
+	    TypePointer(state, spv::StorageClassWorkgroup, allocation_array), spv::StorageClassWorkgroup);
 	state.mesh_primitive_data =
 	    MeshArray(state, spv::StorageClassPrivate, TypeU32(state), state.lane_count);
 	state.mesh_primitives = MeshArray(state, spv::StorageClassOutput, MeshPrimitiveType(state),
@@ -257,6 +268,96 @@ void EmitMeshEntryPoint(EmitterState& state) {
 	state.lane_half = 0;
 	state.builder.AddFunction(spv::OpReturn);
 	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
+}
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+uint32_t MeshWorkgroupBytes(std::span<const uint32_t> spirv) {
+	if (spirv.size() < 5u || spirv[0] != spv::MagicNumber) {
+		return 0;
+	}
+	std::unordered_set<uint32_t>           aliased;
+	std::unordered_map<uint32_t, uint64_t> array_strides;
+	std::unordered_map<uint64_t, uint64_t> member_offsets;
+	std::unordered_map<uint32_t, uint64_t> constants;
+	std::unordered_map<uint32_t, uint64_t> type_sizes;
+	std::unordered_map<uint32_t, uint32_t> workgroup_pointer_elem;
+	uint64_t                               total       = 0;
+	uint64_t                               aliased_max = 0;
+	for (size_t at = 5; at < spirv.size();) {
+		const uint32_t count = spirv[at] >> spv::WordCountShift;
+		if (count == 0 || at + count > spirv.size()) {
+			break;
+		}
+		const auto opcode = static_cast<spv::Op>(spirv[at] & spv::OpCodeMask);
+		if (opcode == spv::OpDecorate && count >= 3u) {
+			const auto deco = static_cast<spv::Decoration>(spirv[at + 2u]);
+			if (deco == spv::DecorationAliased) {
+				aliased.insert(spirv[at + 1u]);
+			} else if (deco == spv::DecorationArrayStride && count >= 4u) {
+				array_strides[spirv[at + 1u]] = spirv[at + 3u];
+			}
+		} else if (opcode == spv::OpMemberDecorate && count >= 5u &&
+		           static_cast<spv::Decoration>(spirv[at + 3u]) == spv::DecorationOffset) {
+			const uint64_t key = (static_cast<uint64_t>(spirv[at + 1u]) << 32u) | spirv[at + 2u];
+			member_offsets[key] = spirv[at + 4u];
+		} else if ((opcode == spv::OpConstant || opcode == spv::OpSpecConstant) && count == 4u) {
+			constants[spirv[at + 2u]] = spirv[at + 3u];
+		} else if (opcode == spv::OpTypeBool && count >= 2u) {
+			type_sizes[spirv[at + 1u]] = 4u;
+		} else if ((opcode == spv::OpTypeInt || opcode == spv::OpTypeFloat) && count >= 3u) {
+			type_sizes[spirv[at + 1u]] = std::max<uint64_t>(spirv[at + 2u] / 8u, 1u);
+		} else if (opcode == spv::OpTypeVector && count >= 4u) {
+			if (const auto it = type_sizes.find(spirv[at + 2u]); it != type_sizes.end()) {
+				type_sizes[spirv[at + 1u]] = it->second * spirv[at + 3u];
+			}
+		} else if (opcode == spv::OpTypeArray && count >= 4u) {
+			const auto elem = type_sizes.find(spirv[at + 2u]);
+			const auto len  = constants.find(spirv[at + 3u]);
+			if (elem != type_sizes.end() && len != constants.end()) {
+				const auto     stride_it = array_strides.find(spirv[at + 1u]);
+				const uint64_t stride    = stride_it != array_strides.end() ? stride_it->second : elem->second;
+				type_sizes[spirv[at + 1u]] = stride * len->second;
+			}
+		} else if (opcode == spv::OpTypeStruct && count >= 2u) {
+			uint64_t sum        = 0;
+			uint64_t end        = 0;
+			bool     has_offset = false;
+			for (uint32_t i = 2u; i < count; i++) {
+				const auto it = type_sizes.find(spirv[at + i]);
+				if (it == type_sizes.end()) {
+					continue;
+				}
+				const uint64_t key = (static_cast<uint64_t>(spirv[at + 1u]) << 32u) | (i - 2u);
+				if (const auto off = member_offsets.find(key); off != member_offsets.end()) {
+					has_offset = true;
+					end        = std::max(end, off->second + it->second);
+				}
+				sum += it->second;
+			}
+			type_sizes[spirv[at + 1u]] = has_offset ? end : sum;
+		} else if (opcode == spv::OpTypePointer && count >= 4u &&
+		           static_cast<spv::StorageClass>(spirv[at + 2u]) == spv::StorageClassWorkgroup) {
+			workgroup_pointer_elem[spirv[at + 1u]] = spirv[at + 3u];
+		} else if (opcode == spv::OpVariable && count >= 4u &&
+		           static_cast<spv::StorageClass>(spirv[at + 3u]) == spv::StorageClassWorkgroup) {
+			if (const auto ptr = workgroup_pointer_elem.find(spirv[at + 1u]);
+			    ptr != workgroup_pointer_elem.end()) {
+				if (const auto sz = type_sizes.find(ptr->second); sz != type_sizes.end()) {
+					if (aliased.contains(spirv[at + 2u])) {
+						aliased_max = std::max(aliased_max, sz->second);
+					} else {
+						total += sz->second;
+					}
+				}
+			}
+		}
+		at += count;
+	}
+	return static_cast<uint32_t>(
+	    std::min<uint64_t>(total + aliased_max, std::numeric_limits<uint32_t>::max()));
 }
 
 }

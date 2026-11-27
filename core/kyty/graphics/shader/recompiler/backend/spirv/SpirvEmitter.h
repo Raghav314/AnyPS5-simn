@@ -5,9 +5,14 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <cstdint>
+#include <span>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+inline constexpr uint32_t MeshAllocationLengthSpecId = 0;
+inline constexpr uint32_t MeshAllocationBaseDwords   = 2;
 
 struct Profile {
 	bool maintenance8         = false;
@@ -43,7 +48,8 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
                                   bool           ray_stats             = false,
                                   SplitHints*    split_hints           = nullptr);
 
-[[nodiscard]] bool UsesMipStats(const IR::Program& program);
+[[nodiscard]] bool     UsesMipStats(const IR::Program& program);
+[[nodiscard]] uint32_t MeshWorkgroupBytes(std::span<const uint32_t> spirv);
 }
 
 #endif

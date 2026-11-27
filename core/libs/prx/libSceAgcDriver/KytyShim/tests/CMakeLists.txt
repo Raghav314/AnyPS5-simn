@@ -525,6 +525,29 @@ set_tests_properties(kyty_shim_mesh_per_primitive_block_draw PROPERTIES TIMEOUT 
         PASS_REGULAR_EXPRESSION "kyty_shim_mesh_per_primitive_block_draw: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
 if(NOT ANYPS5_KYTY_DLL)
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/MeshLdsWgpPad.cpp)
+    if(WIN32)
+        set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/MeshLdsWgpPad.cpp
+                TARGET_DIRECTORY libSceAgcDriver PROPERTIES
+                INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include"
+                COMPILE_OPTIONS "-fno-extern-tls-init")
+    else()
+        set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/MeshLdsWgpPad.cpp
+                TARGET_DIRECTORY libSceAgcDriver PROPERTIES
+                INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include")
+    endif()
+    add_test_executable(kyty_shim_mesh_lds_wgp_pad_tests ${CMAKE_CURRENT_SOURCE_DIR}/MeshLdsWgpPadMain.cpp)
+    configure_host_test_executable(kyty_shim_mesh_lds_wgp_pad_tests)
+    target_link_libraries(kyty_shim_mesh_lds_wgp_pad_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_mesh_lds_wgp_pad COMMAND kyty_shim_mesh_lds_wgp_pad_tests)
+    set_tests_properties(kyty_shim_mesh_lds_wgp_pad PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "kyty_shim_mesh_lds_wgp_pad: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+    add_test(NAME kyty_shim_mesh_lds_wgp_pad_draw COMMAND kyty_shim_mesh_lds_wgp_pad_tests draw)
+    set_tests_properties(kyty_shim_mesh_lds_wgp_pad_draw PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "kyty_shim_mesh_lds_wgp_pad_draw: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+endif()
+
+if(NOT ANYPS5_KYTY_DLL)
     add_test_executable(kyty_shim_recompiler_robustness_tests ${CMAKE_CURRENT_SOURCE_DIR}/RecompilerRobustness.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
     target_include_directories(kyty_shim_recompiler_robustness_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../fuzz)
     target_include_directories(kyty_shim_recompiler_robustness_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
