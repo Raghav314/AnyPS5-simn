@@ -173,6 +173,11 @@ void Buffer::Commit(uint64_t offset, uint64_t size) {
 	for (const auto zero_buffer: zero_buffers) {
 		command.fillBuffer(zero_buffer, 0, VK_WHOLE_SIZE, 0);
 	}
+	const vk::MemoryBarrier zero_visibility {.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+	                                         .dstAccessMask = vk::AccessFlagBits::eMemoryRead};
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                        vk::PipelineStageFlagBits::eAllCommands, {},
+	                        1, &zero_visibility, 0, nullptr, 0, nullptr);
 	EXIT_IF(command.end() != vk::Result::eSuccess);
 	vk::SemaphoreCreateInfo semaphore_info {};
 	vk::Semaphore           zeroed = nullptr;
