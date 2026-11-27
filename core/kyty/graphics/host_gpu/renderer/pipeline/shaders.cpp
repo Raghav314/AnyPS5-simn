@@ -229,12 +229,11 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	}
 	const auto max_stage_sampled = *std::ranges::max_element(stage_sampled);
 	if (sampled_images > limits.maxDescriptorSetSampledImages ||
-	    max_stage_sampled > limits.maxPerStageDescriptorSampledImages ||
-	    sampled_images > DescriptorHeap::MaxSampledImages) {
+	    max_stage_sampled > limits.maxPerStageDescriptorSampledImages) {
 		EXIT("pipeline needs %" PRIu64 " sampled images (%" PRIu64 " in one stage); the device allows "
-		     "%u per set and %u per stage, a descriptor pool holds %u\n",
+		     "%u per set and %u per stage\n",
 		     sampled_images, max_stage_sampled, limits.maxDescriptorSetSampledImages,
-		     limits.maxPerStageDescriptorSampledImages, DescriptorHeap::MaxSampledImages);
+		     limits.maxPerStageDescriptorSampledImages);
 	}
 	pipeline.uses_push_descriptors =
 	    !pipeline.native_bindings && descriptor_count <= graphics.max_push_descriptors;

@@ -950,3 +950,19 @@ set_tests_properties(kyty_shim_hw_oracle PROPERTIES TIMEOUT 60
 add_test(NAME kyty_shim_hw_oracle_rows COMMAND kyty_shim_hw_oracle_tests rows)
 set_tests_properties(kyty_shim_hw_oracle_rows PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_hw_oracle_rows: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
+if(NOT ANYPS5_KYTY_DLL)
+add_test_executable(kyty_shim_descriptor_pool_oversize_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/DescriptorPoolOversize.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_descriptor_pool_oversize_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_descriptor_pool_oversize_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_descriptor_pool_oversize_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_descriptor_pool_oversize_tests PRIVATE
+        "$<TARGET_GENEX_EVAL:kyty_shim_descriptor_pool_oversize_tests,$<TARGET_PROPERTY:Kyty::gpu,INTERFACE_LINK_LIBRARIES>>"
+        Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_descriptor_pool_oversize COMMAND kyty_shim_descriptor_pool_oversize_tests)
+set_tests_properties(kyty_shim_descriptor_pool_oversize PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+endif()
