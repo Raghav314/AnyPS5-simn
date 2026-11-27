@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
@@ -459,6 +460,31 @@ void UntracedWalk() {
     Expect((second & IR::BvhIntersectOracle) == 0 && (second & IR::BvhIntersectEmpty) != 0, "the walk over the untraced TLAS stays empty");
 }
 
+void CodeWaveSize() {
+    namespace Decoder = Libs::Graphics::ShaderRecompiler::Decoder;
+    const auto wave   = [](std::vector<uint32_t> code) {
+        code.push_back(0xbf810000u);
+        Decoder::Program program;
+        Decoder::DecodeProgram(code, program);
+        return Decoder::ExecWaveSize(program);
+    };
+    constexpr uint32_t mov_exec_lo  = 0xbefe0300u;
+    constexpr uint32_t mov_exec     = 0xbefe0400u;
+    constexpr uint32_t saveexec_b32 = 0xbe823c6au;
+    constexpr uint32_t saveexec_b64 = 0xbe82246au;
+    constexpr uint32_t mov_s2       = 0xbe820300u;
+    constexpr uint32_t mov_exec_hi  = 0xbeff0300u;
+    constexpr uint32_t and_exec_lo  = 0x877e007eu;
+    constexpr uint32_t and_exec     = 0x87fe007eu;
+    Expect(wave({mov_exec_lo, saveexec_b32}) == 32u, "code that writes exec with 32-bit operations is wave32");
+    Expect(wave({mov_exec, saveexec_b64}) == 64u, "code that writes exec with 64-bit operations is wave64");
+    Expect(wave({saveexec_b32}) == 32u && wave({saveexec_b64}) == 64u, "a saveexec alone decides the width");
+    Expect(wave({mov_exec_lo, saveexec_b64}) == 0u, "code that mixes both widths has no known wave size");
+    Expect(wave({mov_s2}) == 0u && wave({}) == 0u, "code that never writes exec has no known wave size");
+    Expect(wave({mov_exec_lo, mov_exec_hi}) == 64u, "code that writes exec_hi is wave64 even with 32-bit operations");
+    Expect(wave({and_exec_lo}) == 32u && wave({and_exec}) == 64u, "a scalar ALU write to exec decides the width");
+}
+
 void RecordLayouts() {
     constexpr std::array<uint32_t, 4> masked {0x76543210u, 0x3dc6ba98u, 0x000801dfu, 0u};
     constexpr std::array<uint32_t, 4> plain {0x76543210u, 0x3dc6ba98u, 0u, 0u};
@@ -546,6 +572,7 @@ int main() {
     TwoTlasWalks();
     RecordLayouts();
     UntracedWalk();
+    CodeWaveSize();
     DescriptorHighWord();
     Marking();
     EmptyWalks();
