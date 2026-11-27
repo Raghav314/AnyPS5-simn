@@ -296,7 +296,26 @@ struct Dispatch {
 	std::optional<uint32_t>            sampler_word;
 };
 
-bool Run(const Gpu& gpu, const Dispatch& dispatch) {
+std::optional<uint32_t> StoredWord(const Recompiler::IR::Program& program) {
+	using namespace Recompiler::IR;
+	const Inst* store = nullptr;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::StoreBufferU32 ||
+			    program.memory_info.at(inst.Flags<MemoryFlags>().index).offset != 0u) continue;
+			Require(store == nullptr, "correlated phi: multiple result stores");
+			store = &inst;
+		}
+	}
+	Require(store != nullptr, "correlated phi: missing result store");
+	const auto value = store->Arg(4).Resolve();
+	if (value.IsImmediate()) return value.U32();
+	const auto* producer = value.TryInstruction();
+	Require(producer && producer->GetOpcode() == ValueOpcode::Phi, "correlated phi: result must come from a constant or a Phi");
+	return std::nullopt;
+}
+
+bool Run(const Gpu& gpu, const Dispatch& dispatch, std::optional<uint32_t>* stored_word = nullptr) {
 	const std::string what = dispatch.name;
 	ShaderComputeInputInfo compute;
 	compute.threads_num[0]     = dispatch.threads;
@@ -315,6 +334,7 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch) {
 	options.input_info.compute    = &compute;
 	const auto source             = Recompiler::PrepareShaderSource(dispatch.code, options);
 	auto       translated         = Recompiler::TranslateProgram(source.decoded, options);
+	if (stored_word) *stored_word = StoredWord(translated.program);
 	const bool lane_local         = translated.program.lane_local;
 	const auto plan               = Recompiler::IR::ExtractResourcePlan(translated.program);
 	const Recompiler::IR::SrtRuntime       runtime {.user_data = dispatch.user_data};
@@ -1010,23 +1030,82 @@ void SamplerSpill(const Gpu& gpu) {
 	std::printf("sampler spill: %td/%u lanes sampled 1.0\n", sampled, Threads);
 }
 
+void CorrelatedPhiExecution(const Gpu& gpu) {
+	constexpr uint32_t Saved = 17u;
+	constexpr size_t BypassValueWord = 8;
+	constexpr uint32_t ReadRuntimeWord = 0xbe8c030au;
+	constexpr std::array<uint32_t, 20> Code {
+	    0xbe8d0380u, 0xbe8c0391u, 0xbf068008u, 0xbf840006u,
+	    0xbf068009u, 0xbf850002u,
+	    ReadRuntimeWord, 0xbf820002u,
+	    0xbe8c0391u, 0xbf820002u,
+	    0xbe8c0391u, 0xbe8d0381u,
+	    0x7e08020cu, 0x7e0a020du, 0x34020083u,
+	    0xe0701000u, 0x80010401u, 0xe0701004u, 0x80010501u, 0xbf810000u,
+	};
+	alignas(256) std::array<uint32_t, 2 * HostSubgroup> output;
+	Dispatch dispatch;
+	dispatch.name      = "correlated phi";
+	dispatch.threads   = HostSubgroup;
+	dispatch.wave_size = HostSubgroup;
+	const auto buffer = BufferDescriptor(output.data(), sizeof(output), 0, 0x30014000u | 0xfacu);
+	std::ranges::copy(buffer, dispatch.user_data.begin() + 4);
+	bool folded = true;
+	for (const bool conflict: {false, true}) {
+		auto code = Code;
+		if (conflict) code[BypassValueWord] = ReadRuntimeWord;
+		dispatch.code = code;
+		for (uint32_t input = 0; input < 4; ++input) {
+			const uint32_t a = input >> 1u;
+			const uint32_t b = input & 1u;
+			const uint32_t restored = a | b;
+			for (const uint32_t runtime: {47u, 93u}) {
+				output.fill(0xdeadbeefu);
+				dispatch.user_data[8] = a;
+				dispatch.user_data[9] = b;
+				dispatch.user_data[10] = runtime;
+				std::optional<uint32_t> stored_word;
+				Require(Run(gpu, dispatch, &stored_word), "correlated phi dispatch did not run");
+				if (conflict) {
+					Check(!stored_word, "correlated phi: a reachable runtime value was folded");
+				} else {
+					Check(!stored_word || *stored_word == Saved, "correlated phi: result folded to the wrong value");
+					folded &= stored_word.has_value();
+				}
+				const uint32_t expected = conflict && restored == 0u ? runtime : Saved;
+				const std::array inputs {a, b, runtime};
+				for (uint32_t lane = 0; lane < HostSubgroup; ++lane) {
+					CheckResult(dispatch.name, "stored value", lane, inputs.data(), output[2 * lane], expected);
+					CheckResult(dispatch.name, "restore taken", lane, inputs.data(), output[2 * lane + 1], restored);
+				}
+				std::printf("correlated phi readback: %s a=%u b=%u runtime=%u value=%u restored=%u (%u lanes)\n",
+				            conflict ? "conflicting" : "correlated", a, b, runtime, output[0], output[1], HostSubgroup);
+			}
+		}
+	}
+	std::printf("correlated phi execution: %s, all lane outputs checked\n", folded ? "folded" : "unfolded");
+}
+
 }
 
 int main(int argc, char** argv) {
 	const char* why = nullptr;
 	auto        gpu = OpenGpu(why);
 	if (!gpu) return NoDevice(why);
-	if (argc == 2 && std::string_view(argv[1]) == "sampler-spill") {
+	const std::string_view test = argc == 2 ? argv[1] : "";
+	if (test == "sampler-spill" || test == "correlated-phi") {
+		const auto* name = test == "sampler-spill" ? "sampler spill" : "correlated phi";
 		const auto subgroup32 = ComputeSubgroup32(*gpu, HostSubgroup);
 		if (subgroup32 == Subgroup32::Unavailable) {
-			std::printf("%s: sampler spill: skipped, %s has no 32-lane compute subgroup\n", Name, gpu->name.c_str());
+			std::printf("%s: %s: skipped, %s has no 32-lane compute subgroup\n", Name, name, gpu->name.c_str());
 			CloseGpu(*gpu);
 			return SkippedExit;
 		}
-		std::printf("sampler spill: %s compute subgroup size %u (native compute size %u, supported size range %u-%u)\n",
-		            subgroup32 == Subgroup32::Required ? "requesting" : "using native", HostSubgroup, gpu->compute_subgroup,
-		            gpu->min_subgroup, gpu->max_subgroup);
-		SamplerSpill(*gpu);
+		std::printf("%s: %s compute subgroup size %u (native compute size %u, supported size range %u-%u)\n",
+		            name, subgroup32 == Subgroup32::Required ? "requesting" : "using native", HostSubgroup,
+		            gpu->compute_subgroup, gpu->min_subgroup, gpu->max_subgroup);
+		if (test == "sampler-spill") SamplerSpill(*gpu);
+		else CorrelatedPhiExecution(*gpu);
 	} else {
 		SumOfAbsoluteDifferences(*gpu);
 		ByteAverage(*gpu);
