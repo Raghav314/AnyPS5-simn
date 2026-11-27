@@ -298,7 +298,8 @@ std::optional<ShaderModule> PipelineCache::BuildModule(const ProgramKey&        
 	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
 		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
 	} else if (key.stage == ShaderType::Mesh) {
-		module.mesh_task = options.input_info.vertex->indirect_draw;
+		module.mesh_task         = options.input_info.vertex->indirect_draw;
+		module.mesh_shared_bytes = ShaderRecompiler::Spirv::MeshWorkgroupBytes(result.spirv);
 	}
 	if (!result.spirv_plain.empty()) {
 		ValidateShaderSpirv(stage, key.hash, result.spirv_plain, profile.maintenance8);

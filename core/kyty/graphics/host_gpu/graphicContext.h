@@ -67,6 +67,8 @@ struct GraphicContext {
 	vk::SubgroupFeatureFlags                  subgroup_supported_operations         = {};
 	bool                                      native_ray_tracing_enabled            = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
+	bool                                      amd_shader_info_enabled               = false;
+	PFN_vkGetShaderInfoAMD                    fn_get_shader_info                    = nullptr;
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;

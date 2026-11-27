@@ -570,6 +570,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	LOGF("Vulkan fragment shader pixel interlock: %s\n",
 	     graphics.fragment_shader_pixel_interlock_enabled ? "true" : "false");
 #endif
+	graphics.amd_shader_info_enabled =
+	    HasExtension(available_extensions, VK_AMD_SHADER_INFO_EXTENSION_NAME);
+	if (graphics.amd_shader_info_enabled) {
+		add(VK_AMD_SHADER_INFO_EXTENSION_NAME);
+	}
 	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
 
 	auto features12                     = WindowContext::RequiredVulkan12Features();
@@ -873,6 +878,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	vk::Device device = nullptr;
 	RequireVulkanSuccess(physical_device.createDevice(&create.get(), nullptr, &device),
 	                     "vkCreateDevice");
+	if (graphics.amd_shader_info_enabled) {
+		graphics.fn_get_shader_info =
+		    reinterpret_cast<PFN_vkGetShaderInfoAMD>(device.getProcAddr("vkGetShaderInfoAMD"));
+		if (graphics.fn_get_shader_info == nullptr) {
+			graphics.amd_shader_info_enabled = false;
+		}
+	}
 	return device;
 }
 

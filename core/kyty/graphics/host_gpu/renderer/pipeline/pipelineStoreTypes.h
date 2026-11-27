@@ -29,8 +29,9 @@ struct ShaderModule {
 	std::vector<uint32_t>                        function_code;
 	std::vector<vk::Format>                      vertex_formats;
 	std::vector<RectListParameter>               rect_parameters;
-	bool                                         mesh_task = false;
-	uint32_t                                     spirv_words = 0;
+	bool                                         mesh_task         = false;
+	uint32_t                                     mesh_shared_bytes = 0;
+	uint32_t                                     spirv_words       = 0;
 	std::shared_ptr<const ShaderModule>          plain;
 	bool                                         guest_traversal = false;
 	ShaderBvh                                    bvh = ShaderBvh::None;
