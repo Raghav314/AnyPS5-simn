@@ -175,7 +175,8 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 	}
 	auto memory = std::ranges::find_if(
 	    m_memories, [&](const auto& candidate) { return candidate->base == request.base; });
-	if (memory == m_memories.end() || ((*memory)->size != size && (*memory)->draw != m_draw)) {
+	if (memory != m_memories.end() && (*memory)->size != size && (*memory)->draw == m_draw) return false;
+	if (memory == m_memories.end() || (*memory)->size != size) {
 		if (!m_context.IsMapped(request.base, size)) return false;
 		if (memory == m_memories.end()) {
 			memory = std::ranges::find_if(m_memories, [&](const auto& candidate) {
@@ -759,6 +760,7 @@ uint32_t ImageHeap::Allocate(bool may_fail) {
 }
 
 void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
+	const auto previous_size = memory.size;
 	{
 		std::scoped_lock lock {m_mutex};
 		Unwatch(memory);
@@ -775,6 +777,7 @@ void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 	for (auto& view: memory.views) {
 		const auto count = std::min(view->limit, Probes(size, view->first, view->step));
 		view->demand = {};
+		if (size < previous_size) Widen(view->changed_begin, view->changed_end, size, previous_size);
 		for (auto probe = count; view->buffer != nullptr && probe < view->count; ++probe) {
 			Assign(*view, (view->first + probe * view->step) / 4u, 0u);
 		}

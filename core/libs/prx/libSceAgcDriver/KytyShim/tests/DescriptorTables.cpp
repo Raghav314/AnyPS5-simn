@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "kernel/memory.h"
 #include "prx/libkernel/include/Api.hpp"
 
 #include <spirv-tools/libspirv.hpp>
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <memory>
 #include <span>
 #include <string>
 #include <thread>
@@ -29,9 +31,10 @@ struct ImageHeapTestAccess {
 	static constexpr size_t TableLimit = ShaderRecompiler::IR::ImageHeapCapacity * 7u / 8u;
 
 	static void Fill(ImageHeap& heap) {
+		const auto occupied = heap.m_elements.size();
 		heap.m_elements.resize(TableLimit);
 		heap.m_uses.resize(TableLimit);
-		for (size_t i = heap.m_pending.back() + 1u; i < TableLimit; ++i) heap.m_elements[i].refs = 1;
+		for (size_t i = occupied; i < TableLimit; ++i) heap.m_elements[i].refs = 1;
 	}
 
 	static void Release(ImageHeap& heap, uint32_t index) {
@@ -44,32 +47,44 @@ struct ImageHeapTestAccess {
 	static size_t TableSlotsFree(const ImageHeap& heap) { return TableLimit - std::min(TableLimit, Occupied(heap)); }
 	static size_t ViewBytes() { return sizeof(ImageHeap::View); }
 
-	static size_t Buffers(const ImageHeap& heap) {
-        size_t count = 0;
-        for (const auto& memory: heap.m_memories) {
-            for (const auto& view: memory->views) count += view->buffer != nullptr;
-        }
-        return count;
-    }
+	static uint32_t LiveSlot(const ImageHeap& heap, const ShaderRecompiler::IR::DescriptorValue& value) {
+		for (const auto& [key, slot]: heap.m_index) {
+			if (key.value == value) return slot;
+		}
+		return 0u;
+	}
 
-    static bool Matches(const ImageHeap& heap, const ShaderRecompiler::IR::ImageHeapRequest& request,
-                        const ShaderRecompiler::IR::ImageTableSnapshot& table, const std::array<ImageId, 4>& images) {
-        const auto memory = std::ranges::find_if(heap.m_memories, [&](const auto& item) { return item->base == request.base; });
-        if (memory == heap.m_memories.end()) return false;
-        const auto view = std::ranges::find_if((*memory)->views, [&](const auto& item) {
-            return item->first == request.first && item->step == request.step && heap.m_profiles[item->profile] == *request.root;
-        });
-        if (view == (*memory)->views.end()) return false;
-        for (size_t i = 1; i < table.mapping.size(); ++i) {
-            const auto entry = (*view)->slots[(request.first + (i - 1u) * request.step) / 4u];
-            const auto slot = entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u);
-            const auto ordinal = table.mapping[i];
-            if (slot == 0u || heap.m_elements[slot].key.value != table.slots[ordinal] ||
-                heap.m_elements[slot].image != images[ordinal]) return false;
-            if (ordinal >= 2u && slot != 2u && slot != 3u) return false;
-        }
-        return true;
-    }
+	static size_t Buffers(const ImageHeap& heap) {
+		size_t count = 0;
+		for (const auto& memory: heap.m_memories) {
+			for (const auto& view: memory->views) count += view->buffer != nullptr;
+		}
+		return count;
+	}
+
+	static bool Matches(const ImageHeap& heap, const ShaderRecompiler::IR::ImageHeapRequest& request,
+	                    const ShaderRecompiler::IR::ImageTableSnapshot& table, const std::array<ImageId, 4>& images) {
+		const auto memory = std::ranges::find_if(heap.m_memories, [&](const auto& item) { return item->base == request.base; });
+		if (memory == heap.m_memories.end()) return false;
+		const auto view = std::ranges::find_if((*memory)->views, [&](const auto& item) {
+			return item->first == request.first && item->step == request.step && heap.m_profiles[item->profile] == *request.root;
+		});
+		if (view == (*memory)->views.end()) return false;
+		for (size_t i = 1; i < table.mapping.size(); ++i) {
+			const auto offset = (request.first + (i - 1u) * request.step) / 4u;
+			if (offset >= (*view)->slots.size()) return false;
+			const auto entry = (*view)->slots[offset];
+			const auto slot = entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u);
+			const auto ordinal = table.mapping[i];
+			if (ordinal == 0u) {
+				if (slot != 0u) return false;
+				continue;
+			}
+			if (slot == 0u || heap.m_elements[slot].key.value != table.slots[ordinal] ||
+				heap.m_elements[slot].image != images[ordinal]) return false;
+		}
+		return true;
+	}
 };
 
 struct RenderExecutorTestAccess {
@@ -133,9 +148,12 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	const auto texture_a = HeapTexture(address + 0x4000u);
 	const auto texture_b = HeapTexture(address + 0x8000u);
 	const auto texture_c = HeapTexture(address + 0xc000u);
-	auto* resident_words = reinterpret_cast<uint32_t*>(address);
-    std::ranges::copy(texture_a.dwords, resident_words);
-    const IR::ImageHeapRequest resident {.base = address, .size = 32u, .step = 32u, .count = 1u, .root = &profile, .table = true};
+	const auto write = [&](uint64_t target, const IR::DescriptorValue& value) {
+		Libs::LibKernel::Memory::WriteBacking(target, value.dwords.data(), sizeof(value.dwords));
+		(void)heap.InvalidateMemory(target, sizeof(value.dwords));
+	};
+	write(address, texture_a);
+	const IR::ImageHeapRequest resident {.base = address, .size = 32u, .step = 32u, .count = 1u, .root = &profile, .table = true};
 	IR::ImageHeapView result;
 	if (!heap.Acquire(resident, result)) {
 		Check(false, "direct binding before exhaustion");
@@ -150,34 +168,32 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	table.mapping[aliases + 1u] = 2;
 	table.mapping[aliases + 2u] = 3;
 	const IR::ImageHeapRequest request {.base = address + 0x10000u, .size = (aliases + 2u) * 32u,
-                                        .step = 32u, .count = aliases + 2u, .root = &profile, .table = true};
-    const auto write_table = [&](const IR::ImageHeapRequest& target, const IR::ImageTableSnapshot& source) {
-        auto* words = reinterpret_cast<uint32_t*>(target.base + target.first);
-        for (size_t i = 1; i < source.mapping.size(); ++i) {
-            std::ranges::copy(source.slots[source.mapping[i]].dwords, words + (i - 1u) * target.step / 4u);
-        }
-        (void)heap.InvalidateMemory(target.base, target.size);
-        heap.BeginDraw();
-    };
-    write_table(request, table);
+	                                    .step = 32u, .count = aliases + 2u, .root = &profile, .table = true};
+	const auto write_table = [&](const IR::ImageHeapRequest& target, const IR::ImageTableSnapshot& source) {
+		for (size_t i = 1; i < source.mapping.size(); ++i) {
+			write(target.base + target.first + (i - 1u) * target.step, source.slots[source.mapping[i]]);
+		}
+		heap.BeginDraw();
+	};
+	write_table(request, table);
 	const auto pending = ImageHeapTestAccess::Pending(heap);
 	Check(!heap.Acquire(request, result), "full heap falls back for a mixed table with two missing slots");
 	std::printf("%s: first failure, occupied including null=%zu, free for tables=0, required=2, heap_bytes=%zu, view_bytes=%zu\n",
 	            g_name, ImageHeapTestAccess::Occupied(heap), sizeof(ImageHeap), ImageHeapTestAccess::ViewBytes());
-    size_t failed_buffers = 0;
-    for (uint32_t window = 0; window < 8; ++window) {
-        for (uint32_t gc = 0; gc < 33; ++gc) {
-            heap.BeginDraw();
-            Check(heap.Acquire(resident, result), "keep the resident alias across reclamation windows");
-            heap.RunGarbageCollector();
-        }
-        heap.BeginDraw();
-        Check(!heap.Acquire(request, result), "a recreated exhausted view uses fallback");
-        failed_buffers += ImageHeapTestAccess::Buffers(heap) - 1u;
-        scheduler.Wait(scheduler.CurrentTick());
-    }
-    std::printf("%s: 8 recreated exhausted views, unnecessary_slot_buffers=%zu\n", g_name, failed_buffers);
-    Check(failed_buffers == 0u, "recreated exhausted views must not allocate slot buffers");
+	size_t failed_buffers = 0;
+	for (uint32_t window = 0; window < 8; ++window) {
+		for (uint32_t gc = 0; gc < 33; ++gc) {
+			heap.BeginDraw();
+			Check(heap.Acquire(resident, result), "keep the resident alias across reclamation windows");
+			heap.RunGarbageCollector();
+		}
+		heap.BeginDraw();
+		Check(!heap.Acquire(request, result), "a recreated exhausted view uses fallback");
+		failed_buffers += ImageHeapTestAccess::Buffers(heap) - 1u;
+		scheduler.Wait(scheduler.CurrentTick());
+	}
+	std::printf("%s: 8 recreated exhausted views, unnecessary_slot_buffers=%zu\n", g_name, failed_buffers);
+	Check(failed_buffers == 0u, "recreated exhausted views must not allocate slot buffers");
 	const auto device = graphics.device;
 	const auto extensions = graphics.physical_device.enumerateDeviceExtensionProperties(nullptr);
 	const bool memory_budget = extensions.result == vk::Result::eSuccess &&
@@ -212,7 +228,7 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	module.info.bindings.descriptor_counts[static_cast<size_t>(kind)] = fallback_descriptors;
 	module.info.bindings.descriptor_mask = uint64_t {1} << static_cast<size_t>(kind);
 	const IR::ResourceSnapshot fallback {.images = {{.dword_count = 8u}},
-	                                     .image_tables = {table}};
+	                                     .image_tables = {std::make_shared<IR::ImageTableSnapshot>(table)}};
 	const ShaderStageRuntime runtime {&module, &fallback};
 	const vk::DescriptorSetLayoutBinding binding {
 	    IR::NativeBinding(ShaderType::Compute, kind), vk::DescriptorType::eSampledImage,
@@ -287,11 +303,11 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	heap.BeginDraw();
 	Check(heap.Acquire(resident, result), "keep the resident alias while reclaiming one slot");
 	heap.RunGarbageCollector();
-    auto replacement = request;
-    replacement.base = address + 0x40000u;
-    write_table(replacement, table);
-    Check(!heap.Acquire(replacement, result), "a fresh alias-heavy view needs two slots when only one is free");
-    Check(ImageHeapTestAccess::Pending(heap) == pending, "insufficient reclamation must not allocate a partial view");
+	auto replacement = request;
+	replacement.base = address + 0x40000u;
+	write_table(replacement, table);
+	Check(!heap.Acquire(replacement, result), "a fresh alias-heavy view needs two slots when only one is free");
+	Check(ImageHeapTestAccess::Pending(heap) == pending, "insufficient reclamation must not allocate a partial view");
 	retry(4096);
 	std::printf("%s: after insufficient reclamation, occupied including null=%zu, free for tables=%zu, required=2\n",
 	            g_name, ImageHeapTestAccess::Occupied(heap), ImageHeapTestAccess::TableSlotsFree(heap));
@@ -340,22 +356,21 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 		unique.slots.push_back(HeapTexture(address + uint64_t {i} * 0x10000u));
 		unique.mapping.push_back(i);
 	}
-    auto changed = replacement;
-    changed.size = 260u * 32u;
-    changed.count = 260u;
-    write_table(changed, unique);
-    Check(!heap.Acquire(changed, result) && ImageHeapTestAccess::Pending(heap) == full,
+	auto changed = replacement;
+	changed.size = 260u * 32u;
+	changed.count = 260u;
+	write_table(changed, unique);
+	Check(!heap.Acquire(changed, result) && ImageHeapTestAccess::Pending(heap) == full,
 	      "mostly unique replacement at the same owner stays on fallback without allocating");
 	const IR::ImageTableSnapshot remapped {.slots = {{}, texture_c}, .mapping = {4, 1, 1, 1, 1}, .slots_id = 4};
-    changed.size = 4u * 32u;
-    changed.count = 4u;
-    write_table(changed, remapped);
-    Check(heap.Acquire(changed, result), "a changed snapshot can use resident aliases at zero free slots");
+	changed.size = 4u * 32u;
+	changed.count = 4u;
+	write_table(changed, remapped);
+	Check(heap.Acquire(changed, result), "a changed snapshot can use resident aliases at zero free slots");
 
-	auto* words = reinterpret_cast<uint32_t*>(address);
-	std::ranges::copy(texture_a.dwords, words);
-	std::ranges::copy(texture_b.dwords, words + 8);
-	std::ranges::copy(unique.slots[4].dwords, words + 16);
+	write(address, texture_a);
+	write(address + 32u, texture_b);
+	write(address + 64u, unique.slots[4]);
 	const IR::ImageHeapRequest mapped {.base = address, .size = 96, .step = 32, .count = 3, .root = &profile, .table = true};
 	heap.BeginDraw();
 	Check(!heap.Acquire(mapped, result), "memory-backed view starts on fallback");
@@ -369,15 +384,52 @@ void CheckHeapExhaustion(GraphicContext& graphics, uint64_t address, uint64_t by
 	}
 	invalidator.join();
 	Check(exhausted, "concurrent invalidation preserves the memory-backed failure");
-	(void)heap.InvalidateMemory(address, 96u);
-	std::ranges::copy(texture_c.dwords, words + 16);
+	write(address + 64u, texture_c);
 	heap.BeginDraw();
 	Check(heap.Acquire(mapped, result), "memory-backed descriptor mutation invalidates a failed request");
+	IR::ImageTableSnapshot expected {.slots = {{}, texture_a, texture_b, texture_c}, .mapping = {3, 1, 2, 3}};
+	heap.Rebind(executor);
+	Check(ImageHeapTestAccess::Matches(heap, mapped, expected, fallback_images), "changed descriptors select the current images");
+	auto truncated = mapped;
+	truncated.size = 76u;
+	Check(!heap.Acquire(truncated, result) && ImageHeapTestAccess::Matches(heap, mapped, expected, fallback_images),
+	      "a different extent in the same draw preserves the active view and uses fallback");
+	expected.mapping.back() = 0u;
+	heap.BeginDraw();
+	Check(heap.Acquire(truncated, result) && ImageHeapTestAccess::Matches(heap, truncated, expected, fallback_images),
+	      "truncating a descriptor clears its previous image");
 	renderer.UnmapMemory(address, 0x4000u);
 	renderer.MapMemory(address, 0x4000u);
-	std::ranges::copy(texture_a.dwords, words + 16);
+	write(address + 64u, texture_a);
 	heap.BeginDraw();
 	Check(heap.Acquire(mapped, result), "a view remapped at the same guest address uses the new table");
+	expected.mapping.back() = 1u;
+	heap.Rebind(executor);
+	Check(ImageHeapTestAccess::Matches(heap, mapped, expected, fallback_images), "remapped slots resolve to the current images");
+
+	const IR::ImageTableSnapshot keep {.slots = {{}, texture_a, texture_c}, .mapping = {2, 1, 2}};
+	changed.size = 64u;
+	changed.count = 2u;
+	write_table(changed, keep);
+	Check(heap.Acquire(changed, result), "keep the two unchanged images resident");
+	renderer.UnmapMemory(request.base, request.size);
+	const auto old_slot = ImageHeapTestAccess::LiveSlot(heap, texture_b);
+	const auto next = HeapTexture(address + 0x38000u);
+	write(address + 32u, next);
+	heap.BeginDraw();
+	Check(!heap.Acquire(mapped, result), "the retired image slot cannot be overwritten on the recording tick");
+	heap.RunGarbageCollector();
+	scheduler.Wait(scheduler.CurrentTick());
+	heap.BeginDraw();
+	Check(heap.Acquire(mapped, result), "a completed image slot accepts a different descriptor");
+	heap.Rebind(executor);
+	const auto next_image = executor.ResolveTexture(IR::ImageTableHeapResource(profile, next), next, true).image_id;
+	expected.slots[2] = next;
+	auto next_images = fallback_images;
+	next_images[2] = next_image;
+	Check(old_slot != 0u && old_slot == ImageHeapTestAccess::LiveSlot(heap, next) &&
+	      next_image && next_image != fallback_images[2] && ImageHeapTestAccess::Matches(heap, mapped, expected, next_images),
+	      "a recycled slot resolves the replacement image at every ordinal");
 	scheduler.Finish();
 	renderer.UnmapMemory(address, bytes);
 	if (memory_budget) {
