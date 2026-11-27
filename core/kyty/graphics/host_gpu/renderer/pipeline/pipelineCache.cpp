@@ -140,7 +140,7 @@ std::string ReadDriverCacheSignature(const std::filesystem::path& path, size_t s
 }
 
 std::filesystem::path DriverCachePath(const std::string& title_id, const std::string& signature) {
-	const std::filesystem::path directory = "_PipelineCache";
+	const std::filesystem::path directory = PipelineCacheDirectory();
 	const auto                  shared    = directory / (title_id + ".bin");
 	const auto own = directory / fmt::format("{}.{:016x}.bin", title_id, XXH3_64bits(signature.data(), signature.size()));
 	const bool shared_exists = Common::File::IsFileExisting(shared);
@@ -460,6 +460,14 @@ bool F32ProductNoContractionEnabled() {
 	return enabled;
 }
 
+std::filesystem::path PipelineCacheDirectory() {
+	std::filesystem::path directory = "_PipelineCache";
+	if (Config::RayTracingStatsEnabled() && RayTracing::NativeTraversals()) {
+		directory /= "rt-stats";
+	}
+	return directory;
+}
+
 std::filesystem::path ShaderStorePath() {
 	if (KYTY_BUILD != KYTY_BUILD_RELEASE || !Config::ShaderCacheEnabled() ||
 	    Config::GraphicsDebugDumpEnabled()) {
@@ -469,7 +477,7 @@ std::filesystem::path ShaderStorePath() {
 	if (title_id.empty()) {
 		return {};
 	}
-	return std::filesystem::path("_PipelineCache") / (title_id + ".shaders");
+	return PipelineCacheDirectory() / (title_id + ".shaders");
 }
 
 void GuestReadLog::Append(uint64_t address, const void* data, uint32_t size, bool strict,
@@ -1793,7 +1801,7 @@ bool PipelineCache::InitializeDriverCache() {
 		m_driver_cache_path = DriverCachePath(title_id, DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()));
 	}
 #else
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	m_driver_cache_path     = PipelineCacheDirectory() / (title_id + ".bin");
 #endif
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = !m_driver_cache_path.empty() && Common::File::IsFileExisting(m_driver_cache_path);

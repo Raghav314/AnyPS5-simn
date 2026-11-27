@@ -13,6 +13,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -193,6 +194,21 @@ std::string readFile(const std::filesystem::path& path) {
     return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
 }
 
+void writeFile(const std::filesystem::path& path, std::string_view contents) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    stream << contents;
+    if (!stream) throw std::runtime_error("could not write synthetic cache file");
+}
+
+std::map<std::string, std::string> cacheFiles(const std::filesystem::path& directory) {
+    std::map<std::string, std::string> files;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.is_regular_file()) files.emplace(entry.path().filename().string(), readFile(entry.path()));
+    }
+    return files;
+}
+
 std::string quote(const std::filesystem::path& path) {
     return "\"" + path.string() + "\"";
 }
@@ -241,7 +257,7 @@ Replay replay(const std::filesystem::path& tool, const std::filesystem::path& ro
 
 Replay preparedReplay(const std::filesystem::path& tool, const std::filesystem::path& root,
                       const char* scenario, const char* phase, std::span<const Dispatch> dispatches,
-                      bool wait_manifest) {
+                      bool wait_manifest, bool cold_pipelines = true) {
     const auto directory = root / scenario;
     const auto run = directory / phase;
     std::filesystem::create_directories(directory / "app0" / "sce_sys");
@@ -256,7 +272,8 @@ Replay preparedReplay(const std::filesystem::path& tool, const std::filesystem::
     const auto frames = run / "frames";
     const auto dump = run / "output.bin";
     const auto command = quote(tool) + " " + quote(run / "capture") +
-                         " --strict --no-synthesize --repeat 1 --cold-pipelines" +
+                         " --strict --no-synthesize --repeat 1" +
+                         (cold_pipelines ? " --cold-pipelines" : "") +
                          (wait_manifest ? " --wait-manifest" : "") + " --frames " + quote(frames) +
                          " --dump \"" + std::to_string(Output) + ":" +
                          std::to_string(Width * Rows * 4u) + ":" + dump.string() + "\"" +
@@ -416,19 +433,132 @@ int prepared(const std::filesystem::path& tool, const std::filesystem::path& roo
     return 0;
 }
 
+int rtStatsCache(const std::filesystem::path& tool, const std::filesystem::path& root) {
+    setVariable("KYTY_NATIVE_RT", "1");
+    setVariable("KYTY_RT_STATS", "0");
+    setVariable("KYTY_GENERIC_COMPUTE_VARIANT", "0");
+    setVariable("KYTY_GENERIC_COMPUTE_SPECIALIZE", "0");
+    setVariable("KYTY_SHADER_VARIANT_LOG", "1");
+    setVariable("KYTY_ASYNC_PIPELINES", "0");
+    setVariable("KYTY_GPU_PIPELINE", "0");
+    const auto dispatches = std::span<const Dispatch>(PreparedDispatches.data(), 1);
+    const auto require = [&](bool condition, const char* message, const Replay& result) {
+        if (condition) return;
+        std::cerr << "RT statistics cache replay files: " << root << '\n';
+        printTail(result.log);
+        throw std::runtime_error(message);
+    };
+    const auto run = [&](const char* scenario, const char* phase, bool wait_manifest) {
+        return preparedReplay(tool, root, scenario, phase, dispatches, wait_manifest, false);
+    };
+
+    setVariable("KYTY_PIPELINE_MANIFEST", "0");
+    setVariable("KYTY_RECORD_PIPELINE_MANIFEST", "0");
+    setVariable("ANYPS5_NO_SHADER_CACHE", "0");
+    const auto store_seed = run("store", "normal-seed", false);
+    if (!store_seed.completed) {
+        std::cerr << "RT statistics cache replay files: " << root << '\n';
+        printTail(store_seed.log);
+        if (store_seed.log.find("asks for native ray tracing") != std::string::npos ||
+            vulkanUnavailable(store_seed)) return 77;
+        throw std::runtime_error("the normal shader-store seed replay did not complete");
+    }
+    const auto store = root / "store" / "_PipelineCache";
+    const auto default_store = store / "PREP00001.shaders";
+    require(std::filesystem::is_regular_file(default_store), "the normal run did not save a shader store", store_seed);
+    const auto store_bytes = readFile(default_store);
+    require(!store_bytes.empty(), "the normal shader store is empty", store_seed);
+    const auto normal_driver = (std::filesystem::path("_PipelineCache") / "PREP00001").string();
+    const auto stats_driver = (std::filesystem::path("_PipelineCache") / "rt-stats" / "PREP00001").string();
+    require(store_seed.log.find("Vulkan pipeline cache: initializing " + normal_driver) != std::string::npos,
+            "the normal run did not select the normal Vulkan pipeline cache", store_seed);
+    const auto normal_store_files = cacheFiles(store);
+
+    setVariable("KYTY_RT_STATS", "1");
+    const auto store_stats = run("store", "stats", false);
+    require(store_stats.completed && store_stats.dump == store_seed.dump &&
+                store_stats.log.find("native ray tracing on") != std::string::npos &&
+                cacheFiles(store) == normal_store_files &&
+                std::filesystem::is_regular_file(store / "rt-stats" / "PREP00001.shaders") &&
+                readFile(store / "rt-stats" / "PREP00001.shaders") != store_bytes &&
+                store_stats.log.find("Vulkan pipeline cache: initializing " + stats_driver) != std::string::npos &&
+                count(store_stats.log, BuildLine) != 0,
+            "the statistics run changed the normal shader or Vulkan pipeline cache", store_stats);
+
+    setVariable("KYTY_RT_STATS", "0");
+    const auto store_warm = run("store", "normal-warm", false);
+    require(store_warm.completed && store_warm.dump == store_seed.dump &&
+                store_warm.log.find("Shader cache: loaded ") != std::string::npos &&
+                store_warm.log.find("Shader cache: loaded 0 programs") == std::string::npos &&
+                store_warm.log.find("Shader cache: replacing ") == std::string::npos,
+            "the normal shader store did not load warm after the statistics run", store_warm);
+
+    setVariable("ANYPS5_NO_SHADER_CACHE", "1");
+    setVariable("KYTY_PIPELINE_MANIFEST", "1");
+    setVariable("KYTY_RECORD_PIPELINE_MANIFEST", "1");
+    const auto cache = root / "manifest" / "_PipelineCache";
+    const auto normal_use = cache / "PREP00001_01.00.use";
+    const auto stats_use = cache / "rt-stats" / "PREP00001_01.00.use";
+    writeFile(normal_use, "# kyty shader use order v1\nS\n1111111111111111\n");
+    const auto manifest_seed = run("manifest", "normal-seed", false);
+    require(manifest_seed.completed &&
+                manifest_seed.log.find("1 shaders used in 1 earlier sessions go first (" +
+                                       (std::filesystem::path("_PipelineCache") / normal_use.filename()).string()) !=
+                    std::string::npos,
+            "the normal manifest run did not read its use order", manifest_seed);
+    const auto default_manifest = cache / "PREP00001_01.00.kpm";
+    const auto default_code = cache / "PREP00001_01.00.code";
+    require(std::filesystem::is_regular_file(default_manifest) && std::filesystem::is_regular_file(default_code),
+            "the normal run did not save its pipeline manifest and code", manifest_seed);
+    const auto manifest_bytes = readFile(default_manifest);
+    const auto normal_manifest_files = cacheFiles(cache);
+    const auto code_bytes = readFile(default_code);
+
+    writeFile(stats_use, "# kyty shader use order v1\nS\n2222222222222222\n");
+    setVariable("KYTY_RT_STATS", "1");
+    const auto manifest_stats = run("manifest", "stats", false);
+    require(manifest_stats.completed && manifest_stats.dump == manifest_seed.dump &&
+                cacheFiles(cache) == normal_manifest_files &&
+                manifest_stats.log.find("1 shaders used in 1 earlier sessions go first (" +
+                                        (std::filesystem::path("_PipelineCache") / "rt-stats" /
+                                         stats_use.filename()).string()) != std::string::npos &&
+                manifest_stats.log.find("Vulkan pipeline cache: initializing " + stats_driver) != std::string::npos &&
+                readFile(default_manifest) == manifest_bytes && readFile(default_code) == code_bytes &&
+                std::filesystem::is_regular_file(cache / "rt-stats" / "PREP00001_01.00.kpm") &&
+                std::filesystem::is_regular_file(cache / "rt-stats" / "PREP00001_01.00.code"),
+            "the statistics run changed the normal pipeline manifest or code store", manifest_stats);
+
+    setVariable("KYTY_RT_STATS", "0");
+    const auto manifest_warm = run("manifest", "normal-warm", true);
+    require(manifest_warm.completed && manifest_warm.dump == manifest_seed.dump &&
+                manifest_warm.log.find("Pipeline manifest: 1 modules, 0 pipelines in ") != std::string::npos &&
+                manifest_warm.log.find("Pipeline manifest: wrote ") == std::string::npos &&
+                readFile(default_manifest) == manifest_bytes,
+            "the normal pipeline manifest did not load warm after the statistics run", manifest_warm);
+
+    if (std::getenv("APS5_REPLAY_KEEP_ARTIFACTS") == nullptr) {
+        std::filesystem::remove_all(root);
+    } else {
+        std::cout << "RT statistics cache replay files: " << root << '\n';
+    }
+    std::cout << "kyty_shim_rt_stats_cache_isolation: ok (normal shader store and manifest stayed warm)\n";
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 2 && (argc != 3 || std::strcmp(argv[2], "--prepared") != 0)) {
-            throw std::runtime_error("usage: kyty_shim_generic_compute_replay_tests <agc_frame_replay> [--prepared]");
+        if (argc != 2 && (argc != 3 || (std::strcmp(argv[2], "--prepared") != 0 &&
+                                          std::strcmp(argv[2], "--rt-stats-cache") != 0))) {
+            throw std::runtime_error("usage: kyty_shim_generic_compute_replay_tests <agc_frame_replay> [--prepared|--rt-stats-cache]");
         }
         const std::filesystem::path tool = argv[1];
         const auto root = std::filesystem::temp_directory_path() /
                           ("kyty-generic-compute-replay-" +
                            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(root);
-        if (argc == 3) return prepared(tool, root);
+        if (argc == 3) return std::strcmp(argv[2], "--prepared") == 0 ? prepared(tool, root) : rtStatsCache(tool, root);
         const bool vulkan_required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
         const char* setting = std::getenv("KYTY_GENERIC_COMPUTE_SPECIALIZE");
         const bool specialize = setting == nullptr || std::strcmp(setting, "0") != 0;

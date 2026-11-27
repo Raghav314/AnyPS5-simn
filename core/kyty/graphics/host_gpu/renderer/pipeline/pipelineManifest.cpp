@@ -473,14 +473,14 @@ void PipelineCache::OpenManifest() {
 	Loader::SystemContentParamSfoGetString("APP_VER", &version);
 	const auto stem = SafeFileName(version.empty() ? title : title + "_" + version);
 	const auto name = stem + ".kpm";
-	OpenUseOrder(std::filesystem::path("_PipelineCache") / (stem + ".use"));
+	OpenUseOrder(PipelineCacheDirectory() / (stem + ".use"));
 	std::vector<std::filesystem::path> folders;
 	std::filesystem::path              assets;
 	if (const char* base = SDL_GetBasePath(); base != nullptr) {
 		assets = Common::PathFromUtf8(base) / "assets" / "pipelines";
 		folders.push_back(assets);
 	}
-	folders.emplace_back("_PipelineCache");
+	folders.push_back(PipelineCacheDirectory());
 	std::vector<std::filesystem::path> files;
 	for (const auto& folder: folders) {
 		if (Common::File::IsFileExisting(folder / name)) {
