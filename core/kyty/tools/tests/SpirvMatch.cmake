@@ -21,6 +21,7 @@ string(CONCAT both "${vertex}"
 check_match(0 "${both}" "" fixture.shaders "モジュール.spv" plain.spv ps.spv)
 check_match(0 "${vertex}" "" legacy.shaders vs.spv)
 check_match(0 "${vertex}" "" previous.shaders vs.spv)
+check_match(0 "${vertex}" "" intermediate.shaders vs.spv)
 check_match(0 "${vertex}" "" no-indexed-reads.shaders vs.spv)
 check_match(0 "${vertex}" "" no-extra-sources.shaders vs.spv)
 check_match(1 "${vertex}input=2 no match\n" "" fixture.shaders vs.spv missing.spv)

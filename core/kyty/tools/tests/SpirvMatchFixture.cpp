@@ -113,6 +113,11 @@ int main() {
 	Write(previous, previous_header.bytes);
 	WriteModule<CommonWriter>(previous, 0x102, 0x201, ShaderType::Vertex, vertex, {});
 	WriteModule<CommonWriter>(previous, 0x101, 0x201, ShaderType::Vertex, vertex, {});
+	std::ofstream intermediate("intermediate.shaders", std::ios::binary);
+	Write(intermediate, header.bytes);
+	WriteModule<CommonWriter>(intermediate, 0x102, 0x201, ShaderType::Vertex, vertex, {});
+	WriteModule<CommonWriter>(intermediate, 0x101, 0x201, ShaderType::Vertex, vertex, {});
+	intermediate.close();
 	std::ofstream no_extra("no-extra-sources.shaders", std::ios::binary);
 	Write(no_extra, header.bytes);
 	WriteModule<NoExtraSourcesWriter>(no_extra, 0x102, 0x201, ShaderType::Vertex, vertex, {});
@@ -141,5 +146,5 @@ int main() {
 	WriteDump("plain.spv", plain);
 	WriteDump("missing.spv", missing);
 	WriteDump("invalid.spv", {0, 0, 0, 0, 0});
-	return !store || !legacy || !previous || !no_extra || !no_indexed || !malformed || !bad_header;
+	return !store || !legacy || !previous || !intermediate || !no_extra || !no_indexed || !malformed || !bad_header;
 }
