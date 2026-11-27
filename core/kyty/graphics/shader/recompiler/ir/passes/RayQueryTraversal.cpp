@@ -73,6 +73,40 @@ std::optional<uint32_t> Immediate(Value value) {
 	return value.U32();
 }
 
+std::optional<uint32_t> LowThreeBits(Value value, uint32_t depth = 0u) {
+	if (depth >= 16u) return std::nullopt;
+	if (const auto immediate = Immediate(value)) return *immediate & 7u;
+	const auto* inst = value.Resolve().TryInstruction();
+	if (inst == nullptr) return std::nullopt;
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::IAdd32: {
+			const auto left  = LowThreeBits(inst->Arg(0), depth + 1u);
+			const auto right = LowThreeBits(inst->Arg(1), depth + 1u);
+			if (left && right) return (*left + *right) & 7u;
+			return std::nullopt;
+		}
+		case ValueOpcode::ShiftLeftLogical32: {
+			const auto shift = Immediate(inst->Arg(1));
+			if (!shift) return std::nullopt;
+			const auto count = *shift & 31u;
+			if (count >= 3u) return 0u;
+			const auto low = LowThreeBits(inst->Arg(0), depth + 1u);
+			if (low) return (*low << count) & 7u;
+			return std::nullopt;
+		}
+		case ValueOpcode::BitwiseAnd32: {
+			const auto left  = Immediate(inst->Arg(0));
+			const auto right = Immediate(inst->Arg(1));
+			if ((left && (*left & 7u) == 0u) || (right && (*right & 7u) == 0u)) return 0u;
+			const auto low_left  = LowThreeBits(inst->Arg(0), depth + 1u);
+			const auto low_right = LowThreeBits(inst->Arg(1), depth + 1u);
+			if (low_left && low_right) return *low_left & *low_right;
+			return std::nullopt;
+		}
+		default: return std::nullopt;
+	}
+}
+
 std::optional<uint32_t> Slot(Value value) {
 	const auto* read = Producer(value, ValueOpcode::ReadConst);
 	return read != nullptr ? Immediate(read->Arg(1)) : std::nullopt;
@@ -1454,6 +1488,18 @@ uint32_t TraceTraversalsWithRayQueries(Program& program) {
 		}
 	}
 	return traced;
+}
+
+std::optional<RayQueryResultKind> WaveScalarReadKind(const Program& program, const Inst& read) {
+	if (read.GetOpcode() != ValueOpcode::ReadConstBuffer || read.NumArgs() < 2u) return std::nullopt;
+	const auto index = read.Flags<MemoryFlags>().index;
+	if (index >= program.memory_info.size()) return std::nullopt;
+	const auto low = LowThreeBits(read.Arg(1));
+	if (!low) return std::nullopt;
+	const auto at = ((*low & ~3u) + (program.memory_info[index].offset & ~3u)) & 7u;
+	return at == 0u   ? std::optional(RayQueryResultKind::Node)
+	       : at == 4u ? std::optional(RayQueryResultKind::Word)
+	                  : std::nullopt;
 }
 
 namespace {
@@ -3993,13 +4039,7 @@ std::optional<RayQueryResultKind> WaveResultKind(const Program& program, const L
 		     (base->GetOpcode() == ValueOpcode::CompositeConstructU64 &&
 		      resource->Arg(0).Resolve() == base->Arg(0).Resolve()));
 		if (!blas || !InLoop(program, value->Parent(), s.wave_header, s.wave_latch)) return std::nullopt;
-		auto at = MemoryOf(program, *value).offset & ~3u;
-		if (const auto* add = Producer(value->Arg(1), ValueOpcode::IAdd32); add != nullptr)
-			at += Immediate(add->Arg(0)).value_or(Immediate(add->Arg(1)).value_or(0u)) & ~3u;
-		at &= 7u;
-		return at == 0u   ? std::optional(RayQueryResultKind::Node)
-		       : at == 4u ? std::optional(RayQueryResultKind::Word)
-		                  : std::nullopt;
+		return WaveScalarReadKind(program, *value);
 	}
 	const auto* mul = Producer(Canonical(Value(const_cast<Inst*>(value))), ValueOpcode::FPMul32);
 	for (uint32_t side = 0; mul != nullptr && side < 2; ++side) {
