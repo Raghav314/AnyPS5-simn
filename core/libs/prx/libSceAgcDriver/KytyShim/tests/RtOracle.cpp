@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/ir/passes/RayQueryTraversal.h"
 
 #include <array>
+#include <optional>
 #include <bit>
 #include <cstring>
 #include <cstdint>
@@ -232,6 +233,8 @@ struct SourceWalk {
     IR::Program            program;
     IR::Block*             block = &entry;
     std::vector<IR::Inst*> sites;
+    IR::ResourceKind       address_kind {};
+    std::optional<IR::ResourceKind> user_kind;
 
     IR::Value Add(IR::ValueOpcode opcode, std::initializer_list<IR::Value> args, uint64_t flags = 0) {
         return IR::Value(&block->AppendNewInst(opcode, args, flags));
@@ -247,7 +250,9 @@ struct SourceWalk {
     }
 
     IR::Value LoadAddress(IR::Value resource, uint32_t offset) {
-        return Load(IR::ValueOpcode::LoadAddressU32, {resource, IR::Value(uint32_t {0}), IR::Value(uint32_t {0}), IR::Value(true)}, offset, false);
+        const auto value = Load(IR::ValueOpcode::LoadAddressU32, {resource, IR::Value(uint32_t {0}), IR::Value(uint32_t {0}), IR::Value(true)}, offset, false);
+        program.memory_info.back().kind = address_kind;
+        return value;
     }
 
     std::array<IR::Value, 2> Offset(IR::Value low, IR::Value high, IR::Value node) {
@@ -298,7 +303,11 @@ std::array<IR::Value, 2> UserHeader(SourceWalk& walk, uint32_t offset) {
     walk.block         = &walk.entry;
     const auto user    = [&](uint32_t reg) { return walk.Add(Op::GetUserData, {IR::Value(IR::ScalarReg {reg})}); };
     const auto pointer = walk.Add(Op::GetAddressResource, {user(4), user(5)});
-    return {walk.LoadAddress(pointer, offset), walk.LoadAddress(pointer, offset + 4)};
+    const auto kind    = walk.address_kind;
+    walk.address_kind  = walk.user_kind.value_or(kind);
+    const std::array<IR::Value, 2> header {walk.LoadAddress(pointer, offset), walk.LoadAddress(pointer, offset + 4)};
+    walk.address_kind  = kind;
+    return header;
 }
 
 std::array<IR::Value, 6> UserRay(SourceWalk& walk) {
@@ -389,12 +398,15 @@ void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> head
     loop.merge.AppendNewInst(Op::Phi, {}, word).AddPhiOperand(&loop.body, child);
 }
 
-IR::OracleWalks DeriveWithHighWord(HighWord kind) {
+IR::OracleWalks DeriveWithHighWord(HighWord kind, IR::ResourceKind address_kind = {}, uint32_t header_at = 0x20,
+                                   std::optional<IR::ResourceKind> user_kind = std::nullopt) {
     SourceWalk walk;
+    walk.address_kind   = address_kind;
+    walk.user_kind      = user_kind;
     walk.program.blocks = {&walk.entry, &walk.header, &walk.body, &walk.latch, &walk.merge};
     Number(walk);
     const auto ray    = UserRay(walk);
-    const auto header = UserHeader(walk, 0x20);
+    const auto header = UserHeader(walk, header_at);
     BuildWalk(walk, {walk.entry, walk.header, walk.body, walk.latch, walk.merge}, header, ray, kind);
     return IR::DeriveOracleWalks(walk.program, walk.sites);
 }
@@ -513,6 +525,19 @@ void DescriptorHighWord() {
     Expect(exact.refusal == nullptr && !exact.sources.empty(), "a walk whose descriptor high word is the high dword of header plus instance offset is derived");
     Expect(!exact.sources.empty() && exact.sources.front().user_sgpr == 4u && exact.sources.front().header_offset == 0x20u,
            "the derived walk reads the TLAS header the user data names");
+    const auto scalar = DeriveWithHighWord(HighWord::Exact, IR::ResourceKind::ScalarAddress);
+    Expect(scalar.refusal == nullptr && !scalar.sources.empty() && scalar.sources.front().user_sgpr == 4u &&
+               scalar.sources.front().header_offset == 0x20u,
+           "a TLAS header read with scalar loads through the user data pointer is derived");
+    const auto plain  = DeriveWithHighWord(HighWord::Exact);
+    const auto loaded = DeriveWithHighWord(HighWord::Exact, IR::ResourceKind::ScalarAddress, 0x20, IR::ResourceKind {});
+    Expect(loaded.refusal == nullptr && !loaded.sources.empty() && !plain.sources.empty() && loaded.sources.front().user_sgpr == plain.sources.front().user_sgpr &&
+               loaded.sources.front().header_offset == plain.sources.front().header_offset &&
+               loaded.sources.front().root == plain.sources.front().root && loaded.sources.front().layout == plain.sources.front().layout,
+           "scalar reads through a header pointer loaded from memory name the same source as plain reads");
+    const auto unaligned = DeriveWithHighWord(HighWord::Exact, IR::ResourceKind::ScalarAddress, 0x22);
+    Expect(!unaligned.sources.empty() && unaligned.sources.front().header_offset == 0x20u,
+           "a scalar header read at an unaligned offset names the dword the hardware reads");
     Expect(refused(HighWord::StrideBit), "a computed high word that sets a stride bit is refused");
     Expect(refused(HighWord::SwizzleBit), "a computed high word that sets a swizzle bit is refused");
 }

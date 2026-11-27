@@ -352,7 +352,11 @@ public:
 
 	uint32_t AlignAddress(uint32_t value) {
 		auto form = m_store.F(value);
-		if (std::ranges::all_of(form.terms, [](const auto& term) { return (term.second & 3u) == 0u; })) {
+		if (std::ranges::all_of(form.terms, [&](const auto& term) {
+			    const auto& atom = m_store.A(term.first);
+			    return (term.second & 3u) == 0u ||
+			           (term.second == 1u && (atom.kind == Kind::Pointer || (atom.kind == Kind::Load && atom.args[1] == 8)));
+		    })) {
 			form.constant &= ~uint64_t {3};
 			return m_store.Make(std::move(form));
 		}

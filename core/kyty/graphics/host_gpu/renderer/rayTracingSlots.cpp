@@ -514,6 +514,9 @@ bool RayTracing::HeaderInUserData(const TlasSource& source) noexcept {
 
 uint64_t RayTracing::UserPointer(const TlasSource& source, uint64_t pointer,
                                        const std::function<bool(uint64_t, uint64_t)>& readable) {
+	if ((pointer & 3u) != 0u) {
+		return 0;
+	}
 	if (source.header_vsharp == ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot) {
 		return pointer;
 	}
@@ -591,7 +594,7 @@ RayTracing::GuestTlas RayTracing::ReadGuestTlas(
 	const uint32_t node_limit = node_limit_at(header, TlasNodeCountBit);
 	uint64_t       instance_offset = 0;
 	load(header + ((layout[1] >> 16u) & 15u) * 8u, instance_offset);
-	if (node_limit >= QueueCapacity || instance_offset >= MaxExtent) {
+	if (node_limit >= QueueCapacity || instance_offset >= MaxExtent || (instance_offset & 3u) != 0u) {
 		return {};
 	}
 	const auto nodes_end = header + (uint64_t {node_limit} + 1) * 64;
