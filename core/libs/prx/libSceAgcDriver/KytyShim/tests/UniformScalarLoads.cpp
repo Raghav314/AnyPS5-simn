@@ -268,6 +268,88 @@ void TableRead(bool robust) {
 	      name + "the uniform view is declared in the Uniform storage class");
 }
 
+void RecordTableAlignedOffsets() {
+	std::fill(g_guest.begin(), g_guest.end(), 0u);
+	const uint64_t pointer_table = SrtAddress + 0x400u;
+	const std::array<uint64_t, 2> records {ConstantAddress + 0x400u, ConstantAddress + 0x500u};
+	const std::array<uint64_t, 2> elements {SrtAddress + 0x800u, SrtAddress + 0x900u};
+	const std::array<Texture, 2> images {MakeTexture(TextureA, Format8888), MakeTexture(TextureB, Format8888)};
+	std::array<uint32_t, 2> keys {};
+	for (size_t row = 0; row < records.size(); ++row) {
+		Poke(pointer_table + row * 16u, static_cast<uint32_t>(records[row]));
+		Poke(pointer_table + row * 16u + 4u, static_cast<uint32_t>(records[row] >> 32u));
+		const auto sharp = MakeSharp(elements[row], 32u, Format32UInt, SwizzleXyzw, 3u);
+		keys[row] = sharp[0];
+		for (size_t word = 0; word < sharp.size(); ++word) Poke(records[row] + word * 4u, sharp[word]);
+		for (size_t word = 0; word < images[row].size(); ++word)
+			Poke(elements[row] + word * 4u, images[row][word]);
+	}
+	std::array<uint32_t, 16> user_data {};
+	const auto pointer_sharp = MakeSharp(pointer_table, 32u, Format32UInt, SwizzleXyzw, 3u);
+	std::copy(pointer_sharp.begin(), pointer_sharp.end(), user_data.begin());
+	user_data[12] = 1u;
+	const std::vector<uint32_t> code {
+	    0x7e040f00u, 0x7e180502u, 0x8f0d840cu, 0xf4240100u, 0x1a000000u, WaitAll, 0xb00e0003u,
+	    0xf4080202u, 0x1c000001u, WaitAll, 0xf42c0404u, 0xfa000000u, WaitAll,
+	    0x7e040280u, 0x7e060280u, 0xf0001108u, 0x00040402u, WaitAll,
+	    0xf800180fu, 0x04040404u, EndProgram,
+	};
+	ShaderPixelInputInfo pixel {};
+	pixel.ps_pos_x = true;
+	pixel.target_output_mode[0] = 1;
+	Recompiler::CompileOptions options;
+	options.stage = ShaderType::Pixel;
+	options.input_info.pixel = &pixel;
+	options.user_data = std::vector<uint32_t>(16, 0u);
+	const auto source = Recompiler::PrepareShaderSource(code, options);
+	auto translated = Recompiler::TranslateProgram(source.decoded, options);
+	const auto plan = IR::ExtractResourcePlan(translated.program);
+	const IR::DescriptorSource::IndirectDescriptor* indirect = nullptr;
+	for (const auto& descriptor: plan.descriptor_sources) {
+		if (!descriptor.indirect_descriptor || !descriptor.indirect_descriptor->pointer_table ||
+		    !descriptor.indirect_descriptor->pointer_table->buffer) continue;
+		indirect = &*descriptor.indirect_descriptor;
+		break;
+	}
+	Check(indirect != nullptr, "the image is planned through a scalar record table");
+	if (indirect == nullptr) return;
+	Check(indirect->pointer_table->offset == 0u && indirect->pointer_table->element_offset == 0u &&
+	          indirect->table_stride == 16u,
+	      "a register offset of three and encoded offset of one select the first aligned record word");
+	const IR::SrtRuntime runtime {.user_data = user_data, .read_specialization_memory = ReadMemory};
+	IR::ResourceSnapshot snapshot;
+	IR::ResourceSpecialization specialization;
+	const bool materialized = IR::MaterializeResources(plan, runtime, snapshot, specialization);
+	Check(materialized, "both scalar record table rows materialize");
+	if (!materialized) return;
+	for (const auto& image: images) {
+		const bool found = std::any_of(snapshot.images.begin(), snapshot.images.end(),
+		    [&](const IR::DescriptorValue& descriptor) {
+			return descriptor.dword_count == image.size() &&
+			       std::equal(image.begin(), image.end(), descriptor.dwords.begin());
+		    });
+		Check(found, "the scalar record table contains each image descriptor");
+	}
+	Check(!specialization.images.empty(), "the scalar record table has an image specialization");
+	if (specialization.images.empty()) return;
+	const size_t mapping_offset = specialization.images[0].indirect_mapping_offset;
+	const bool mapped = mapping_offset <= snapshot.flattened_srt.size() &&
+	                    snapshot.flattened_srt.size() - mapping_offset >= 5u &&
+	                    snapshot.flattened_srt[mapping_offset] == 2u;
+	Check(mapped, "the scalar record table has two distinct rows");
+	if (mapped) {
+		for (const auto key: keys) {
+			const bool found = snapshot.flattened_srt[mapping_offset + 1u] == key ||
+			                   snapshot.flattened_srt[mapping_offset + 3u] == key;
+			Check(found, "the scalar record table maps each record V# key");
+		}
+	}
+	const auto compiled = Recompiler::CompileProgram(std::move(translated), options, specialization, 0);
+	std::string messages;
+	Check(!compiled.spirv.empty() && ValidateSpirv(compiled.spirv, messages),
+	      "pixel shader with a scalar record table: " + messages);
+}
+
 void IndirectTypedLoad() {
 	const std::vector<uint32_t> code {
 	    0xd760000cu, 0x00000500u, 0x870c810cu, 0x8f0c840cu, 0xf4280304u, 0x18000000u, WaitAll,
@@ -299,15 +381,16 @@ const IR::Inst* ReadLaneSource(IR::Value value) {
 	}
 }
 
-enum class RecordIndex { UserData, FirstLane, Waterfall, CombinedOffsets, OverlappingOffsets };
+enum class RecordIndex { UserData, IndependentAlignment, FirstLane, Waterfall, CombinedOffsets, OverlappingOffsets };
 
 void RuntimeOffsetDescriptors(RecordIndex index) {
+	const bool independent_alignment = index == RecordIndex::IndependentAlignment;
 	const bool overlap = index == RecordIndex::OverlappingOffsets;
 	const bool combined = index == RecordIndex::CombinedOffsets || overlap;
 	const bool waterfall = index == RecordIndex::Waterfall || combined;
-	const bool wave_record = index != RecordIndex::UserData;
-	const uint32_t sampler_field = combined ? (overlap ? 1u : 5u) : waterfall ? 128u : 8u;
-	const uint32_t image_field = combined ? (overlap ? 4u : 1u) : waterfall ? 64u : 0u;
+	const bool wave_record = index != RecordIndex::UserData && !independent_alignment;
+	const uint32_t sampler_field = independent_alignment ? 3u : combined ? (overlap ? 1u : 5u) : waterfall ? 128u : 8u;
+	const uint32_t image_field = independent_alignment ? 7u : combined ? (overlap ? 2u : 1u) : waterfall ? 64u : 0u;
 	std::vector<uint32_t> code;
 	uint32_t loop_start = 0;
 	if (waterfall) {
@@ -325,8 +408,10 @@ void RuntimeOffsetDescriptors(RecordIndex index) {
 		constexpr uint32_t ReadFirstLaneS12 = 0x7e180502u;
 		code = {ConvertPositionX, ReadFirstLaneS12};
 	}
+	code.push_back(waterfall ? 0x98eb0d0cu : 0x936bb00cu);
+	if (independent_alignment) code.push_back(0x806b816bu);
 	code.insert(code.end(), {
-	    waterfall ? 0x98eb0d0cu : 0x936bb00cu, 0xf4201a84u, 0xd6000000u | sampler_field,
+	    0xf4201a84u, 0xd6000000u | sampler_field,
 	    0xf4201ac4u, 0xd6000000u | image_field, WaitAll, 0x8f6a846au, 0x8f6b856bu, 0xf4280600u,
 	    0xd4000000u, 0xf42c0402u, 0xd6000000u, WaitAll, 0xf0800109u, 0x00c40400u, WaitAll,
 	});
@@ -378,21 +463,21 @@ void RuntimeOffsetDescriptors(RecordIndex index) {
 	};
 	bind_table(0, sampler_table, sizeof(samplers));
 	bind_table(4, image_table, sizeof(images));
-	bind_table(8, ConstantAddress, combined ? 32u : waterfall ? 160u : 96u);
+	bind_table(8, ConstantAddress, independent_alignment ? 56u : combined ? 32u : waterfall ? 160u : 96u);
 	if (waterfall) user_data[13] = combined ? 3u : 5u;
 	const IR::SrtRuntime runtime {.user_data = user_data, .read_specialization_memory = ReadMemory};
 	IR::ResourceSpecialization specialization;
 	for (uint32_t record = 0; record < 2u; ++record) {
 		if (combined) {
 			const auto address = ConstantAddress + record * 16u;
-			Poke(address, 7u);
-			Poke(address + 4u, overlap ? record : 0u);
-			Poke(address + 8u, overlap ? 7u : record);
+			Poke(address, overlap ? record : 0u);
+			Poke(address + 4u, overlap ? 7u : record);
+			Poke(address + 8u, 7u);
 		} else {
 			const auto address = ConstantAddress + (waterfall ? 4u + record * 16u : record * 48u);
 			if (waterfall) Poke(address - 4u + sampler_field, 7u);
-			Poke(address + image_field, 1u - record);
-			Poke(address + sampler_field, record);
+			Poke(address + (independent_alignment ? 4u : image_field), 1u - record);
+			Poke(address + (independent_alignment ? 0u : sampler_field), record);
 		}
 	}
 	IR::ResourceSnapshot snapshot;
@@ -455,8 +540,10 @@ int main() {
 	Common::SoftExitScope soft;
 	IR::SetComputeIndirectFloors(256, 8);
 	RuntimeOffsetDescriptors(RecordIndex::UserData);
+	RuntimeOffsetDescriptors(RecordIndex::IndependentAlignment);
 	RuntimeOffsetDescriptors(RecordIndex::FirstLane);
 	try {
+		RecordTableAlignedOffsets();
 		RuntimeOffsetDescriptors(RecordIndex::Waterfall);
 		RuntimeOffsetDescriptors(RecordIndex::CombinedOffsets);
 		RuntimeOffsetDescriptors(RecordIndex::OverlappingOffsets);

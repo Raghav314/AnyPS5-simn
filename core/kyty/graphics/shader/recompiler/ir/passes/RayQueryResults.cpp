@@ -880,8 +880,10 @@ private:
 				const auto* buffer = inst.Arg(0).Resolve().TryInstruction();
 				if (buffer == nullptr) return "a constant buffer read without resource";
 				for (uint32_t lane = 0; lane < m_wave; ++lane) {
-					const auto base    = (a(0, lane, 0) & 0xffffffffu) | ((a(0, lane, 1) & 0xffffu) << 32u);
-					const auto address = base + u32(a(1, lane)) + memory.offset;
+					const auto raw_base = (a(0, lane, 0) & 0xffffffffu) | ((a(0, lane, 1) & 0xffffu) << 32u);
+					const auto base = memory.kind == ResourceKind::IndirectBuffer ? raw_base & ~uint64_t {3} : raw_base;
+					const auto address = base + (u32(a(1, lane)) & ~3u) +
+					                     (memory.offset & ~3u);
 					At(out, lane)      = Memory(address);
 					if (m_tracking && m_walk) {
 						if (lane == 0) m_taint[out].reset();
@@ -967,9 +969,14 @@ private:
 						continue;
 					}
 					const auto& memory = m_program.memory_info[inst.Flags<MemoryFlags>().index];
+					const bool  scalar = memory.kind == ResourceKind::ScalarAddress;
+					const auto  low = u32(a(1, lane));
+					const auto  base_low = memory.address_is_full ? low : u32(a(0, lane, 0));
+					const auto  base_high = memory.address_is_full ? u32(a(2, lane)) : u32(a(0, lane, 1));
+					const auto  base = uint64_t {scalar ? base_low & ~3u : base_low} | (uint64_t {base_high} << 32u);
+					const auto  dynamic = memory.address_is_full ? 0u : scalar ? low & ~3u : low;
 					const auto  offset = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(memory.offset)));
-					const auto  address = memory.address_is_full ? ((a(1, lane) & 0xffffffffu) | (a(2, lane) & 0xffffffffu) << 32u) + offset
-					                                             : ((a(0, lane, 0) & 0xffffffffu) | (a(0, lane, 1) << 32u)) + (a(1, lane) & 0xffffffffu) + offset;
+					const auto  address = base + dynamic + (scalar ? offset & ~uint64_t {3} : offset);
 					auto        value   = static_cast<uint64_t>(Memory(address));
 					value >>= (address & 3u) * 8u;
 					if (op == Op::LoadAddressU16) value &= 0xffffu;

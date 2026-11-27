@@ -324,7 +324,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				                        ? inst.Arg(1).Resolve() : Value {};
 				const bool constant =
 				    offset.IsImmediate() && offset.GetType() == Type::U32 &&
-				    (static_cast<uint64_t>(offset.U32() & ~3u) + memory.offset + sizeof(uint32_t) <=
+				    (static_cast<uint64_t>(offset.U32() & ~3u) + (memory.offset & ~3u) + sizeof(uint32_t) <=
 				     UniformBufferBytes - UniformBufferBaseSlack);
 				if (!constant) {
 					inputs.not_constant[memory.resource] = true;

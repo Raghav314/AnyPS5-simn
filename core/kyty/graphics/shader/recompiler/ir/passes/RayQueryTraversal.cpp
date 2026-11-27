@@ -3348,11 +3348,11 @@ bool DeriveLaneAlpha(const Program& program, const PacketWalk& w, const BlasWalk
 	if (m2_load == nullptr || !std::ranges::all_of(textures->first, descriptor_defined)) return false;
 	const auto material_element = [&](const Inst* load) -> std::optional<std::pair<uint32_t, Value>> {
 		if (!a.scalar) return ElementOfThree(load->Arg(1));
-		auto       at    = MemoryOf(program, *load).offset;
+		auto       at    = MemoryOf(program, *load).offset & ~3u;
 		auto       index = Canonical(load->Arg(1));
 		const auto plus  = Operands(index, Op::IAdd32, [](Value side) { return Immediate(side).has_value(); });
 		if (plus) {
-			at += *Immediate(plus->first);
+			at += *Immediate(plus->first) & ~3u;
 			index = Canonical(plus->second);
 		}
 		const auto* lsl = Producer(index, Op::ShiftLeftLogical32);
@@ -3993,9 +3993,9 @@ std::optional<RayQueryResultKind> WaveResultKind(const Program& program, const L
 		     (base->GetOpcode() == ValueOpcode::CompositeConstructU64 &&
 		      resource->Arg(0).Resolve() == base->Arg(0).Resolve()));
 		if (!blas || !InLoop(program, value->Parent(), s.wave_header, s.wave_latch)) return std::nullopt;
-		auto at = MemoryOf(program, *value).offset;
+		auto at = MemoryOf(program, *value).offset & ~3u;
 		if (const auto* add = Producer(value->Arg(1), ValueOpcode::IAdd32); add != nullptr)
-			at += Immediate(add->Arg(0)).value_or(Immediate(add->Arg(1)).value_or(0u));
+			at += Immediate(add->Arg(0)).value_or(Immediate(add->Arg(1)).value_or(0u)) & ~3u;
 		at &= 7u;
 		return at == 0u   ? std::optional(RayQueryResultKind::Node)
 		       : at == 4u ? std::optional(RayQueryResultKind::Word)

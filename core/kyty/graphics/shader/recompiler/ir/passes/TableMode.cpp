@@ -74,7 +74,7 @@ bool EnterTableMode(Program& program, std::string& reason) {
 				return refuse("an SRT slot that is no scalar buffer load");
 			const auto low = TableOperand(handle->Arg(0), slot), high = TableOperand(handle->Arg(1), slot),
 			           records = TableOperand(handle->Arg(2), slot);
-			const auto bytes   = (uint64_t {static_cast<uint32_t>(memory.offset)} + offset.U32()) & ~uint64_t {3};
+			const auto bytes   = uint64_t {memory.offset & ~3u} + (offset.U32() & ~3u);
 			if (!low || !high || !records || bytes > INT32_MAX)
 				return refuse("an SRT slot address table mode cannot evaluate");
 			plan.slots.push_back({*low, *high, TablePlan::Operand {}, static_cast<int32_t>(bytes), *records, true});

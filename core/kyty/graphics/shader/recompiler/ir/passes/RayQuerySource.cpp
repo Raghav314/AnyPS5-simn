@@ -335,6 +335,24 @@ public:
 		return value;
 	}
 
+	uint32_t AlignDword(uint32_t value) {
+		auto form = m_store.F(value);
+		if (std::ranges::all_of(form.terms, [](const auto& term) { return (term.second & 3u) == 0u; })) {
+			form.constant &= ~uint64_t {3};
+			return m_store.Make(std::move(form));
+		}
+		return m_store.Op(32, {static_cast<uint64_t>(ValueOpcode::BitwiseAnd32), value, Literal | 0xfffffffcu});
+	}
+
+	uint32_t AlignAddress(uint32_t value) {
+		auto form = m_store.F(value);
+		if (std::ranges::all_of(form.terms, [](const auto& term) { return (term.second & 3u) == 0u; })) {
+			form.constant &= ~uint64_t {3};
+			return m_store.Make(std::move(form));
+		}
+		return m_store.Join(AlignDword(m_store.Lo(value)), m_store.Hi(value));
+	}
+
 	Choices Word(Value value) {
 		value = value.Resolve();
 		if (value.IsImmediate()) {
@@ -530,15 +548,22 @@ public:
 	Choices Address(const Inst& load) {
 		const auto& memory = m_program.memory_info[load.Flags<MemoryFlags>().index];
 		auto        offset = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(memory.offset)));
+		const bool  scalar = memory.kind == ResourceKind::ScalarAddress;
+		if (scalar) offset &= ~uint64_t {3};
 		Choices     bases;
 		auto&       ev = load.NumArgs() > 3 ? Given(load.Arg(3)) : *this;
 		if (memory.address_is_full) {
 			bases = ev.Pair(load.Arg(1), load.Arg(2));
+			if (scalar) {
+				for (auto& base: bases) base = AlignAddress(base);
+			}
 		} else {
 			const auto* handle = ProducerOf(load.Arg(0), ValueOpcode::GetAddressResource);
 			if (handle == nullptr) return {};
 			for (const auto base: ev.Pair(handle->Arg(0), handle->Arg(1))) {
-				for (const auto index: ev.Word(load.Arg(1))) bases.push_back(m_store.Add(base, m_store.Widen(index)));
+				for (const auto index: ev.Word(load.Arg(1)))
+					bases.push_back(m_store.Add(scalar ? AlignAddress(base) : base,
+					                            m_store.Widen(scalar ? AlignDword(index) : index)));
 			}
 		}
 		Choices result;
@@ -555,7 +580,8 @@ public:
 		for (const auto base: Pair(buffer->Arg(0), buffer->Arg(1))) {
 			const auto start = m_store.Op(64, {Base48, base});
 			for (const auto index: Word(read.Arg(1))) {
-				result.push_back(m_store.Add(m_store.Add(start, m_store.Widen(index)), m_store.Constant(64, memory.offset)));
+				result.push_back(m_store.Add(m_store.Add(start, m_store.Widen(AlignDword(index))),
+				                             m_store.Constant(64, memory.offset & ~3u)));
 			}
 		}
 		Cap(result);
