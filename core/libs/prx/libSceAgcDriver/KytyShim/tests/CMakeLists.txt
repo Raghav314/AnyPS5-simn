@@ -315,6 +315,16 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
                 ENVIRONMENT "KYTY_GPU_PIPELINE=0"
                 PASS_REGULAR_EXPRESSION "kyty_shim_indirect_dispatch_dimensions: ok" FAIL_REGULAR_EXPRESSION "FAILED")
     endif()
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/BdaPageTable.cpp)
+    add_test_executable(kyty_shim_bda_page_table_tests ${CMAKE_CURRENT_SOURCE_DIR}/BdaPageTableMain.cpp)
+    configure_host_test_executable(kyty_shim_bda_page_table_tests)
+    target_link_libraries(kyty_shim_bda_page_table_tests PRIVATE libSceAgcDriver libkernel libc)
+    foreach(mode sparse dense)
+        add_test(NAME kyty_shim_bda_page_table_${mode} COMMAND kyty_shim_bda_page_table_tests ${mode})
+        set_tests_properties(kyty_shim_bda_page_table_${mode} PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
+                ENVIRONMENT "KYTY_GPU_PIPELINE=0"
+                PASS_REGULAR_EXPRESSION "kyty_shim_bda_page_table_${mode}: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    endforeach()
 endif()
 
 if(WIN32)
