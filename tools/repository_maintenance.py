@@ -140,6 +140,8 @@ def model_review(context, key):
             decision = part.get("input", {})
             if decision.get("action") in schema["properties"]["action"]["enum"] and isinstance(decision.get("body"), str):
                 return {"action": decision["action"], "body": decision["body"]}
+    blocks = [str(part.get("type")) for part in result.get("content", [])]
+    print(f"Model returned no valid decision (stop_reason={result.get('stop_reason')}, blocks={blocks}).")
     return {"action": "escalate", "body": ""}
 
 
