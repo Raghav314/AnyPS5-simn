@@ -5678,6 +5678,12 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		layout[3] &= ~(3u << 26u);
 		return layout;
 	};
+	const auto unmasked = [&](std::array<uint32_t, 4> layout) {
+		layout     = canonical(layout);
+		layout[2] &= ~(15u | 31u << 4u | 1u << 19u | 31u << 25u);
+		layout[3] &= ~(3u << 24u);
+		return layout;
+	};
 	const auto shares = [&](Walk& each) {
 		auto&       walk   = each.Shape();
 		const auto& source = walk.source;
@@ -5687,7 +5693,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		}
 		if (source.layout == reference.layout) return true;
 		if (each.kind == Kind::Universal) {
-			if (canonical(source.layout) != canonical(reference.layout)) return false;
+			if (canonical(source.layout) != canonical(reference.layout) && unmasked(source.layout) != unmasked(reference.layout)) return false;
 			walk.source.layout = reference.layout;
 			return true;
 		}

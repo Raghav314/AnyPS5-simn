@@ -25,11 +25,14 @@ namespace {
 using Op = ValueOpcode;
 
 constexpr uint32_t NoSlot     = 0xffffffffu;
+constexpr uint32_t RayConstant = 0x40000000u;
 constexpr uint32_t Miss       = 0xffffffffu;
 constexpr uint32_t InfBits    = 0x7f800000u;
 constexpr uint32_t OneBits    = 0x3f800000u;
 constexpr uint32_t MaxVisits  = 6000;
 constexpr uint32_t MaxSeeds   = 12;
+constexpr uint8_t  EntryFlag   = 3;
+constexpr uint8_t  EntryExtent = 4;
 constexpr uint32_t MaxRows    = 1024;
 constexpr uint64_t PrologueWork = 60000;
 constexpr uint64_t WalkWork     = 150000;
@@ -139,6 +142,7 @@ public:
 		m_merge = header->terminator.merge_block;
 		m_active.assign(m_wave, 1u);
 		m_varying.assign(slots, 0u);
+		m_kept.assign(slots, 0u);
 		for (bool changed = true; changed;) {
 			changed = false;
 			for (const auto* block: program.blocks) {
@@ -177,6 +181,21 @@ public:
 					if (varying) {
 						m_varying[slot] = 1u;
 						changed         = true;
+					}
+				}
+			}
+		}
+		m_mask_half.assign(slots, 0u);
+		for (const auto* block: program.blocks) {
+			for (const auto& inst: *block) {
+				if (inst.GetOpcode() != Op::SelectU32 || !LowLanes(inst.Arg(0))) continue;
+				const bool picks_lane_bit = std::ranges::any_of(inst.Uses(), [](const Use& use) {
+					return use.user->GetOpcode() == Op::ShiftRightLogical32 && use.operand == 0;
+				});
+				if (!picks_lane_bit) continue;
+				for (uint32_t half = 0; half < 2; ++half) {
+					if (const auto* mask = inst.Arg(1 + half).Resolve().TryInstruction(); mask != nullptr && mask->GetType() == Type::U32) {
+						m_mask_half[m_slot.at(mask)] = static_cast<uint8_t>(1u + half);
 					}
 				}
 			}
@@ -352,6 +371,18 @@ private:
 		return static_cast<uint32_t>(h) & 0xff00u;
 	}
 
+	uint32_t UnalignedDword(uint64_t address, uint32_t width = 32u) {
+		const auto shift = static_cast<uint32_t>(address & 3u) * 8u;
+		if (shift + width <= 32u) return Memory(address) >> shift;
+		return static_cast<uint32_t>((static_cast<uint64_t>(Memory(address)) | static_cast<uint64_t>(Memory(address + 4u)) << 32u) >> shift);
+	}
+
+	Taint UnalignedTaint(uint64_t address, uint32_t width = 32u) const {
+		auto taint = MemoryTaint(address);
+		if ((address & 3u) * 8u + width > 32u) taint |= MemoryTaint(address + 4u);
+		return taint;
+	}
+
 	uint32_t Memory(uint64_t address) {
 		address &= ~uint64_t {3};
 		if (!m_walk) m_reads.insert(address);
@@ -506,14 +537,36 @@ private:
 		return {Space::Global, address};
 	}
 
+	[[nodiscard]] static bool LowLanes(Value value) {
+		const auto* compare = value.Resolve().TryInstruction();
+		if (compare == nullptr || compare->GetOpcode() != Op::ULessThan32) return false;
+		const auto* lane  = compare->Arg(0).Resolve().TryInstruction();
+		const auto  limit = compare->Arg(1).Resolve();
+		return lane != nullptr && lane->GetOpcode() == Op::LaneId && limit.IsImmediate() && limit.U32() == 32u;
+	}
+
 	const char* Execute(const Inst& inst) {
 		const char* failure = Compute(inst);
-		if (failure == nullptr && !m_walk && inst.GetOpcode() != Op::ConditionRef && inst.GetType() == Type::U1 && m_varying[m_slot.at(&inst)] != 0) {
-			const auto out = m_slot.at(&inst);
+		if (failure != nullptr || m_walk) return failure;
+		const auto out = m_slot.at(&inst);
+		if (inst.GetOpcode() != Op::ConditionRef && inst.GetType() == Type::U1 && m_varying[out] != 0 && m_kept[out] == 0) {
 			for (uint32_t lane = 0; lane < m_wave; ++lane) At(out, lane) = m_active[lane];
 		}
-		return failure;
+		return nullptr;
 	}
+
+public:
+	[[nodiscard]] uint8_t MaskHalf(uint32_t slot) const { return m_mask_half[slot]; }
+	void                  Keep(uint32_t slot) { m_kept[slot] = 1u; }
+	[[nodiscard]] bool    IsActive(uint32_t lane) const { return m_active[lane] != 0; }
+	[[nodiscard]] uint64_t ActiveMask(uint8_t half) const {
+		const uint32_t first = half == 1u ? 0u : 32u;
+		uint64_t       mask  = 0;
+		for (uint32_t lane = first; lane < std::min(m_wave, first + 32u); ++lane) mask |= uint64_t {m_active[lane] != 0} << (lane - first);
+		return mask;
+	}
+
+private:
 
 	struct Ref {
 		const uint64_t*         base = nullptr;
@@ -919,10 +972,10 @@ private:
 					const auto base    = (w0 & 0xffffffffu) | ((w1 & 0xffffu) << 32u);
 					const auto stride  = (w1 >> 16u) & 0x3fffu;
 					const auto address = base + (a(1, lane) & 0xffffffffu) * stride + (a(2, lane) & 0xffffffffu) + (a(3, lane) & 0xffffffffu) + memory.offset;
-					for (uint32_t k = 0; k < 4; ++k) At(out, lane, k) = k < count ? Memory(address + 4u * k) : 0u;
+					for (uint32_t k = 0; k < 4; ++k) At(out, lane, k) = k < count ? UnalignedDword(address + 4u * k) : 0u;
 					if (m_tracking && m_walk) {
 						if (lane == 0) m_taint[out].reset();
-						m_taint[out] |= MemoryTaint(address);
+						for (uint32_t k = 0; k < count; ++k) m_taint[out] |= UnalignedTaint(address + 4u * k);
 					}
 				}
 				return nullptr;
@@ -970,15 +1023,15 @@ private:
 					const auto  offset = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(memory.offset)));
 					const auto  address = memory.address_is_full ? ((a(1, lane) & 0xffffffffu) | (a(2, lane) & 0xffffffffu) << 32u) + offset
 					                                             : ((a(0, lane, 0) & 0xffffffffu) | (a(0, lane, 1) << 32u)) + (a(1, lane) & 0xffffffffu) + offset;
-					auto        value   = static_cast<uint64_t>(Memory(address));
-					value >>= (address & 3u) * 8u;
+					const auto  width   = op == Op::LoadAddressU8 ? 8u : op == Op::LoadAddressU16 ? 16u : 32u;
+					auto        value   = static_cast<uint64_t>(UnalignedDword(address, width));
 					if (op == Op::LoadAddressU16) value &= 0xffffu;
 					if (op == Op::LoadAddressU8) value &= 0xffu;
 					At(out, lane) = value;
 					if (m_tracking && m_walk) {
 						if (!cleared) m_taint[out].reset();
 						cleared = true;
-						m_taint[out] |= MemoryTaint(address);
+						m_taint[out] |= UnalignedTaint(address, width);
 					}
 				}
 				return nullptr;
@@ -990,8 +1043,8 @@ private:
 						continue;
 					}
 					const auto address = (u32(a(0, lane)) | u32(a(1, lane)) << 32u) + u32(a(2, lane));
-					At(out, lane)      = Memory(address);
-					if (m_tracking && m_walk) m_taint[out] |= MemoryTaint(address);
+					At(out, lane)      = UnalignedDword(address);
+					if (m_tracking && m_walk) m_taint[out] |= UnalignedTaint(address);
 				}
 				return nullptr;
 			case Op::LoadSharedU32:
@@ -1118,7 +1171,9 @@ private:
 	std::unordered_map<uint32_t, uint32_t>     m_live_ids;
 	std::unordered_set<const Block*>           m_reaches;
 	std::vector<uint8_t>                       m_active;
+	std::vector<uint8_t>                       m_mask_half;
 	std::vector<uint8_t>                       m_varying;
+	std::vector<uint8_t>                       m_kept;
 	uint64_t                                   m_work = 0;
 	std::vector<std::pair<uint64_t, uint32_t>> m_records;
 	std::vector<uint64_t>                      m_lists;
@@ -1198,6 +1253,18 @@ struct World {
 	std::vector<Triangle>                  triangles;
 	std::unordered_map<uint64_t, uint32_t> memory;
 	std::vector<LaneScript>                lanes;
+
+	void Put(uint64_t address, uint32_t value) {
+		const auto shift = static_cast<uint32_t>(address & 3u) * 8u;
+		const auto at    = address & ~uint64_t {3};
+		if (shift == 0) {
+			memory[at] = value;
+			return;
+		}
+		const auto low = (uint32_t {1} << shift) - 1u;
+		memory[at]      = (memory[at] & low) | value << shift;
+		memory[at + 4u] = (memory[at + 4u] & ~low) | value >> (32u - shift);
+	}
 	bool                                   proposal      = false;
 	uint32_t                               proposed      = 0;
 	std::vector<uint32_t>                  history;
@@ -1278,11 +1345,13 @@ public:
 
 	const char* Derive();
 	void        Emit(uint32_t site);
+	EntrySample Sample(uint64_t seed);
 
 	uint32_t detail = 0;
 
 private:
 	void        Begin(uint64_t seed);
+	const char* Enter(uint64_t seed, const Block*& from);
 	const char* Prepare();
 	const char* Seed(uint64_t seed, Start& start);
 	const char* Discover(uint64_t seed, const Start& start);
@@ -1333,6 +1402,11 @@ private:
 	std::array<Value, 2>           m_node {};
 	std::vector<std::pair<Block*, Block*>> m_path;
 	Block*                         m_preheader = nullptr;
+	struct EntryInput {
+		uint32_t slot = 0;
+		uint8_t  kind = 0;
+	};
+	std::vector<EntryInput>        m_entry;
 };
 
 const char* Analysis::Prepare() {
@@ -1375,7 +1449,70 @@ const char* Analysis::Prepare() {
 	if (m_outs.empty()) return "the walk has no result";
 	m_types = {0u, 1u, 2u, 3u};
 	if (m_layout.inline_record) m_types.push_back(m_layout.inline_type);
+	const auto entry_slot = [&](Value value) -> std::optional<uint32_t> {
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst != nullptr && inst->GetOpcode() == Op::Phi && inst->Parent() == m_header) {
+			const Inst* incoming = nullptr;
+			for (size_t index = 0; index < inst->NumArgs(); ++index) {
+				if (inst->PhiBlock(index) == m_preheader) incoming = inst->Arg(index).Resolve().TryInstruction();
+			}
+			inst = incoming;
+		}
+		if (inst == nullptr || m_machine.Inside(inst->Parent())) return std::nullopt;
+		return m_machine.SlotOf(inst);
+	};
+	const auto add_entry = [&](uint32_t slot, uint8_t kind) {
+		if (std::ranges::none_of(m_entry, [&](const EntryInput& each) { return each.slot == slot; })) m_entry.push_back({slot, kind});
+	};
+	for (const auto& [slot, id]: m_machine.LiveIds()) {
+		if (const auto half = m_machine.MaskHalf(slot); half != 0) add_entry(slot, half);
+	}
+	for (const auto* inst: m_served) {
+		if (!m_machine.Inside(inst->Parent())) continue;
+		if (const auto exec = entry_slot(inst->Arg(2)); exec && m_machine.InstOf(*exec)->GetType() == Type::U1) {
+			add_entry(*exec, EntryFlag);
+			m_machine.Keep(*exec);
+		}
+		const auto* address = inst->Arg(1).Resolve().TryInstruction();
+		const uint32_t words = inst->Flags<uint32_t>() & 0xffu;
+		if (address == nullptr || address->GetOpcode() != Op::MakeImageAddress || words >= address->NumArgs()) continue;
+		if (const auto extent = entry_slot(address->Arg(words)); extent && m_machine.InstOf(*extent)->GetType() != Type::U1) add_entry(*extent, EntryExtent);
+	}
 	return nullptr;
+}
+
+const char* Analysis::Enter(uint64_t seed, const Block*& from) {
+	if (const char* failure = m_machine.RunPrologue(from)) return failure;
+	for (const auto& input: m_entry) {
+		for (uint32_t lane = 0; lane < m_machine.Wave(); ++lane) {
+			auto& value = m_machine.At(input.slot, lane);
+			switch (input.kind) {
+				case EntryFlag: value = EntryFlagOf(value, m_machine.IsActive(lane)); break;
+				case EntryExtent:
+					if (!Usable(F(static_cast<uint32_t>(value)))) {
+						value = B(8.0f + static_cast<float>(Mix(seed * 0x9e3779b97f4a7c15ull + lane) & 0xfffu) * (120.0f / 4096.0f));
+					}
+					break;
+				default: value = EntryMaskOf(value, m_machine.ActiveMask(input.kind)); break;
+			}
+		}
+	}
+	return nullptr;
+}
+
+EntrySample Analysis::Sample(uint64_t seed) {
+	EntrySample sample;
+	if ((sample.failure = Prepare()) != nullptr) return sample;
+	Begin(seed);
+	const Block* from = nullptr;
+	if ((sample.failure = Enter(seed, from)) != nullptr) return sample;
+	for (uint32_t lane = 0; lane < m_machine.Wave(); ++lane) sample.active.push_back(m_machine.IsActive(lane) ? 1u : 0u);
+	for (const auto& input: m_entry) {
+		if (input.kind != EntryFlag) continue;
+		auto& values = sample.flags.emplace_back();
+		for (uint32_t lane = 0; lane < m_machine.Wave(); ++lane) values.push_back(m_machine.At(input.slot, lane));
+	}
+	return sample;
 }
 
 std::vector<uint8_t> ActiveLanes(uint64_t seed, uint32_t wave) {
@@ -1415,7 +1552,7 @@ void Analysis::Begin(uint64_t seed) {
 const char* Analysis::Seed(uint64_t seed, Start& start) {
 	Begin(seed);
 	const Block* from = nullptr;
-	if (const char* failure = m_machine.RunPrologue(from)) return failure;
+	if (const char* failure = Enter(seed, from)) return failure;
 	if (from != m_preheader) return "the walk is entered from another block";
 	bool             recorded = false;
 	Machine::Oracle  oracle   = [&](const Inst& inst, std::span<const Machine::Call> calls, std::span<std::array<uint32_t, 4>>) {
@@ -1534,13 +1671,13 @@ uint32_t Analysis::AddTriangle(World& world, Random& random, uint32_t instance, 
 
 void Analysis::PlantWorld(World& world) const {
 	for (const auto& instance: world.instances) {
-		for (uint32_t k = 0; k < m_layout.Words(); ++k) world.memory[instance.record + 4u * k] = instance.words[k];
+		for (uint32_t k = 0; k < m_layout.Words(); ++k) world.Put(instance.record + 4u * k, instance.words[k]);
 	}
 	for (const auto& triangle: world.triangles) {
 		const auto& instance = world.instances[triangle.instance];
 		const auto  at       = instance.blas + (static_cast<uint64_t>(triangle.entry >> 3u) << 3u);
-		world.memory[at]      = triangle.tri;
-		world.memory[at + 4u] = triangle.word;
+		world.Put(at, triangle.tri);
+		world.Put(at + 4u, triangle.word);
 	}
 }
 
@@ -1612,6 +1749,29 @@ bool Analysis::Answer(World& world, std::span<const Machine::Call> calls, std::s
 		if ((call.node & 7u) > 5u) {
 			answers[index] = {Miss, Miss, Miss, Miss};
 			continue;
+		}
+		{
+			const auto address = call.base + ((call.node >> 3u) << 6u);
+			const auto kind    = call.node & 7u;
+			const auto box_of  = [&](const Instance& each) {
+				return address == (each.blas & ~uint64_t {0xff}) + ((static_cast<uint64_t>(each.root) >> 3u) << 6u);
+			};
+			const auto triangle_of = [&](const Triangle& each) {
+				const auto& owner = world.instances[each.instance];
+				return kind == (each.tri & 7u) && address == (owner.blas & ~uint64_t {0xff}) + ((static_cast<uint64_t>(each.tri) >> 3u) << 6u);
+			};
+			const bool box   = kind == 4u || kind == 5u;
+			const bool known = box ? std::ranges::any_of(world.instances, box_of) : std::ranges::any_of(world.triangles, triangle_of);
+			const bool mine  = lane.offered && (box ? box_of(world.instances[world.triangles[lane.proposed].instance])
+			                                        : triangle_of(world.triangles[lane.proposed]));
+			const bool on_ray = std::ranges::any_of(lane.candidates, [&](const Candidate& candidate) {
+				const auto& triangle = world.triangles[candidate.triangle];
+				return box ? box_of(world.instances[triangle.instance]) : triangle_of(triangle);
+			});
+			if (known && !mine && !on_ray) {
+				answers[index] = box ? std::array<uint32_t, 4> {Miss, Miss, Miss, Miss} : std::array<uint32_t, 4> {InfBits, OneBits, Miss, 0u};
+				continue;
+			}
 		}
 		if (!lane.offered) {
 			return false;
@@ -1709,7 +1869,7 @@ const char* Analysis::Trial(uint64_t seed, const Start& start) {
 	Random random(seed * 0x3bu + 11u);
 	Begin(seed);
 	const Block* from = nullptr;
-	if (const char* failure = m_machine.RunPrologue(from)) return failure;
+	if (const char* failure = Enter(seed, from)) return failure;
 	World world = MakeWorld(start, random);
 	for (size_t at = 0; at < start.lanes.size(); ++at) {
 		const auto extent = start.extents[at];
@@ -1730,7 +1890,7 @@ const char* Analysis::Discover(uint64_t seed, const Start& start) {
 	Begin(seed);
 	{
 		const Block* from = nullptr;
-		if (const char* failure = m_machine.RunPrologue(from)) return failure;
+		if (const char* failure = Enter(seed, from)) return failure;
 	}
 	World world = MakeWorld(start, random);
 	std::vector<uint32_t> lanes;
@@ -1861,7 +2021,7 @@ const char* Analysis::Rows() {
 		Random random(seed * 0x1000003u + round);
 		Begin(seed);
 		const Block* from = nullptr;
-		if (const char* failure = m_machine.RunPrologue(from)) return failure;
+		if (const char* failure = Enter(seed, from)) return failure;
 		World world = MakeWorld(start, random);
 		std::vector<std::pair<uint32_t, std::vector<uint64_t>>> overrides;
 		for (size_t live = 0; live < m_lives.size(); ++live) {
@@ -1987,7 +2147,9 @@ bool Analysis::HostAccepts(const Params& params, const Instance& instance, const
                            std::span<const uint64_t> lives) const {
 	if (!candidate.inside) return false;
 	const auto live = [&](uint32_t index) { return lives[index] & 0xffffffffu; };
-	uint32_t   ray_mask = params.ray_mask == NoSlot ? 0xffu : static_cast<uint32_t>(live(params.ray_mask)) & 0xffu;
+	uint32_t   ray_mask = params.ray_mask == NoSlot                  ? 0xffu
+	                      : (params.ray_mask & RayConstant) != 0 ? params.ray_mask & 0xffu
+	                                                             : static_cast<uint32_t>(live(params.ray_mask)) & 0xffu;
 	uint32_t   mask     = 0xffu;
 	if (params.mask) {
 		mask = (instance.words[params.mask_dword] >> params.mask_shift) & 0xffu;
@@ -2043,6 +2205,22 @@ const char* Analysis::Search() {
 	}
 	std::vector<uint32_t> lives {NoSlot};
 	for (uint32_t index = 0; index < m_lives.size(); ++index) lives.push_back(index);
+	std::vector<uint32_t> rays = lives;
+	if (m_layout.mask && m_layout.mask_width == 0) {
+		for (const auto* block: m_program.blocks) {
+			if (!m_machine.Inside(block)) continue;
+			for (const auto& inst: *block) {
+				if (inst.GetOpcode() != Op::BitwiseAnd32) continue;
+				for (uint32_t side = 0; side < 2; ++side) {
+					const auto literal = inst.Arg(side).Resolve();
+					if (!literal.IsImmediate()) continue;
+					const auto bits = literal.U32() >> m_layout.mask_shift;
+					if (bits == 0 || bits >= 0xffu || bits << m_layout.mask_shift != literal.U32()) continue;
+					if (std::ranges::find(rays, RayConstant | bits) == rays.end() && rays.size() < lives.size() + 8u) rays.push_back(RayConstant | bits);
+				}
+			}
+		}
+	}
 	struct Flags {
 		bool     on    = false;
 		uint32_t dword = 0;
@@ -2081,7 +2259,7 @@ const char* Analysis::Search() {
 		}
 	}
 	for (const auto& mask_option: masks) {
-		for (const auto ray_mask: lives) {
+		for (const auto ray_mask: rays) {
 			bool plausible = true;
 			for (size_t index = 0; index < m_rows.size() && plausible; ++index) {
 				if (!accepted[index]) continue;
@@ -2094,7 +2272,9 @@ const char* Analysis::Search() {
 					const auto field = instance.words[m_layout.mask_dword] >> m_layout.mask_shift;
 					bits = m_layout.mask_width == 0 ? field & 0xffu : (field & ((1u << m_layout.mask_width) - 1u)) != 0 ? 0xffu : 0u;
 				}
-				const uint32_t ray = ray_mask == NoSlot ? 0xffu : static_cast<uint32_t>(row.lives[ray_mask]) & 0xffu;
+				const uint32_t ray = ray_mask == NoSlot                  ? 0xffu
+				                     : (ray_mask & RayConstant) != 0 ? ray_mask & 0xffu
+				                                                     : static_cast<uint32_t>(row.lives[ray_mask]) & 0xffu;
 				plausible = (bits & ray) != 0;
 			}
 			if (!plausible) continue;
@@ -2141,7 +2321,7 @@ const char* Analysis::Validate() {
 		std::vector<std::pair<uint32_t, std::vector<uint64_t>>> overrides;
 		Begin(seed);
 		const Block* from = nullptr;
-		if (const char* failure = m_machine.RunPrologue(from)) return failure;
+		if (const char* failure = Enter(seed, from)) return failure;
 		World world = MakeWorld(start, random);
 		for (size_t live = 0; live < m_lives.size(); ++live) {
 			std::vector<uint64_t> values(m_machine.Wave());
@@ -2341,7 +2521,7 @@ const char* Analysis::ForcedPath() {
 		const auto seed = m_seeds[which];
 		Begin(seed);
 		const Block* from = nullptr;
-		if (const char* failure = m_machine.RunPrologue(from)) return failure;
+		if (const char* failure = Enter(seed, from)) return failure;
 		World world;
 		world.header = m_starts[which].header;
 		world.root   = m_result.root;
@@ -2471,7 +2651,9 @@ void Analysis::Emit(uint32_t site) {
 	}
 	const auto low_word  = entry(Op::CompositeExtractU64, {header, Value(0u)});
 	const auto high_word = entry(Op::CompositeExtractU64, {header, Value(1u)});
-	const auto mask      = m_params.ray_mask == NoSlot ? Value(0xffu) : word(m_params.ray_mask);
+	const auto mask      = m_params.ray_mask == NoSlot                  ? Value(0xffu)
+	                       : (m_params.ray_mask & RayConstant) != 0 ? Value(m_params.ray_mask & 0xffu)
+	                                                                : word(m_params.ray_mask);
 	const auto alpha_off = m_params.opacity == Opacity::AllOpaque ? Value(1u) : m_params.opacity == Opacity::OnlyOpaque ? Value(0u) : word(m_params.alpha_off);
 	const uint32_t variant = (m_params.both ? RayQueryInitBothFacings : 0u) | (m_params.opacity != Opacity::AllOpaque ? RayQueryInitOpaqueOnly : 0u);
 	const auto native = entry(Op::RayQueryInit,
@@ -2544,6 +2726,13 @@ void Analysis::Emit(uint32_t site) {
 	m_result.oracle_improvements = {};
 }
 
+}
+
+EntrySample SampleWalkEntry(Program& program, const NativeTraversalOptions& options, Block* header, Block* latch,
+                            std::span<Inst* const> served, uint64_t seed) {
+	NativeTraversals result;
+	Analysis         analysis(program, options, header, latch, served, result);
+	return analysis.Sample(seed);
 }
 
 bool RewriteResultsWalk(Program& program, const NativeTraversalOptions& options, Block* header, Block* latch,
