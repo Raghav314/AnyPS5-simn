@@ -1151,6 +1151,7 @@ void RenderContext::PrepareHackMarks() {
 
 void RenderContext::RunGarbageCollector() {
 	m_frame_number++;
+	m_descriptor_heap.TrimCompletedPools();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_hack_marks_pending    = true;

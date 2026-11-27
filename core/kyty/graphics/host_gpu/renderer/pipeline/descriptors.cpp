@@ -2257,6 +2257,7 @@ void RenderExecutor::ResetBindings() {
 		TrimTableResolutions();
 	}
 	if ((++m_table_stats.resets & 255u) == 0) {
+		m_context.GetDescriptorHeap().TrimCompletedPools();
 		LogTableSummary(TrimTableBindings());
 	}
 	auto& texture_cache = m_context.GetTextureCache();

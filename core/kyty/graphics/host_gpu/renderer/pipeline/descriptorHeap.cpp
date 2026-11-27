@@ -154,6 +154,17 @@ void DescriptorHeap::ReleasePersistent(vk::DescriptorSet set) {
 	}
 }
 
+void DescriptorHeap::TrimCompletedPools() {
+	if (m_pending_pools.size() < 2) {
+		return;
+	}
+	m_master_semaphore.Refresh();
+	while (m_pending_pools.size() > 1 && m_master_semaphore.IsFree(m_pending_pools[1].second)) {
+		m_graphics.device.destroyDescriptorPool(m_pending_pools.front().first.pool, nullptr);
+		m_pending_pools.pop_front();
+	}
+}
+
 const std::vector<vk::DescriptorPoolSize>&
 DescriptorHeap::LayoutSizes(vk::DescriptorSetLayout layout) {
 	auto found = m_layout_sizes.find(layout);

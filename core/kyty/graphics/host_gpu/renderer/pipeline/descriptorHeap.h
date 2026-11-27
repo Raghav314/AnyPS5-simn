@@ -24,6 +24,7 @@ public:
 	[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout layout);
 	[[nodiscard]] vk::DescriptorSet CommitPersistent(vk::DescriptorSetLayout layout);
 	void ReleasePersistent(vk::DescriptorSet set);
+	void TrimCompletedPools();
 
 	static void RegisterLayout(vk::DescriptorSetLayout                         layout,
 	                           std::span<const vk::DescriptorSetLayoutBinding> bindings);
@@ -31,6 +32,8 @@ public:
 	static constexpr uint32_t MaxSampledImages = 262144;
 
 private:
+	friend struct VramBudgetTestAccess;
+
 	static constexpr uint32_t DescriptorSetBatch = 32;
 
 	struct Batch {
