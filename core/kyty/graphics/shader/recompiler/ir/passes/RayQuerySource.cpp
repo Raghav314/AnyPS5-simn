@@ -590,7 +590,7 @@ public:
 			if (!m_busy.insert(l).second) return {Opaque(*l, 64)};
 			Choices result;
 			for (size_t index = 0; index < l->NumArgs(); ++index) {
-				if (Unreached(*l, index)) continue;
+				if (Unreached(*l, index, h)) continue;
 				const auto from = l->PhiBlock(index);
 				Append(result, Pair(l->Arg(index), Incoming(*h, from), depth + 1));
 			}
@@ -1004,8 +1004,13 @@ private:
 		std::vector<const Inst*> products;
 	};
 
-	[[nodiscard]] bool Unreached(const Inst& phi, size_t index) const {
-		return m_reach != nullptr && m_target != nullptr && m_reach->Dead(phi.Parent(), phi.PhiBlock(index), m_target);
+	[[nodiscard]] bool Unreached(const Inst& phi, size_t index, const Inst* high = nullptr) const {
+		const auto* join = phi.Parent();
+		if (m_reach == nullptr || m_target == nullptr || !m_reach->Dead(join, phi.PhiBlock(index), m_target)) return false;
+		const auto used_at_join = [join](const Inst& part) {
+			return std::ranges::any_of(part.Uses(), [join](const Use& use) { return use.user->Parent() == join; });
+		};
+		return !used_at_join(phi) && (high == nullptr || !used_at_join(*high));
 	}
 
 	Evaluator& Given(Value fact) {
