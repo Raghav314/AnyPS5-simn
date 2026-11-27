@@ -2308,7 +2308,7 @@ static void ShareEmptyBuffer(const ResourcePlan& program, uint32_t index, bool r
 	if (!vector) {
 		buffer.scalar_empty = false;
 	} else if (runtime_stride && !program.info.buffers[index].formatted) {
-		buffer.packed_stride   = RuntimeBufferStride;
+		buffer.packed_stride   = RuntimeBufferStride | ExactBufferBounds;
 		buffer.zero_stride_oob = false;
 		buffer.scalar_empty    = false;
 	} else {

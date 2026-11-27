@@ -131,6 +131,19 @@ void RawSlot(bool sharing) {
 		Check(zero.specialization != bound.specialization, "raw: sharing off keeps one variant per null slot");
 		Check(zero.specialization.buffers[slot].zero_stride_oob, "raw: sharing off keeps the empty form");
 	}
+	for (uint32_t select: {1u, 2u}) {
+		const auto mode = Materialize(program.plan,
+		                              MakeSharp(SourceAddress, Records * 4u, Format32UInt, SwizzleXyzw, select),
+		                              target, true);
+		const auto label = "raw: mode " + std::to_string(select);
+		Check(mode.ok, label + " materializes");
+		if (!mode.ok) continue;
+		Check(mode.specialization != bound.specialization, label + " keeps a distinct key from mode 3");
+		Check(!IR::SameModuleCode(program.plan, mode.specialization, bound.specialization),
+		      label + " keeps a distinct module from mode 3");
+		Check(IR::EmptyBuffersServe(program.plan, zero.snapshot, zero.specialization, mode.specialization) == sharing,
+		      label + " safely serves an empty request when sharing is on");
+	}
 	Check(zero_baked.specialization.buffers[slot].zero_stride_oob,
 	      "raw: a null V# of a baked-stride program keeps its empty form");
 	Check(zero_baked.specialization.buffers[slot].scalar_empty == sharing,
