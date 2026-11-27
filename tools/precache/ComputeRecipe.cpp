@@ -27,82 +27,6 @@ struct DispatchMode {
 constexpr std::array DispatchModes {DispatchMode {false, false}, DispatchMode {true, false},
                                     DispatchMode {true, true}};
 
-std::vector<ResourceSpecialization> FindComputeVariants(const IR::Program& program, const IR::ResourcePlan& plan,
-                                                        const PipelineManifest& library) {
-	std::vector<ResourceSpecialization> variants;
-	for (const auto& sample: library.modules) {
-		auto shape = sample.specialization;
-		if (sample.stage != ShaderType::Compute || shape.images.empty() ||
-		    !IR::ResourceSpecializationFits(program, shape)) continue;
-		const auto roots_fit = [&](const auto& slots, const auto& resources, uint32_t none) {
-			for (size_t i = 0; i < resources.size(); ++i) {
-				if (slots[i].indirect_root == none) continue;
-				const auto source = resources[i].source;
-				if (slots[i].indirect_root != i || source >= plan.descriptor_sources.size() ||
-				    !plan.descriptor_sources[source].indirect_descriptor) return false;
-			}
-			return true;
-		};
-		if (!roots_fit(shape.images, plan.info.images, IR::ImageResource::NoIndirectImage) ||
-		    !roots_fit(shape.samplers, plan.info.samplers, IR::SamplerResource::NoIndirectSampler) ||
-		    !roots_fit(shape.buffers, plan.info.buffers, IR::BufferResource::NoIndirectBuffer)) continue;
-		IR::ReadStridesAtRunTime(plan, shape);
-		if (std::ranges::find(variants, shape) == variants.end()) variants.push_back(std::move(shape));
-	}
-	if (!variants.empty()) return variants;
-
-	ResourceSpecialization base;
-	base.buffers.resize(plan.info.buffers.size());
-	for (size_t i = 0; i < base.buffers.size(); ++i) {
-		if (plan.info.buffers[i].formatted) base.buffers[i].descriptor_format = Prospero::BufferFormat::k32Float;
-	}
-	IR::ReadStridesAtRunTime(plan, base);
-	base.samplers.resize(plan.info.samplers.size());
-	base.images.resize(plan.info.images.size());
-	using Numeric = Prospero::TextureNumericClass;
-	using Dimension = ShaderRecompiler::Decoder::ImageDimension;
-	constexpr std::array numeric_classes {Numeric::Float, Numeric::Uint, Numeric::Sint};
-	const auto add_variant = [&](Numeric storage, Numeric sampled, uint32_t alternate_source = UINT32_MAX) {
-		for (size_t i = 0; i < base.images.size(); ++i) {
-			const auto& resource = plan.info.images[i];
-			auto& view = base.images[i];
-			view.dimension = resource.dimension == Dimension::Unknown ? Dimension::Dim2D : resource.dimension;
-			const bool storage_view = resource.resource_class == IR::ImageResourceClass::Storage;
-			const auto storage_class = resource.source == alternate_source
-			                               ? (storage == Numeric::Float ? Numeric::Uint : Numeric::Float) : storage;
-			view.numeric_class = resource.atomic ? Numeric::Uint : storage_view ? storage_class : sampled;
-			view.cube = resource.cube;
-		}
-		if (std::ranges::find(variants, base) == variants.end()) variants.push_back(base);
-	};
-	for (const auto storage: numeric_classes) {
-		for (const auto sampled: numeric_classes) add_variant(storage, sampled);
-	}
-
-	std::vector<uint32_t> outputs;
-	for (const auto& image: plan.info.images) {
-		if (image.source >= plan.descriptor_sources.size()) return variants;
-		const auto& source = plan.descriptor_sources[image.source];
-		if (source.indirect_descriptor) return variants;
-		if (image.resource_class != IR::ImageResourceClass::Storage) continue;
-		if (!image.written || image.read || image.atomic || source.dword_count <= 1u ||
-		    source.dwords[1].Resolve().IsImmediate()) return variants;
-		if (std::ranges::find(outputs, image.source) == outputs.end()) outputs.push_back(image.source);
-		if (outputs.size() > 2) return variants;
-	}
-	if (outputs.size() == 2 &&
-	    std::ranges::none_of(plan.info.images, [&](const auto& image) {
-		    return image.resource_class != IR::ImageResourceClass::Storage &&
-		           std::ranges::find(outputs, image.source) != outputs.end();
-	    })) {
-		for (const auto sampled: numeric_classes) {
-			add_variant(Numeric::Float, sampled, outputs.front());
-			add_variant(Numeric::Uint, sampled, outputs.front());
-		}
-	}
-	return variants;
-}
-
 }
 
 int PrepareComputeRecipe(const char* signatures) {
@@ -172,7 +96,14 @@ int PrepareComputeRecipe(const char* signatures) {
 			                           index, true, [&] {
 				    translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
 				    const auto plan = IR::ExtractResourcePlan(translated.program);
-				    variants = FindComputeVariants(translated.program, plan, library);
+				    auto recipes = SynthesizeComputeVariants(info, queue_dependent, translated.program, plan,
+				                                             library.modules);
+				    for (auto& recipe: recipes) {
+				        auto& shape = recipe.specialization;
+				        if (std::ranges::find(variants, shape) == variants.end()) {
+				            variants.push_back(std::move(shape));
+				        }
+				    }
 				})) continue;
 			for (size_t variant = 0; variant < variants.size(); ++variant) {
 				const auto variant_index = index++;
