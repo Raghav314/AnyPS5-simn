@@ -573,9 +573,10 @@ RayTracing::GuestTlas RayTracing::ReadGuestTlas(
 			return tlas;
 		}
 	}
-	constexpr uint64_t HeaderSize = 256;
+	constexpr uint64_t HeaderSize   = 256;
+	constexpr uint64_t AddressLimit = uint64_t {1} << 48u;
 	constexpr uint64_t MaxExtent = uint64_t {64} * 1024 * 1024;
-	if (header > UINT64_MAX - MaxExtent || !readable(header, HeaderSize)) {
+	if (header > AddressLimit - 2 * MaxExtent || !readable(header, HeaderSize)) {
 		return {};
 	}
 	const auto load = [](uint64_t address, auto& value) {
@@ -645,7 +646,7 @@ RayTracing::GuestTlas RayTracing::ReadGuestTlas(
 		const auto blas = ((layout[1] >> 24u) & 1u) != 0
 		                      ? (uint64_t {words[0]} | (uint64_t {words[1] & 0x3fffffu} << 32u)) << 3u
 		                      : uint64_t {words[0]} | (uint64_t {words[1]} << 32u);
-		if (blas != 0 && (blas & 255u) == 0) {
+		if (blas != 0 && (blas & 255u) == 0 && blas <= AddressLimit - MaxExtent) {
 			blas_list.push_back(blas);
 		}
 	};
