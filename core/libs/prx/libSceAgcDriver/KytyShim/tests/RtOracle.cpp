@@ -193,7 +193,7 @@ void TriangleIndexSpirv() {
     Expect(validator.Validate(builder.Build()), "the ray-query triangle index load emits valid SPIR-V");
 }
 
-enum class HighWord { Exact, StrideBit, SwizzleBit };
+enum class HighWord { Exact, StrideBit, SwizzleBit, Masked };
 
 struct SourceWalk {
     IR::Block              entry, header, body, latch, merge, second_header, second_body, second_latch, second_merge;
@@ -320,6 +320,7 @@ void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> head
     auto       high  = walk.Add(Op::IAdd32, {walk.Add(Op::IAdd32, {header_high, walk.LoadAddress(table, 0x34)}), carry});
     if (kind == HighWord::StrideBit) high = walk.Add(Op::IAdd32, {high, u32(0x00010000u)});
     if (kind == HighWord::SwizzleBit) high = walk.Add(Op::BitwiseOr32, {high, u32(0x40000000u)});
+    if (kind == HighWord::Masked) high = walk.Add(Op::BitwiseAnd32, {high, u32(0xffffu)});
     const auto buffer = walk.Add(Op::GetBufferResource, {low, walk.Add(Op::BitwiseOr32, {high, u32(0x00800000u)}), u32(0xffffffffu), u32(0x00027000u)});
     const auto index  = walk.Add(Op::ShiftRightLogical32, {child, u32(3)});
     const auto record = [&](uint32_t dword) {
@@ -402,6 +403,29 @@ void TwoTlasWalks() {
     TraceTwoWalks(same, 0x20);
     Expect(same.traced.sites == 2 && same.traced.extra_sources.empty() && !multi(same.flags[0]) && !multi(same.flags[1]),
            "two walks over one TLAS bind no extra source and keep the single-TLAS query");
+}
+
+void UntracedWalk() {
+    TwoWalks two;
+    auto&    walk        = two.walk;
+    walk.program.blocks  = {&walk.entry, &walk.header, &walk.body, &walk.latch, &walk.merge,
+                            &walk.second_header, &walk.second_body, &walk.second_latch, &walk.second_merge};
+    Number(walk);
+    const auto ray       = UserRay(walk);
+    const auto named     = UserHeader(walk, 0x20);
+    const auto chased    = UserHeader(walk, 0x1b4);
+    const auto high      = walk.Add(IR::ValueOpcode::BitwiseAnd32, {chased[1], IR::Value(uint32_t {0xffffu})});
+    const auto table     = walk.Add(IR::ValueOpcode::GetAddressResource, {chased[0], high});
+    const std::array<IR::Value, 2> untraced {walk.LoadAddress(table, 0), walk.LoadAddress(table, 4)};
+    BuildWalk(walk, {walk.entry, walk.header, walk.body, walk.latch, walk.merge}, named, ray, HighWord::Exact);
+    BuildWalk(walk, {walk.merge, walk.second_header, walk.second_body, walk.second_latch, walk.second_merge}, untraced, ray, HighWord::Masked);
+    two.traced = IR::TraceNativeTraversals(walk.program, {.wave_size = 32, .rewrite = true, .oracle = IR::OracleRemaining | IR::OracleOnly});
+    const auto first  = walk.sites[0]->Flags<uint32_t>();
+    const auto second = walk.sites[1]->Flags<uint32_t>();
+    Expect(two.traced.sites == 1 && two.traced.source_valid && two.traced.header_offset == 0x20u,
+           "a walk over a named TLAS is served although another walk's TLAS is not traced");
+    Expect((first & IR::BvhIntersectOracle) != 0, "the walk over the named TLAS is answered from the host query");
+    Expect((second & IR::BvhIntersectOracle) == 0 && (second & IR::BvhIntersectEmpty) != 0, "the walk over the untraced TLAS stays empty");
 }
 
 void RecordLayouts() {
@@ -490,6 +514,7 @@ int main() {
     PrologueFlag();
     TwoTlasWalks();
     RecordLayouts();
+    UntracedWalk();
     DescriptorHighWord();
     Marking();
     EmptyWalks();
