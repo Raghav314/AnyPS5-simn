@@ -153,8 +153,10 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
-inline constexpr uint32_t BufferStrideMask    = 0x3fffu;
-inline constexpr uint32_t RuntimeBufferStride = BufferStrideMask;
+inline constexpr uint32_t BufferStrideMask       = 0x3fffu;
+inline constexpr uint32_t RuntimeBufferStride    = BufferStrideMask;
+inline constexpr uint32_t StructuredBufferBounds = 1u << 21u;
+inline constexpr uint32_t ExactBufferBounds      = 1u << 22u;
 [[nodiscard]] constexpr bool HasRuntimeStride(uint32_t packed_stride) {
 	return (packed_stride & BufferStrideMask) == RuntimeBufferStride;
 }

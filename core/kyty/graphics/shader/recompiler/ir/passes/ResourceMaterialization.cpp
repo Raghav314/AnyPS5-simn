@@ -2313,7 +2313,7 @@ static void ShareEmptyBuffer(const ResourcePlan& program, uint32_t index, bool r
 	if (!vector) {
 		buffer.scalar_empty = false;
 	} else if (runtime_stride && !program.info.buffers[index].formatted) {
-		buffer.packed_stride   = RuntimeBufferStride;
+		buffer.packed_stride   = RuntimeBufferStride | ExactBufferBounds;
 		buffer.zero_stride_oob = false;
 		buffer.scalar_empty    = false;
 	} else {
@@ -2557,6 +2557,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		} else if (!swizzle) {
 			packed_stride &= ~(3u << 16u);
 		}
+		if (stride != 0u && descriptor.OutOfBounds() == 0u) packed_stride |= StructuredBufferBounds;
+		if (descriptor.OutOfBounds() == 3u) packed_stride |= ExactBufferBounds;
 		auto& buffer         = specialization.buffers[i];
 		buffer.packed_stride = packed_stride;
 		buffer.descriptor_format =
@@ -2749,6 +2751,8 @@ bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& sn
 		} else if (!swizzle) {
 			packed_stride &= ~(3u << 16u);
 		}
+		if (stride != 0u && descriptor.OutOfBounds() == 0u) packed_stride |= StructuredBufferBounds;
+		if (descriptor.OutOfBounds() == 3u) packed_stride |= ExactBufferBounds;
 		auto& buffer              = specialization.buffers[i];
 		buffer.packed_stride      = packed_stride;
 		buffer.descriptor_format  = base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;

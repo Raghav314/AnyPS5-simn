@@ -21,7 +21,7 @@ TableDrawExportMapping(const GraphicContext& graphics, const HW::Context& ctx, u
 
 bool TableBufferSpecialized(const ShaderRecompiler::IR::BufferResource&                 resource,
                             const ShaderRecompiler::IR::ResourceSpecialization::Buffer& specialized,
-                            const std::array<uint32_t, 4>& words4, bool runtime_format) {
+                            const std::array<uint32_t, 4>& words4, bool runtime_format, bool vector_access) {
 	runtime_format = runtime_format && specialized.descriptor_format == Prospero::BufferFormat::kInvalid;
 	ShaderBufferResource descriptor;
 	std::copy_n(words4.begin(), 4, descriptor.fields);
@@ -34,6 +34,11 @@ bool TableBufferSpecialized(const ShaderRecompiler::IR::BufferResource&         
 	} else if (!swizzle) {
 		packed_stride &= ~(3u << 16u);
 	}
+	if (stride != 0u && descriptor.OutOfBounds() == 0u)
+		packed_stride |= ShaderRecompiler::IR::StructuredBufferBounds;
+	if (descriptor.OutOfBounds() == 3u)
+		packed_stride |= ShaderRecompiler::IR::ExactBufferBounds;
+	if (!vector_access) packed_stride = 0u;
 	const bool any_stride = !swizzle && (specialized.packed_stride & (1u << 14u)) == 0u &&
 	                        resource.indirect_root == ShaderRecompiler::IR::BufferResource::NoIndirectBuffer &&
 	                        resource.indirect_resources.empty();
@@ -42,7 +47,7 @@ bool TableBufferSpecialized(const ShaderRecompiler::IR::BufferResource&         
 	       (runtime_format ||
 	        ((resource.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid) == specialized.descriptor_format &&
 	         (resource.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7)) == specialized.descriptor_swizzle)) &&
-	       (descriptor.OutOfBounds() == 0u && stride == 0u) == specialized.zero_stride_oob &&
+	       (vector_access && descriptor.OutOfBounds() == 0u && stride == 0u) == specialized.zero_stride_oob &&
 	       (resource.scalar && descriptor.GetSize() == 0u) == specialized.scalar_empty;
 }
 
@@ -1307,7 +1312,9 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 		const auto& specified = pair.tables[st]->specialization.buffers;
 		return i < specified.size() &&
 		       TableBufferSpecialized(resources[i], specified[i], words4,
-		                              i < 32 && ((pair.programs[st]->table_plan.runtime_formats >> i) & 1u) != 0);
+		                              i < 32 && ((pair.programs[st]->table_plan.runtime_formats >> i) & 1u) != 0,
+		                              i < pair.plans[st]->buffer_vector_access.size() &&
+		                                  pair.plans[st]->buffer_vector_access[i] != 0u);
 	};
 	if (table.gathered != &pair) TableGather(pair, user_data);
 	table.gathered = nullptr;

@@ -94,28 +94,36 @@ uint32_t BufferLane(EmitterState& state) {
 	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 63));
 }
 
+uint32_t BufferStrideValue(EmitterState& state, const IR::MemoryInfo& mem, uint32_t packed) {
+	const auto stride = packed & IR::BufferStrideMask;
+	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
+	if (state.program.table_mode && !swizzle && mem.resource < state.table_strides.size()) {
+		const auto value = state.table_strides[mem.resource];
+		return value != 0u ? value : ConstantU32(state, stride);
+	}
+	if (IR::HasRuntimeStride(packed)) {
+		const auto binding = state.program.info.buffers[mem.resource].descriptor_index;
+		const auto value = binding < state.memory_strides.size() ? state.memory_strides[binding] : 0u;
+		if (value == 0u) {
+			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+			                             "the buffer's run-time stride was not prepared");
+		}
+		return value;
+	}
+	return ConstantU32(state, stride);
+}
+
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	auto&      state  = ctx.state;
 	const auto packed = StorageBufferPackedStride(state, mem);
-	const auto stride = packed & 0x3fffu;
+	const auto stride = packed & IR::BufferStrideMask;
 	auto       index  = ctx.Arg(inst, 1);
 	if ((packed & (1u << 20u)) != 0u) {
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	}
 	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
-	uint32_t stride_value = 0;
-	if (state.program.table_mode && !swizzle && mem.resource < state.table_strides.size()) {
-		stride_value = state.table_strides[mem.resource];
-	} else if (IR::HasRuntimeStride(packed)) {
-		const auto binding = state.program.info.buffers[mem.resource].descriptor_index;
-		stride_value       = binding < state.memory_strides.size() ? state.memory_strides[binding] : 0u;
-		if (stride_value == 0u) {
-			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
-			                             "the buffer's run-time stride was not prepared");
-		}
-	}
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
-	                              stride_value != 0u ? stride_value : ConstantU32(state, stride),
+	                              BufferStrideValue(state, mem, packed),
 	                              swizzle ? ConstantBool(state, true) : 0u,
 	                              ConstantU32(state, (packed >> 16u) & 3u))
 	    .byte;
@@ -499,30 +507,68 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 
 uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
                              const IR::MemoryInfo& mem, const MemoryResourceAccess& resource,
-                             uint32_t payload_in_bounds) {
+                             uint32_t payload_in_bounds, uint32_t payload_bytes = 0u) {
 	if (mem.kind != IR::ResourceKind::Buffer) return payload_in_bounds;
 	auto& state = ctx.state;
 	const auto& buffer = state.program.info.buffers[mem.resource];
 	const auto& sources = state.program.descriptor_sources;
-	if (buffer.source >= sources.size() || !sources[buffer.source].indirect_descriptor ||
-	    !sources[buffer.source].indirect_descriptor->indexed) return payload_in_bounds;
+	const bool structured = (buffer.packed_stride & IR::StructuredBufferBounds) != 0u;
+	const bool indexed = buffer.source < sources.size() &&
+	    sources[buffer.source].indirect_descriptor &&
+	    sources[buffer.source].indirect_descriptor->indexed;
+	if (!structured && !indexed) return payload_in_bounds;
+	const auto stride = BufferStrideValue(state, mem, buffer.packed_stride);
 	const auto bytes = Binary(state, spv::OpIMul, TypeU32(state), resource.length,
 	                          ConstantU32(state, resource.element_bits / 8u));
 	const auto available = Binary(state, spv::OpISub, TypeU32(state), bytes, resource.byte_offset);
 	const auto last_record = Binary(state, spv::OpUDiv, TypeU32(state),
 	    Binary(state, spv::OpISub, TypeU32(state), available, ConstantU32(state, 1u)),
-	    ConstantU32(state, buffer.packed_stride & 0x3fffu));
-	return AndCondition(state, payload_in_bounds,
+	    EmitUMax32(state, stride, ConstantU32(state, 1u)));
+	auto index = ctx.Arg(inst, 1);
+	auto in_bounds = payload_in_bounds;
+	if ((buffer.packed_stride & (1u << 20u)) != 0u) {
+		const auto original = index;
+		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
+		in_bounds = AndCondition(state, in_bounds,
+		                         Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), index, original));
+	}
+	const auto original_offset = ctx.Arg(inst, 2);
+	const auto offset = mem.offset == 0u ? original_offset
+	    : Binary(state, spv::OpIAdd, TypeU32(state), original_offset,
+	             ConstantU32(state, mem.offset));
+	if (mem.offset != 0u)
+		in_bounds = AndCondition(state, in_bounds,
+		                         Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), offset, original_offset));
+	in_bounds = AndCondition(state, in_bounds,
 	    AndCondition(state,
 	        Binary(state, spv::OpUGreaterThan, TypeBool(state), bytes, resource.byte_offset),
-	        Binary(state, spv::OpULessThanEqual, TypeBool(state), ctx.Arg(inst, 1), last_record)));
+	        Binary(state, spv::OpULessThanEqual, TypeBool(state), index, last_record)));
+	if (!structured) return in_bounds;
+	const auto offset_in_bounds = payload_bytes == 0u
+	    ? Binary(state, spv::OpULessThan, TypeBool(state), offset, stride)
+	    : AndCondition(state,
+	        Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), stride, payload_bytes),
+	        Binary(state, spv::OpULessThanEqual, TypeBool(state), offset,
+	               Binary(state, spv::OpISub, TypeU32(state), stride, payload_bytes)));
+	in_bounds = AndCondition(state, in_bounds, offset_in_bounds);
+	return in_bounds;
+}
+
+uint32_t StorageBufferElementInBounds(EmitterState& state, const IR::MemoryInfo& mem,
+                                      const MemoryResourceAccess& resource, uint32_t index) {
+	if (mem.kind == IR::ResourceKind::Buffer &&
+	    (state.program.info.buffers[mem.resource].packed_stride & IR::ExactBufferBounds) != 0u) {
+		return EmitMemoryElementInBounds(state, resource, index);
+	}
+	return EmitStorageElementInBounds(state, resource, index);
 }
 
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitStorageElementInBounds(ctx.state, resource, index),
+	    ctx.state, BufferIndexInBounds(ctx, inst, mem, resource,
+	                                   StorageBufferElementInBounds(ctx.state, mem, resource, index)),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
@@ -558,7 +604,8 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitStorageElementInBounds(ctx.state, resource, index),
+	    ctx.state, BufferIndexInBounds(ctx, inst, mem, resource,
+	                                   StorageBufferElementInBounds(ctx.state, mem, resource, index)),
 	    [&]() { return LoadSubwordInBounds(ctx, resource, address, index, bits); });
 }
 
@@ -709,7 +756,7 @@ void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
 	const auto in_bounds = resource.element_bits < 32u
-	                           ? EmitStorageElementInBounds(ctx.state, resource, index)
+	                           ? StorageBufferElementInBounds(ctx.state, mem, resource, index)
 	                           : EmitMemoryElementInBounds(ctx.state, resource, index);
 	EmitIfCondition(ctx.state, BufferIndexInBounds(ctx, inst, mem, resource, in_bounds), [&]() {
 		StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
@@ -844,7 +891,7 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	if (resource.object_pointer == 0u) return;
 	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
 	const auto in_bounds = BufferIndexInBounds(ctx, inst, mem, resource,
-	    EmitStorageElementInBounds(ctx.state, resource, index));
+	    StorageBufferElementInBounds(ctx.state, mem, resource, index));
 	EmitIfCondition(ctx.state, in_bounds, [&]() {
 		StoreWordInBounds(ctx, resource, index,
 		                  resource.kind == IR::ResourceKind::Lds && ctx.state.lds_last_lane_stores
@@ -883,7 +930,9 @@ uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
 		}
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return EmitValueOrZeroIfCondition(
-		    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+		    ctx.state, BufferIndexInBounds(ctx, inst, mem, resource,
+		        EmitMemoryElementInBounds(ctx.state, resource, index),
+		        mem.kind == IR::ResourceKind::Buffer ? ConstantU32(ctx.state, 4u) : 0u), [&]() {
 			    const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 			    if (ctx.state.split_hints != nullptr && ctx.state.unordered_update && mem.kind == IR::ResourceKind::Lds) {
 				    ctx.state.split_hints->unordered_updates.emplace_back(pointer, *ctx.state.unordered_update);
@@ -939,7 +988,8 @@ PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::
 	                               ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
 	plan.in_bounds = BufferIndexInBounds(ctx, inst, mem, resource, AndCondition(
 	    ctx.state, Binary(ctx.state, spv::OpUGreaterThanEqual, TypeBool(ctx.state), end, start),
-	    EmitMemoryElementInBounds(ctx.state, plan.resource, last_index)));
+	    EmitMemoryElementInBounds(ctx.state, plan.resource, last_index)),
+	    ConstantU32(ctx.state, info.byte_size));
 	plan.base = Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), start,
 	                   ConstantU32(ctx.state, ~(std::min(4u, info.byte_size) - 1u)));
 	return plan;
@@ -1437,6 +1487,13 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	                      Binary(state, spv::OpIEqual, TypeBool(state), second,
 	                             EmitAddU32(state, first, ConstantU32(state, 4))));
 	atomic = AndCondition(state, atomic, EmitMemoryElementInBounds(state, wide, index));
+	for (uint32_t component = 0; component < 2u; component++) {
+		const auto word  = RebaseRawComponent(mem, component);
+		const auto dword = DwordIndex(ctx, inst, word, resource.byte_offset);
+		atomic = AndCondition(state, atomic,
+		                      BufferIndexInBounds(ctx, inst, word, resource,
+		                                          StorageBufferElementInBounds(state, word, resource, dword)));
+	}
 	const auto atomic_label = state.builder.AllocateId(), scalar_label = state.builder.AllocateId();
 	const auto merge = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
@@ -1498,7 +1555,8 @@ uint32_t LoadRuntimeFormatted(ValueEmitContext& ctx, const IR::Inst& inst, const
 	    ctx, inst, mem, resource,
 	    AndCondition(state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), end, start),
 	                 EmitMemoryElementInBounds(
-	                     state, resource, Binary(state, spv::OpShiftRightLogical, u32, end, ConstantU32(state, 2)))));
+	                     state, resource, Binary(state, spv::OpShiftRightLogical, u32, end, ConstantU32(state, 2)))),
+	    bytes);
 	const auto base = Binary(state, spv::OpBitwiseAnd, u32, start, Unary(state, spv::OpNot, u32, field(3)));
 	std::array<uint32_t, 4> values {};
 	for (uint32_t output = 0; output < components; output++) {
@@ -1596,7 +1654,7 @@ static void StoreRawBufferPair(ValueEmitContext& ctx, const IR::Inst& inst, cons
 		const auto dword = DwordIndex(ctx, inst, word, resource.byte_offset);
 		atomic = AndCondition(state, atomic,
 		                      BufferIndexInBounds(ctx, inst, word, resource,
-		                                          EmitStorageElementInBounds(state, resource, dword)));
+		                                          StorageBufferElementInBounds(state, word, resource, dword)));
 	}
 	const auto atomic_label = state.builder.AllocateId(), scalar_label = state.builder.AllocateId();
 	const auto merge        = state.builder.AllocateId();
@@ -2391,13 +2449,15 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
-		    const auto resource =
+		    auto resource =
 		        PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[3]);
+		    resource.element_bits = 64u;
 		    const auto byte_address = ByteAddress(ctx, inst, mem);
 		    const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byte_address,
 		                              ConstantU32(state, 3u));
 		    return EmitValueOrDefaultIfCondition(
-		        state, EmitMemoryElementInBounds(state, resource, index), TypeU64(state),
+		        state, BufferIndexInBounds(ctx, inst, mem, resource,
+		            EmitMemoryElementInBounds(state, resource, index), ConstantU32(state, 8u)), TypeU64(state),
 		        ConstantU64(state, 0), [&]() {
 			        const auto pointer = EmitStorageBufferElementPointer(
 			            state, resource, index, TypeStorageBufferElementPointer(state, 64));
