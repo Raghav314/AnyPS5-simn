@@ -1943,7 +1943,8 @@ private:
 	}
 
 	const Inst* IndexedMaterialRead(const Inst* read, Value active,
-	                               DescriptorSource::IndirectDescriptor::SelectorRead& selector) const {
+	                               DescriptorSource::IndirectDescriptor::SelectorRead& selector,
+	                               bool allow_implied_mask = false) const {
 		if (read == nullptr) return nullptr;
 		uint32_t lane = 0;
 		const auto op = read->GetOpcode();
@@ -1961,7 +1962,8 @@ private:
 		if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
 		    !memory.idxen || memory.offen || memory.offset > UINT32_MAX - lane * 4u ||
 		    read->Arg(2).Resolve() != Value(0u) || read->Arg(3).Resolve() != Value(0u) ||
-		    !EquivalentValue(m_program, active, read->Arg(4))) return nullptr;
+		    !(allow_implied_mask ? Implies(active, read->Arg(4))
+		                         : EquivalentValue(m_program, active, read->Arg(4)))) return nullptr;
 		selector.offset = memory.offset + lane * 4u;
 		return read;
 	}
@@ -3986,6 +3988,45 @@ private:
 		return true;
 	}
 
+	bool MatchIndexedStoreField(const Inst& handle, Value key,
+	                            DescriptorSource::IndirectDescriptor& indirect) {
+		const auto* lane = key.Resolve().TryInstruction();
+		if (m_program.stage != ShaderType::Compute || lane == nullptr ||
+		    lane->GetOpcode() != ValueOpcode::ReadFirstLane) return false;
+		const auto* local = lane->Arg(0).Resolve().TryInstruction();
+		if (local == nullptr || local->GetOpcode() != ValueOpcode::SelectU32) return false;
+		const auto active = local->Arg(0).Resolve();
+		auto inactive = local->Arg(2).Resolve();
+		while (const auto* previous = inactive.TryInstruction()) {
+			if (previous->GetOpcode() != ValueOpcode::SelectU32 ||
+			    previous->Arg(0).Resolve() != active) break;
+			inactive = previous->Arg(2).Resolve();
+		}
+		if (inactive != Value(0u) && !std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+			    const auto& store = *use.user;
+			    return UniformizedMaterialValue(key, store, store.Arg(store.NumArgs() - 1u)) == local;
+		    })) return false;
+		const auto* mask = ActiveValue(local->Arg(1), active).TryInstruction();
+		if (mask == nullptr || mask->GetOpcode() != ValueOpcode::BitwiseAnd32) return false;
+		DescriptorSource::IndirectDescriptor::SelectorRead selector;
+		const auto literal = mask->Arg(0).Resolve().IsImmediate() ? 0u : 1u;
+		if (!ImmediateU32(mask->Arg(literal), selector.bit_mask)) return false;
+		const auto* read = IndexedMaterialRead(ActiveValue(mask->Arg(1u - literal), active).TryInstruction(),
+		                                       active, selector, true);
+		if (read == nullptr) return false;
+		for (const auto* block: m_program.blocks) {
+			for (const auto& inst: *block) {
+				const auto access = ImageOpcodeInfoOf(inst.GetOpcode()).access;
+				if (access == ImageAccess::Write || access == ImageAccess::Atomic) return false;
+			}
+		}
+		DescriptorSource material;
+		if (!MakeRuntimeTableSource(*read, material)) return false;
+		selector.source = InternSource(material);
+		indirect.selector = std::move(selector);
+		return true;
+	}
+
 	bool TryMakeIndirectBuffer(Inst& handle, const DescriptorSource& descriptor,
 	                           IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
@@ -4041,6 +4082,8 @@ private:
 			indirect.signed_count = bound->GetOpcode() == ValueOpcode::SLessThan32;
 			return finish();
 		}
+		if (legacy_store && indexed && table_source.dword_count == 4u && !plan.split_offsets &&
+		    plan.selection_anchor != nullptr && MatchIndexedStoreField(handle, key, indirect)) return finish();
 		if (table_source.dword_count == 4u && !plan.split_offsets &&
 		    plan.selection_anchor != nullptr && SetExactTableMaximum(key, indirect)) {
 			indirect.table_scalar = true;
