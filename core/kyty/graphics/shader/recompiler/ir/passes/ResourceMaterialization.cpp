@@ -277,10 +277,15 @@ bool TableInGuestMemory(uint64_t base, uint64_t size, const SrtRuntime& runtime)
 	       ReadScalarTable(base, size, size - 4u, runtime, word);
 }
 
-bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource) {
+bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource,
+                             bool selected_store) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(value, descriptor)) return false;
 	const bool formatted_read = resource.formatted && resource.read && !resource.written;
+	if (selected_store && (descriptor.Type() != 0u || descriptor.Format() == Prospero::BufferFormat::kInvalid) &&
+	    std::ranges::any_of(descriptor.fields, [](uint32_t word) { return word != 0; })) {
+		return SpecializationFail("selected store has a non-null invalid buffer descriptor");
+	}
 	if (descriptor.Type() != 0u || descriptor.Format() == Prospero::BufferFormat::kInvalid ||
 	    (!formatted_read && (descriptor.Base48() == 0u || descriptor.GetSize() == 0u))) {
 		value.dwords.fill(0u);
@@ -306,8 +311,11 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 			     descriptor.Format() == Prospero::BufferFormat::k8SInt);
 			const bool rgba16 = resource.max_byte_extent == 16u &&
 			    descriptor.Format() == Prospero::BufferFormat::k16_16_16_16Float;
+			const auto swizzle = descriptor.DstSelXYZW();
+			const bool identity = rgba16 ? swizzle == DstSel(4, 5, 6, 7)
+			    : swizzle == DstSel(4, 0, 0, 0) || (selected_store && swizzle == DstSel(4, 0, 0, 1));
 			if ((!scalar && !rgba16) || descriptor.Stride() != format.byte_size ||
-			    descriptor.DstSelXYZW() != (rgba16 ? DstSel(4, 5, 6, 7) : DstSel(4, 0, 0, 0)))
+			    !identity)
 				return SpecializationFail("indirect formatted stores require tight identity SInt8, UInt32 or RGBA16Float records");
 		}
 		if (formatted_read &&
@@ -2503,6 +2511,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	};
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
+	bool has_selected_store = false;
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
 		const auto base_index =
 		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
@@ -2514,12 +2523,16 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (WalkedActive(program, base.source)) {
+					const auto& indirect = *source->indirect_descriptor;
+					const bool selected_store = base.written && indirect.indexed && indirect.selector &&
+					                            indirect.selector->stride == 0 && !indirect.table_scalar;
+					has_selected_store |= selected_store;
 					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, snapshot,
 					        snapshot.buffers, specialization.buffers,
 					        [&](DescriptorValue& value) {
 						        return NormalizeIndirectBuffer(
-						            value, source->indirect_descriptor->indexed, base);
+						            value, indirect.indexed, base, selected_store);
 					        }))
 						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
 				}
@@ -2687,6 +2700,21 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 #endif
 	FlushRecordBlocks(snapshot.flattened_srt);
+	if (has_selected_store) {
+		for (size_t i = 0; i < snapshot.buffers.size(); ++i) {
+			const auto root = i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
+			if (!program.info.buffers[root].written) continue;
+			ShaderBufferResource dest;
+			if (!DecodeBufferDescriptor(snapshot.buffers[i], dest)) return false;
+			const auto begin = dest.Base48();
+			const auto size = dest.GetSize();
+			if (begin == 0u || size == 0u) continue;
+			for (const auto [address, bytes]: snapshot.specialization_reads) {
+				if (bytes && begin < address + bytes && address < begin + size)
+					return program_failed("selected buffer write overlaps captured descriptor or selector data");
+			}
+		}
+	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
