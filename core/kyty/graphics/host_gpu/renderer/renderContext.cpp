@@ -454,7 +454,8 @@ void RenderContext::CacheIndexedBufferReads(const ShaderStageRuntime& runtime) {
 		if (inputs.size() > probes) return;
 		probes -= inputs.size();
 		for (auto& input: inputs) {
-			if (!read(keys, uint64_t {input} + plan.key_offset, std::span(&input, 1))) return;
+			const auto offset = uint64_t {input & ~3u} + (plan.key_offset & ~3u);
+			if (!read(keys, offset, std::span(&input, 1))) return;
 		}
 		deduplicate(inputs);
 		if (inputs.size() > probes) return;

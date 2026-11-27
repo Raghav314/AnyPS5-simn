@@ -43,7 +43,7 @@ constexpr std::array<std::uint64_t, 2> Children {GuestBase + 0x5000000, GuestBas
 constexpr std::array<std::uint32_t, 2> Rows {12345, 54321};
 
 constexpr std::array<std::uint32_t, 17> IndexedReadCode {
-    0x7e280500, 0xf4200500, 0x28000000, 0xbf8cc07f, 0xf4200542, 0x28000004,
+    0x7e280500, 0xf4200500, 0x28000000, 0xbf8cc07f, 0xf4200542, 0x28000005,
     0xbf8cc07f, 0x8f158415, 0xf4280604, 0x2a000000, 0xbf8cc07f, 0xe0300000,
     0x80060100, 0xbf8c3f70, 0xe0700000, 0x14030100, 0xbf810000,
 };
@@ -140,7 +140,7 @@ void makeCapture(const std::filesystem::path& path, bool indexed) {
         commandWords.push_back(words.size());
     }
     if (indexed) {
-        const std::uint32_t first = 4;
+        const std::uint32_t first = 7;
         write(memory, Root, &first, sizeof(first));
         for (std::uint32_t round = 0; round < Rounds; ++round) {
             const auto row = Rows[round % Rows.size()];
@@ -169,7 +169,7 @@ void makeCapture(const std::filesystem::path& path, bool indexed) {
             snapshot += writer.WriteSnapshot(Children[i], bytesOf(leafValue(0)));
         }
         for (std::uint32_t round = 1; round < Rounds; ++round) {
-            writer.WriteDelta(round, round, Root, bytesOf((round + 1) * 4));
+            writer.WriteDelta(round, round, Root, bytesOf((round + 1) * 4 + 3));
             writer.WriteDelta(round, round, Children[round % Children.size()], bytesOf(leafValue(round)));
         }
     } else {
