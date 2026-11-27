@@ -2995,9 +2995,17 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	const auto stale = [&](const TextureBinding& binding) {
 		return TableTextureStale(binding, binding.TableImage().Get(texture_cache.m_slot_images));
 	};
-	std::vector<bool> stale_tables(prepared.table_images.size());
-	for (size_t k = 0; k < prepared.table_images.size(); k++) {
-		stale_tables[k] = stale(*prepared.table_images[k]);
+	std::vector<uint8_t> stale_tables(prepared.table_images.size());
+	const auto check_range = [&](size_t first, size_t last) {
+		for (size_t k = first; k < last; ++k) {
+			stale_tables[k] = stale(*prepared.table_images[k]);
+		}
+	};
+	if (stale_tables.size() < 8192 || stale_tables.size() > UINT32_MAX) {
+		check_range(0, stale_tables.size());
+	} else {
+		GetExecHelpers().ParallelFor(static_cast<uint32_t>(stale_tables.size()), 1024,
+		                            [&](uint32_t first, uint32_t last) { check_range(first, last); });
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
