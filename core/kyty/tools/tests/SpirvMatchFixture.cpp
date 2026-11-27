@@ -119,14 +119,16 @@ int main() {
 	WriteModule<CommonWriter>(intermediate, 0x101, 0x201, ShaderType::Vertex, vertex, {});
 	intermediate.close();
 	std::ofstream no_extra("no-extra-sources.shaders", std::ios::binary);
-	Write(no_extra, header.bytes);
+	Writer min_lod_header;
+	std::array<bool, 14> subgroup_flags {};
+	IoAll(min_lod_header, stamp, off, off, clock_period, subgroup_flags, all_stages, on, shared_memory);
+	Write(no_extra, min_lod_header.bytes);
 	WriteModule<NoExtraSourcesWriter>(no_extra, 0x102, 0x201, ShaderType::Vertex, vertex, {});
 	WriteModule<NoExtraSourcesWriter>(no_extra, 0x101, 0x201, ShaderType::Vertex, vertex, {});
 	no_extra.close();
 
 	std::ofstream no_indexed("no-indexed-reads.shaders", std::ios::binary);
 	Writer subgroup_header;
-	std::array<bool, 14> subgroup_flags {};
 	IoAll(subgroup_header, stamp, off, off, clock_period, subgroup_flags, all_stages, shared_memory);
 	Write(no_indexed, subgroup_header.bytes);
 	WriteModule<NoIndexedReadsWriter>(no_indexed, 0x102, 0x201, ShaderType::Vertex, vertex, {});

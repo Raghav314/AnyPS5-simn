@@ -19,6 +19,10 @@ struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
+[[nodiscard]] constexpr bool NeedsMeshLdsPadding(uint32_t vendor, uint32_t device, vk::DriverId driver) {
+	return vendor == 0x1002u && device == 0x73bfu && driver == vk::DriverId::eAmdProprietary;
+}
+
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
@@ -67,6 +71,7 @@ struct GraphicContext {
 	vk::SubgroupFeatureFlags                  subgroup_supported_operations         = {};
 	bool                                      native_ray_tracing_enabled            = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
+	PFN_vkGetShaderInfoAMD                    fn_get_shader_info                    = nullptr;
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;

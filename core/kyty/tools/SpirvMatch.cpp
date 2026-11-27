@@ -84,7 +84,8 @@ bool ReadStoreHeader(std::istream& input) {
 		input.seekg(size);
 		return bool(input);
 	};
-	return try_profile(ShaderRecompiler::Spirv::Profile{}) || try_profile(SubgroupProfile<14>{}) ||
+	return try_profile(ShaderRecompiler::Spirv::Profile{}) || try_profile(std::tuple<SubgroupProfile<14>, bool>{}) ||
+	       try_profile(SubgroupProfile<14>{}) ||
 	       try_profile(SubgroupProfile<12>{}) ||
 	       try_profile(EarlierProfile<9>{}) ||
 	       try_profile(EarlierProfile<8>{}) || try_profile(EarlierProfile<7>{}) || try_profile(EarlierProfile<6>{});

@@ -155,7 +155,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .subgroup_shuffle    = bool(operations & vk::SubgroupFeatureFlagBits::eShuffle),
 	        .subgroup_quad       = bool(operations & vk::SubgroupFeatureFlagBits::eQuad),
 	        .subgroup_stages     = SubgroupStages(graphics.subgroup_supported_stages),
-	        .shader_resource_min_lod = graphics.shader_resource_min_lod_enabled};
+	        .shader_resource_min_lod = graphics.shader_resource_min_lod_enabled,
+	        .mesh_lds_padding = graphics.fn_get_shader_info != nullptr};
 }
 
 bool PipelineCache::ResolveTessellationLayout(const HW::ShaderRegisters& sh, const ShaderParams& ls,
@@ -299,6 +300,9 @@ std::optional<ShaderModule> PipelineCache::BuildModule(const ProgramKey&        
 		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
 	} else if (key.stage == ShaderType::Mesh) {
 		module.mesh_task = options.input_info.vertex->indirect_draw;
+		if (profile.mesh_lds_padding) {
+			module.mesh_shared_bytes = ShaderRecompiler::Spirv::MeshWorkgroupBytes(result.spirv);
+		}
 	}
 	if (!result.spirv_plain.empty()) {
 		ValidateShaderSpirv(stage, key.hash, result.spirv_plain, profile.maintenance8);

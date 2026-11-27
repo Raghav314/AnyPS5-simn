@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
@@ -325,6 +326,70 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	                     vk::Result::eSuccess);
 }
 
+std::optional<uint32_t> MeshLdsWgpPadDwords(size_t usage, size_t workgroup_limit, size_t max_pad_bytes) {
+	constexpr size_t KiB = 1024;
+	constexpr size_t CuBytes = 64 * KiB;
+	if (usage == 0 || usage > CuBytes || workgroup_limit != CuBytes) return 0;
+	const auto has_reserve = [](size_t allocation, size_t cu_min, size_t wgp_min) {
+		const size_t cu_groups  = std::min(CuBytes / allocation, size_t {4});
+		const size_t wgp_groups = std::min(2 * CuBytes / allocation, size_t {8});
+		return CuBytes - cu_groups * allocation >= cu_min &&
+		       2 * CuBytes - wgp_groups * allocation >= wgp_min;
+	};
+	const size_t base = (usage + KiB - 1) & ~(KiB - 1);
+	for (size_t pad = 0; pad <= CuBytes - base; pad += KiB) {
+		if (has_reserve(base + pad, 4 * KiB, 8 * KiB)) {
+			if (pad > max_pad_bytes) return std::nullopt;
+			return static_cast<uint32_t>(pad / sizeof(uint32_t));
+		}
+	}
+	if (has_reserve(base, 3 * KiB, 3 * KiB)) return 0;
+	return std::nullopt;
+}
+
+std::optional<uint32_t> QueryMeshLdsWgpPadDwords(const GraphicContext& graphics, vk::Pipeline pipeline,
+                                                 const ShaderModule& module, uint32_t existing_pad_dwords,
+                                                 bool allow_missing_statistics) {
+	VkShaderStatisticsInfoAMD stats {};
+	size_t size = sizeof(stats);
+	if (!graphics.fn_get_shader_info || !pipeline) return std::nullopt;
+	const auto result = graphics.fn_get_shader_info(graphics.device, pipeline, VK_SHADER_STAGE_MESH_BIT_EXT,
+	                                                 VK_SHADER_INFO_TYPE_STATISTICS_AMD, &size, &stats);
+	if (result == VK_ERROR_FEATURE_NOT_PRESENT && allow_missing_statistics) return 0;
+	if (result != VK_SUCCESS || size != sizeof(stats)) return std::nullopt;
+	const auto& limits = graphics.mesh_shader_properties;
+	const uint32_t payload = module.mesh_task ? ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount * 4u : 0u;
+	const uint32_t combined = limits.maxMeshPayloadAndSharedMemorySize;
+	const uint32_t limit = std::min(limits.maxMeshSharedMemorySize, combined > payload ? combined - payload : 0u);
+	const uint64_t shared = module.mesh_shared_bytes + uint64_t {existing_pad_dwords} * sizeof(uint32_t);
+	const size_t budget = module.mesh_shared_bytes != 0 && shared < limit ? limit - shared : 0;
+	const auto& usage = stats.resourceUsage;
+	return MeshLdsWgpPadDwords(usage.ldsUsageSizeInBytes, usage.ldsSizePerLocalWorkGroup, budget);
+}
+
+static vk::Result PadMeshPipeline(const GraphicContext& graphics, const ShaderModule& module,
+                                  vk::PipelineShaderStageCreateInfo& mesh_stage, vk::PipelineCache cache,
+                                  const vk::GraphicsPipelineCreateInfo& info, vk::Pipeline& pipeline) {
+	uint32_t total_pad = 0;
+	for (unsigned attempt = 0;; ++attempt) {
+		const auto pad = QueryMeshLdsWgpPadDwords(graphics, pipeline, module, total_pad, total_pad == 0);
+		if (pad == 0) return vk::Result::eSuccess;
+		graphics.device.destroyPipeline(pipeline, nullptr);
+		pipeline = nullptr;
+		if (!pad || attempt == 2) return vk::Result::eErrorInitializationFailed;
+		total_pad += *pad;
+		const uint32_t length = ShaderRecompiler::Spirv::MeshAllocationBaseDwords + total_pad;
+		const vk::SpecializationMapEntry entry {.constantID = ShaderRecompiler::Spirv::MeshAllocationLengthSpecId,
+		                                        .offset = 0, .size = sizeof(length)};
+		const vk::SpecializationInfo spec {.mapEntryCount = 1, .pMapEntries = &entry,
+		                                   .dataSize = sizeof(length), .pData = &length};
+		mesh_stage.pSpecializationInfo = &spec;
+		const auto result = graphics.device.createGraphicsPipelines(cache, 1, &info, nullptr, &pipeline);
+		mesh_stage.pSpecializationInfo = nullptr;
+		if (result != vk::Result::eSuccess) return result;
+	}
+}
+
 #if defined(ANYPS5_KYTY)
 namespace {
 
@@ -542,7 +607,11 @@ public:
 		    {Hash(0), Hash(1), Hash(2), Hash(3)});
 		const auto create = [&](vk::PipelineCreateFlags create_flags) {
 			pipeline_info.flags = create_flags;
-			return m_graphics.device.createGraphicsPipelines(cache, 1, &pipeline_info, nullptr, &out);
+			const auto result = m_graphics.device.createGraphicsPipelines(cache, 1, &pipeline_info, nullptr, &out);
+			if (result == vk::Result::eSuccess && m_graphics.fn_get_shader_info && mesh && m_stages[3]) {
+				return PadMeshPipeline(m_graphics, *m_stages[0], shader_stages[0], cache, pipeline_info, out);
+			}
+			return result;
 		};
 		return CreateAuditedPipeline(m_graphics, "graphics", PipelineCache::GraphicsPipelineKeyHash {}(m_key),
 		                             flags, out, create);
@@ -952,6 +1021,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		    {hash(0), hash(1), hash(2), hash(3)});
 		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 		                                                 &pipeline.pipeline);
+	}
+	if (result == vk::Result::eSuccess && graphics.fn_get_shader_info && mesh && pixel) {
+		result = PadMeshPipeline(graphics, vertex, shader_stages[0], driver_cache, pipeline_info, pipeline.pipeline);
 	}
 	if (result != vk::Result::eSuccess) {
 		EXIT("vkCreateGraphicsPipelines failed: %s, %s 0x%016" PRIx64 ", hs 0x%016" PRIx64
