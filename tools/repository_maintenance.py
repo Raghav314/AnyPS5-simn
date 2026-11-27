@@ -551,6 +551,12 @@ if __name__ == "__main__":
         else:
             run(sys.argv[1])
     except urllib.error.HTTPError as error:
-        sys.exit(f"External API request failed (HTTP {error.code}).")
+        detail = ""
+        if error.url.startswith("https://api.anthropic.com/"):
+            try:
+                detail = " " + json.loads(error.read())["error"]["message"][:300]
+            except (ValueError, KeyError, TypeError):
+                pass
+        sys.exit(f"External API request failed (HTTP {error.code}).{detail}")
     except RuntimeError as error:
         sys.exit(str(error))
