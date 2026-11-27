@@ -582,7 +582,9 @@ void ComputedHeader(ChasedSource source) {
     Expect(!unreadable, "a program whose pointer chain is unreadable yields no header");
 }
 
-IR::OracleWalks GuardedWalks(bool reachable) {
+enum class WalkGuard { Blocked, Reachable, MixedVote, VoteAtJoin };
+
+IR::OracleWalks GuardedWalks(WalkGuard guard) {
     using Op = IR::ValueOpcode;
     IR::Block   pre, join, second_pre, exit;
     SourceWalk  walk;
@@ -595,7 +597,26 @@ IR::OracleWalks GuardedWalks(bool reachable) {
     const auto first  = UserHeader(walk, 0x40);
     const auto second = UserHeader(walk, 0x20);
     const auto flag   = walk.Add(Op::GetUserData, {IR::Value(IR::ScalarReg {14})});
-    const auto skip   = walk.Add(Op::INotEqual32, {flag, u32(0)});
+    const auto ref = [&](CFG::BranchCondition kind, IR::Value predicate) {
+        return walk.Add(Op::ConditionRef, {predicate}, static_cast<uint64_t>(kind));
+    };
+    IR::Value skip, later;
+    switch (guard) {
+        case WalkGuard::Blocked:
+        case WalkGuard::Reachable:
+            later = walk.Add(Op::INotEqual32, {flag, u32(0)});
+            skip  = ref(CFG::BranchCondition::ScalarInstruction, later);
+            break;
+        case WalkGuard::MixedVote: {
+            const auto lane_zero = walk.Add(Op::IEqual32, {walk.Add(Op::LaneId, {}), u32(0)});
+            skip  = walk.Add(Op::LogicalNot, {ref(CFG::BranchCondition::VccNonZero, lane_zero)});
+            later = walk.Add(Op::LogicalNot, {lane_zero});
+            break;
+        }
+        case WalkGuard::VoteAtJoin:
+            skip = walk.Add(Op::IEqual32, {walk.Add(Op::LaneId, {}), u32(0)});
+            break;
+    }
     walk.entry.condition              = skip;
     walk.entry.terminator.kind        = CFG::TerminatorKind::ConditionalBranch;
     walk.entry.terminator.true_block  = &join;
@@ -628,8 +649,9 @@ IR::OracleWalks GuardedWalks(bool reachable) {
     header_high.AddPhiOperand(&walk.merge, raw[1]);
     gate.AddPhiOperand(&walk.entry, IR::Value(false));
     gate.AddPhiOperand(&walk.merge, IR::Value(true));
-    const auto open = reachable ? IR::Value(&gate) : walk.Add(Op::LogicalNot, {IR::Value(&gate)});
-    join.condition              = walk.Add(Op::LogicalOr, {skip, open});
+    const auto open = guard == WalkGuard::Reachable ? IR::Value(&gate) : walk.Add(Op::LogicalNot, {IR::Value(&gate)});
+    join.condition              = guard == WalkGuard::VoteAtJoin ? ref(CFG::BranchCondition::VccNonZero, open)
+                                                                : walk.Add(Op::LogicalOr, {later, open});
     join.terminator.kind        = CFG::TerminatorKind::ConditionalBranch;
     join.terminator.true_block  = &second_pre;
     join.terminator.false_block = &exit;
@@ -647,13 +669,17 @@ void UnreachableEdgeWalks() {
         if (derived.loop_headers.size() <= loop || derived.loop_headers[loop].size() != 1) return std::nullopt;
         return derived.headers[derived.loop_headers[loop].front()].header_offset;
     };
-    const auto blocked = GuardedWalks(false);
+    const auto blocked = GuardedWalks(WalkGuard::Blocked);
     if (blocked.refusal != nullptr) std::fprintf(stderr, "unreachable edge walks refused: %s\n", blocked.refusal);
     Expect(blocked.refusal == nullptr && bound(blocked, 0) == 0x40u && bound(blocked, 1) == 0x20u,
            "a header value whose edge cannot reach the walk does not reject its TLAS");
-    const auto open = GuardedWalks(true);
-    Expect(open.refusal == nullptr && open.loop_headers.size() == 2 && bound(open, 0) == 0x40u && open.loop_headers[1].empty(),
-           "a full-width record read that can reach the walk still rejects the TLAS");
+    const auto rejects_second = [&](WalkGuard guard) {
+        const auto derived = GuardedWalks(guard);
+        return derived.refusal == nullptr && derived.loop_headers.size() == 2 && bound(derived, 0) == 0x40u && derived.loop_headers[1].empty();
+    };
+    Expect(rejects_second(WalkGuard::Reachable), "a full-width record read that can reach the walk still rejects the TLAS");
+    Expect(rejects_second(WalkGuard::MixedVote), "a positive wave vote leaves other lanes free to carry a full-width record to the walk");
+    Expect(rejects_second(WalkGuard::VoteAtJoin), "a wave vote at the join includes lanes from both phi inputs");
 }
 
 void HeaderPrograms() {

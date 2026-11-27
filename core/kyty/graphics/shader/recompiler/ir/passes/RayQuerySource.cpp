@@ -338,7 +338,11 @@ private:
 		if (inst == nullptr || inst->Parent() == nullptr || Reaches(taken, inst->Parent(), branch)) return;
 		known.emplace_back(value, truth);
 		switch (inst->GetOpcode()) {
-			case ValueOpcode::ConditionRef: Learn(known, inst->Arg(0), truth, taken, branch, depth + 1); break;
+			case ValueOpcode::ConditionRef:
+				if (inst->Flags<CFG::BranchCondition>() == CFG::BranchCondition::ScalarInstruction) {
+					Learn(known, inst->Arg(0), truth, taken, branch, depth + 1);
+				}
+				break;
 			case ValueOpcode::LogicalNot: Learn(known, inst->Arg(0), !truth, taken, branch, depth + 1); break;
 			case ValueOpcode::LogicalAnd:
 				if (truth) {
@@ -390,7 +394,11 @@ private:
 			if (fact == value) return truth;
 		}
 		switch (inst->GetOpcode()) {
-			case ValueOpcode::ConditionRef: return Evaluate(inst->Arg(0), block, from, known, depth + 1);
+			case ValueOpcode::ConditionRef:
+				if (inst->Flags<CFG::BranchCondition>() == CFG::BranchCondition::ScalarInstruction) {
+					return Evaluate(inst->Arg(0), block, from, known, depth + 1);
+				}
+				return std::nullopt;
 			case ValueOpcode::LogicalNot: {
 				const auto inner = Evaluate(inst->Arg(0), block, from, known, depth + 1);
 				return inner ? std::optional(!*inner) : std::nullopt;
