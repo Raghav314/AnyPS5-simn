@@ -275,9 +275,20 @@ int DrawMeshLdsWgpPad() {
 	bool                                       has_amd_shader_info    = false;
 	bool                                       has_cache_control      = false;
 	bool                                       skipped_llvmpipe       = false;
+	bool                                       lacking_device_features = false;
 	std::string                                llvmpipe_info;
 
 	for (const auto candidate: Checked(instance.enumeratePhysicalDevices(), "device enumeration")) {
+		vk::PhysicalDeviceDriverProperties driver_props;
+		vk::PhysicalDeviceProperties2      base_props;
+		base_props.pNext = &driver_props;
+		candidate.getProperties2(&base_props);
+		if (driver_props.driverID == vk::DriverId::eMesaLlvmpipe &&
+		    base_props.properties.driverVersion <= VK_MAKE_API_VERSION(0, 26, 2, 4)) {
+			skipped_llvmpipe = true;
+			llvmpipe_info    = driver_props.driverInfo.data();
+			continue;
+		}
 		const auto extensions = Checked(candidate.enumerateDeviceExtensionProperties(nullptr),
 		                                "device extension enumeration");
 		const auto has_ext    = [&](const char* ext) {
@@ -288,6 +299,7 @@ int DrawMeshLdsWgpPad() {
 		if (!has_ext(VK_EXT_MESH_SHADER_EXTENSION_NAME) ||
 		    !has_ext(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME) ||
 		    !has_ext(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME)) {
+			lacking_device_features = true;
 			continue;
 		}
 		vk::PhysicalDeviceMeshShaderFeaturesEXT       mesh_features;
@@ -312,26 +324,20 @@ int DrawMeshLdsWgpPad() {
 		    !v12_features.uniformBufferStandardLayout || !v13_features.dynamicRendering ||
 		    !features.features.shaderInt64 || !features.features.depthClamp ||
 		    !features.features.depthBounds || graphics == families.end()) {
+			lacking_device_features = true;
 			continue;
 		}
-		vk::PhysicalDeviceDriverProperties      driver_props;
-		vk::PhysicalDeviceVulkan11Properties    props11;
+		vk::PhysicalDeviceVulkan11Properties      props11;
 		vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_props;
-		vk::PhysicalDeviceProperties2           props;
-		driver_props.pNext = &mesh_props;
-		props11.pNext      = &driver_props;
-		props.pNext        = &props11;
+		vk::PhysicalDeviceProperties2             props;
+		props11.pNext = &mesh_props;
+		props.pNext   = &props11;
 		candidate.getProperties2(&props);
 		if (mesh_props.maxMeshWorkGroupInvocations < 64u ||
 		    mesh_props.maxMeshWorkGroupSize[0] < 64u || mesh_props.maxMeshOutputVertices < 64u ||
 		    mesh_props.maxMeshOutputPrimitives < 1u || mesh_props.maxMeshSharedMemorySize < 16384u ||
 		    props11.subgroupSize == 0u) {
-			continue;
-		}
-		if (driver_props.driverID == vk::DriverId::eMesaLlvmpipe &&
-		    props.properties.driverVersion <= VK_MAKE_API_VERSION(0, 26, 2, 4)) {
-			skipped_llvmpipe = true;
-			llvmpipe_info    = driver_props.driverInfo.data();
+			lacking_device_features = true;
 			continue;
 		}
 		const bool software = props.properties.deviceType == vk::PhysicalDeviceType::eCpu;
@@ -351,6 +357,12 @@ int DrawMeshLdsWgpPad() {
 			std::printf("%s_draw: skipped, the device has no mesh shader compiler that handles "
 			            "these programs (llvmpipe %s)\n",
 			            Name, llvmpipe_info.c_str());
+			return 77;
+		}
+		if (lacking_device_features) {
+			std::printf("%s_draw: skipped, the device lacks VK_EXT_mesh_shader, depth clip "
+			            "extensions, or depthBounds\n",
+			            Name);
 			return 77;
 		}
 		return NoDevice("no device with VK_EXT_mesh_shader, depth clip extensions, and dynamic rendering");
