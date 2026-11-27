@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
@@ -224,7 +225,7 @@ void TriangleIndexSpirv() {
     Expect(validator.Validate(builder.Build()), "the ray-query triangle index load emits valid SPIR-V");
 }
 
-enum class HighWord { Exact, StrideBit, SwizzleBit };
+enum class HighWord { Exact, StrideBit, SwizzleBit, Masked };
 
 struct SourceWalk {
     IR::Block              entry, header, body, latch, merge, second_header, second_body, second_latch, second_merge;
@@ -351,6 +352,7 @@ void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> head
     auto       high  = walk.Add(Op::IAdd32, {walk.Add(Op::IAdd32, {header_high, walk.LoadAddress(table, 0x34)}), carry});
     if (kind == HighWord::StrideBit) high = walk.Add(Op::IAdd32, {high, u32(0x00010000u)});
     if (kind == HighWord::SwizzleBit) high = walk.Add(Op::BitwiseOr32, {high, u32(0x40000000u)});
+    if (kind == HighWord::Masked) high = walk.Add(Op::BitwiseAnd32, {high, u32(0xffffu)});
     const auto buffer = walk.Add(Op::GetBufferResource, {low, walk.Add(Op::BitwiseOr32, {high, u32(0x00800000u)}), u32(0xffffffffu), u32(0x00027000u)});
     const auto index  = walk.Add(Op::ShiftRightLogical32, {child, u32(3)});
     const auto record = [&](uint32_t dword) {
@@ -433,6 +435,62 @@ void TwoTlasWalks() {
     TraceTwoWalks(same, 0x20);
     Expect(same.traced.sites == 2 && same.traced.extra_sources.empty() && !multi(same.flags[0]) && !multi(same.flags[1]),
            "two walks over one TLAS bind no extra source and keep the single-TLAS query");
+}
+
+void UntracedWalk() {
+    TwoWalks two;
+    auto&    walk        = two.walk;
+    walk.program.blocks  = {&walk.entry, &walk.header, &walk.body, &walk.latch, &walk.merge,
+                            &walk.second_header, &walk.second_body, &walk.second_latch, &walk.second_merge};
+    Number(walk);
+    const auto ray       = UserRay(walk);
+    const auto named     = UserHeader(walk, 0x20);
+    const auto chased    = UserHeader(walk, 0x1b4);
+    const auto high      = walk.Add(IR::ValueOpcode::BitwiseAnd32, {chased[1], IR::Value(uint32_t {0xffffu})});
+    const auto table     = walk.Add(IR::ValueOpcode::GetAddressResource, {chased[0], high});
+    const std::array<IR::Value, 2> untraced {walk.LoadAddress(table, 0), walk.LoadAddress(table, 4)};
+    BuildWalk(walk, {walk.entry, walk.header, walk.body, walk.latch, walk.merge}, named, ray, HighWord::Exact);
+    BuildWalk(walk, {walk.merge, walk.second_header, walk.second_body, walk.second_latch, walk.second_merge}, untraced, ray, HighWord::Masked);
+    two.traced = IR::TraceNativeTraversals(walk.program, {.wave_size = 32, .rewrite = true, .oracle = IR::OracleRemaining | IR::OracleOnly});
+    const auto first  = walk.sites[0]->Flags<uint32_t>();
+    const auto second = walk.sites[1]->Flags<uint32_t>();
+    Expect(two.traced.sites == 1 && two.traced.source_valid && two.traced.header_offset == 0x20u,
+           "a walk over a named TLAS is served although another walk's TLAS is not traced");
+    Expect((first & IR::BvhIntersectOracle) != 0, "the walk over the named TLAS is answered from the host query");
+    Expect((second & IR::BvhIntersectOracle) == 0 && (second & IR::BvhIntersectEmpty) != 0, "the walk over the untraced TLAS stays empty");
+}
+
+void CodeWaveSize() {
+    namespace Decoder = Libs::Graphics::ShaderRecompiler::Decoder;
+    const auto wave   = [](std::vector<uint32_t> code) {
+        code.push_back(0xbf810000u);
+        Decoder::Program program;
+        Decoder::DecodeProgram(code, program);
+        return Decoder::ExecWaveSize(program);
+    };
+    constexpr uint32_t mov_exec_lo  = 0xbefe0300u;
+    constexpr uint32_t mov_exec     = 0xbefe0400u;
+    constexpr uint32_t saveexec_b32 = 0xbe823c6au;
+    constexpr uint32_t saveexec_b64 = 0xbe82246au;
+    constexpr uint32_t mov_s2       = 0xbe820300u;
+    constexpr uint32_t mov_exec_hi  = 0xbeff0300u;
+    constexpr uint32_t and_exec_lo  = 0x877e007eu;
+    constexpr uint32_t and_exec     = 0x87fe007eu;
+    constexpr uint32_t count_bits   = 0xbefe1000u;
+    constexpr uint32_t replicate    = 0xbefe3b00u;
+    constexpr uint32_t shift_i64    = 0x91fe007eu;
+    constexpr uint32_t cmp_exec_hi  = 0xd4c2007fu;
+    constexpr uint32_t cmp_sources  = 0x00020501u;
+    Expect(wave({cmp_exec_hi, cmp_sources}) == 0u, "a vector comparison destination does not establish a scalar mask width");
+    Expect(wave({count_bits}) == 32u && wave({replicate}) == 64u, "mixed-type scalar operations use their destination width");
+    Expect(wave({shift_i64}) == 64u && wave({count_bits, shift_i64}) == 0u, "signed scalar writes participate in width inference");
+    Expect(wave({mov_exec_lo, saveexec_b32}) == 32u, "code that writes exec with 32-bit operations is wave32");
+    Expect(wave({mov_exec, saveexec_b64}) == 64u, "code that writes exec with 64-bit operations is wave64");
+    Expect(wave({saveexec_b32}) == 32u && wave({saveexec_b64}) == 64u, "a saveexec alone decides the width");
+    Expect(wave({mov_exec_lo, saveexec_b64}) == 0u, "code that mixes both widths has no known wave size");
+    Expect(wave({mov_s2}) == 0u && wave({}) == 0u, "code that never writes exec has no known wave size");
+    Expect(wave({mov_exec_lo, mov_exec_hi}) == 64u, "code that writes exec_hi is wave64 even with 32-bit operations");
+    Expect(wave({and_exec_lo}) == 32u && wave({and_exec}) == 64u, "a scalar ALU write to exec decides the width");
 }
 
 void RecordLayouts() {
@@ -521,6 +579,8 @@ int main() {
     PrologueFlag();
     TwoTlasWalks();
     RecordLayouts();
+    UntracedWalk();
+    CodeWaveSize();
     DescriptorHighWord();
     Marking();
     EmptyWalks();

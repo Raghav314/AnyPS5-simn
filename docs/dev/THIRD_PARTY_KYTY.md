@@ -633,8 +633,9 @@ To list every ray tracing program of a game at once, use
 (`<title>_<version>.kpm`, and `<title>_<version>.shared.kpm` when it exists; `--kpm <file>` names another one) and translates, as
 the driver does at start, each module whose code has `image_bvh_intersect_ray` instructions, with the stage, wave size, workgroup
 size, LDS and scratch the record holds. A program the game registered but no manifest record names is translated as a compute shader
-with a default 8x8x1 workgroup, 8192 LDS dwords and 16384 scratch dwords, at wave sizes 64 and 32 (`source=code`); a graphics shader
-with BVH instructions and no record is listed as `no_record`. Nothing is written, and stderr stays empty. The options that depend on
+with a default 8x8x1 workgroup, 8192 LDS dwords and 16384 scratch dwords (`source=code`). The probe infers the wave size from scalar
+writes to the execution mask and tries both sizes when the evidence is ambiguous or absent. A graphics shader with BVH instructions and
+no record is listed as `no_record`. Nothing is written, and stderr stays empty. The options that depend on
 the GPU are `--subgroup 32|64` (the host subgroup size; 32 by default), `--lds-limit <bytes>` (49152 by default) and `--oracle`
 (the value of `KYTY_RT_ORACLE`; 1, the default of the build, here), `--no-validate` skips the SPIR-V validation, and `--version`
 prints the commit of the build. The output has one line per program, `key=value` pairs after the hash:
@@ -643,7 +644,7 @@ prints the commit of the build. The output has one line per program, `key=value`
 rt-survey 1 build=<commit> oracle=1 subgroup=32 lds_limit=49152
 note <text>
 program <hash> [back=<hash>] stage=cs wave=64 group=8,8,1 lds=0 scratch=0 modules=3 source=manifest status=ok bvh=12 native=0 oracle=12 lane=0 empty=0 emulated=0 spirv=valid
-summary records=N manifest_modules=N manifest_skipped=N code_only=N programs=N intersections=N missing_code=N unreadable=N undecodable=N truncated=0 seconds=S
+summary records=N manifest_modules=N manifest_skipped=N code_only=N programs=N intersections=N code_only_wave_known=N missing_code=N unreadable=N undecodable=N truncated=0 seconds=S
 ```
 
 `bvh` is the number of BVH intersections left in the translated program, and `native`, `oracle`, `lane`, `empty` and `emulated`
@@ -654,6 +655,7 @@ stopped; `phase` and a `stop` text, scrubbed of hashes and paths, say where) or 
 (Vulkan 1.3 validation with the driver's options) or `none`. `missing_code` counts the manifest modules whose code the cache does not
 hold, `undecodable` the programs the decoder stopped on, and `truncated` is 1 when the cache ends in a half-written record. The exit
 code is 0 when the survey ran, 2 when the cache cannot be read and 64 for a wrong command line.
+`code_only_wave_known` counts code-only RT compute programs for which the probe inferred a wave size.
 [`tools/rt_survey.py`](../../tools/rt_survey.py) runs the probe and writes the report that players attach to the survey issue; see
 [the ray tracing survey](../user/ANYKYTY.md#ray-tracing-survey).
 

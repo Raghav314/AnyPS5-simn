@@ -106,6 +106,7 @@ struct Decoded {
     std::uint32_t bvh = 0;
     std::uint32_t exportsPosition = 0;
     std::uint32_t exportsTarget = 0;
+    std::uint32_t wave = 0;
     bool stopped = false;
 };
 
@@ -258,6 +259,7 @@ Decoded Inspect(const Recompiler::ShaderSource& source) {
             else if (inst.exp.target <= 8) ++decoded.exportsTarget;
         }
     }
+    decoded.wave = Recompiler::Decoder::ExecWaveSize(source.decoded);
     return decoded;
 }
 
@@ -504,6 +506,7 @@ int RunSurvey(const SurveySettings& settings) {
     }
 
     std::uint32_t orphans = 0;
+    std::uint32_t sized = 0;
     std::vector<const CachedShaderEntry*> unlisted;
     for (const auto& entry: index.entries) {
         if (!listed.contains(entry.hash)) unlisted.push_back(&entry);
@@ -535,7 +538,9 @@ int RunSurvey(const SurveySettings& settings) {
             rows.push_back(std::move(row));
             continue;
         }
+        if (decoded->wave != 0) ++sized;
         for (const std::uint32_t wave: {64u, 32u}) {
+            if (decoded->wave != 0 && decoded->wave != wave) continue;
             Prepared guess{DefaultComputeModule(wave), {}, {}};
             guess.module.code_hash = entry->hash;
             Prepare(guess, settings, {});
@@ -560,8 +565,8 @@ int RunSurvey(const SurveySettings& settings) {
     }
     const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
     std::printf("summary records=%zu manifest_modules=%zu manifest_skipped=%u code_only=%u programs=%u intersections=%u "
-                "missing_code=%u unreadable=%u undecodable=%u truncated=%d seconds=%.1f\n",
-                index.entries.size(), manifest.modules.size(), skipped, orphans, programs, intersections, missing, unreadable,
+                "code_only_wave_known=%u missing_code=%u unreadable=%u undecodable=%u truncated=%d seconds=%.1f\n",
+                index.entries.size(), manifest.modules.size(), skipped, orphans, programs, intersections, sized, missing, unreadable,
                 undecodable, index.truncated ? 1 : 0, seconds);
     return 0;
 }
