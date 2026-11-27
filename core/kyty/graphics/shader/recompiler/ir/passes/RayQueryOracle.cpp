@@ -174,7 +174,7 @@ size_t MarkWalksEmpty(Program& program) {
 				continue;
 			}
 			if (inst.GetOpcode() != ValueOpcode::BvhIntersect) continue;
-			inst.SetFlags((flags & ~BvhIntersectOracle & ~BvhIntersectOracleLane) | BvhIntersectEmpty | BvhIntersectStrict);
+			inst.SetFlags((flags & ~BvhIntersectOracle & ~BvhIntersectOracleLane & ~BvhIntersectOracleMulti) | BvhIntersectEmpty | BvhIntersectStrict);
 			marked += (flags & (BvhIntersectNative | BvhIntersectEmpty)) == 0 ? 1u : 0u;
 		}
 	}

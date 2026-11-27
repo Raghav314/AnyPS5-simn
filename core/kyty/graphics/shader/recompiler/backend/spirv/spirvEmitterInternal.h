@@ -89,10 +89,25 @@ struct OracleLaneVariables {
 	uint32_t proposed      = 0;
 	uint32_t proposed_blas = 0;
 	uint32_t proposed_root = 0;
+	uint32_t first         = 0;
+	uint32_t top_root      = 0;
+	uint32_t nodes         = 0;
+	uint32_t slots         = 0;
+};
+
+struct OracleSourceVariables {
+	uint32_t valid = 0;
+	uint32_t first = 0;
+	uint32_t root  = 0;
+	uint32_t tlas  = 0;
+	uint32_t nodes = 0;
+	uint32_t slots = 0;
 };
 
 struct OracleVariables {
 	std::array<OracleLaneVariables, 2> lanes {};
+	std::vector<OracleSourceVariables> extra;
+	bool                               multi = false;
 	std::array<uint32_t, 2>            results {};
 	uint32_t                           valid    = 0;
 	uint32_t                           context  = 0;

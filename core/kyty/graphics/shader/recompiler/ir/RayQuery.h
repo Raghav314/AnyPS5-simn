@@ -14,6 +14,7 @@ constexpr uint32_t BvhIntersectOracle = 1u << 9;
 constexpr uint32_t BvhIntersectOracleLane = 1u << 10;
 constexpr uint32_t BvhIntersectEmpty = 1u << 11;
 constexpr uint32_t BvhIntersectStrict = 1u << 12;
+constexpr uint32_t BvhIntersectOracleMulti = 1u << 13;
 constexpr uint32_t RayQueryListSize = 32;
 
 enum class RayQueryResultKind : uint32_t {

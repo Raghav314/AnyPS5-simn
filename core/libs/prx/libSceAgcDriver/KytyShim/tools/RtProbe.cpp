@@ -202,6 +202,12 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 		            translated.oracle_sources.size(), hypothesis.user_sgpr, hypothesis.header_offset, hypothesis.header_vsharp,
 		            hypothesis.root, hypothesis.layout[0], hypothesis.layout[1], hypothesis.layout[2], hypothesis.layout[3]);
 	}
+	for (size_t at = 0; at < info.ray_query_extra_sources.size(); ++at) {
+		const auto& extra = info.ray_query_extra_sources[at];
+		std::printf("%s: extra source %zu/%zu user_sgpr=%u header=0x%x vsharp=0x%x root=0x%x layout=%08x,%08x,%08x,%08x\n", label, at,
+		            info.ray_query_extra_sources.size(), extra.user_sgpr, extra.header_offset, extra.header_vsharp, extra.root, extra.layout[0],
+		            extra.layout[1], extra.layout[2], extra.layout[3]);
+	}
 	for (size_t at = 0; at < translated.oracle_improvements.size(); ++at) {
 		const auto& improvement = translated.oracle_improvements[at];
 		std::printf("%s: improvement %zu/%zu option=0x%x mask=%u:%u:%u\n", label, at, translated.oracle_improvements.size(),

@@ -685,6 +685,21 @@ public:
 				}
 			}
 		}
+		if (const auto mine = SignedRead(value)) {
+			const auto* read  = mine->first.TryInstruction();
+			const auto  words = Word(mine->first);
+			for (uint32_t k = 0; k < 6; ++k) {
+				for (const auto other: world[k]) {
+					const auto theirs = SignedRead(other);
+					if (!theirs || theirs->second != mine->second) continue;
+					const auto* same_read = theirs->first.TryInstruction();
+					if (same_read == read) return {Single(k, One)};
+					if (same_read->GetOpcode() != read->GetOpcode() || words.size() != 1) continue;
+					const auto same = Word(theirs->first);
+					if (same.size() == 1 && same.front() == words.front()) return {Single(k, One)};
+				}
+			}
+		}
 		if (value.IsImmediate()) {
 			const auto bits = value.GetType() == Type::F32 ? std::bit_cast<uint32_t>(value.F32Value())
 			                  : value.GetType() == Type::U32 ? value.U32()
@@ -698,6 +713,27 @@ public:
 		auto result = FloatOf(*inst, value, world, depth);
 		m_floats[inst] = result;
 		return result;
+	}
+
+	std::optional<std::pair<Value, bool>> SignedRead(Value value) {
+		bool negated = false;
+		for (uint32_t depth = 0; depth < 8; ++depth) {
+			value            = value.Resolve();
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr) return std::nullopt;
+			switch (inst->GetOpcode()) {
+				case ValueOpcode::BitCastF32U32:
+				case ValueOpcode::BitCastU32F32: value = inst->Arg(0); continue;
+				case ValueOpcode::FPNeg32:
+					negated = !negated;
+					value   = inst->Arg(0);
+					continue;
+				case ValueOpcode::ReadConstBuffer:
+				case ValueOpcode::LoadAddressU32: return std::pair {value, negated};
+				default: return BufferWordRead(value) != nullptr ? std::optional {std::pair {value, negated}} : std::nullopt;
+			}
+		}
+		return std::nullopt;
 	}
 
 	std::vector<FForm> FloatOf(const Inst& node, Value value, const World& world, uint32_t depth) {
@@ -1822,23 +1858,48 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	std::vector<uint32_t> keys;
 	std::vector<std::pair<uint32_t, uint64_t>> inlined;
 	std::optional<bool>   packed;
-	for (const auto& site: sites) {
-		for (const auto& blas: site.blases) {
-			const auto record = RecordOf(store, blas.address, header);
-			if (!record) continue;
-			if (packed && *packed != blas.packed) return Refuse("the BLAS address is read two ways");
-			packed = blas.packed;
-			if (record->indexed) {
-				if (indexed && (indexed->base != record->base || indexed->stride != record->stride || indexed->offset != record->offset)) {
-					return Refuse("several instance record arrays");
+	std::vector<bool> accepted(named_sources.size(), false);
+	for (size_t named = 0; named < named_sources.size(); ++named) {
+		auto                                        own_indexed = indexed;
+		auto                                        own_packed  = packed;
+		std::vector<uint32_t>                       own_keys;
+		std::vector<std::pair<uint32_t, uint64_t>> own_inlined;
+		const char*                                 conflict = nullptr;
+		for (const auto& site: sites) {
+			for (const auto& blas: site.blases) {
+				const auto record = RecordOf(store, blas.address, std::get<1>(named_sources[named]));
+				if (!record) continue;
+				if (own_packed && *own_packed != blas.packed) conflict = "the BLAS address is read two ways";
+				own_packed = blas.packed;
+				if (record->indexed) {
+					if (own_indexed && (own_indexed->base != record->base || own_indexed->stride != record->stride ||
+					                    own_indexed->offset != record->offset)) {
+						conflict = "several instance record arrays";
+					}
+					if (!own_indexed) own_indexed = record;
+					own_keys.push_back(record->key);
+				} else {
+					own_inlined.emplace_back(record->key, record->offset);
 				}
-				if (!indexed) indexed = record;
-				keys.push_back(record->key);
-			} else {
-				inlined.emplace_back(record->key, record->offset);
 			}
 		}
+		if (conflict != nullptr) {
+			if (named == 0) return Refuse(conflict);
+			continue;
+		}
+		accepted[named] = true;
+		indexed         = own_indexed;
+		packed          = own_packed;
+		keys.insert(keys.end(), own_keys.begin(), own_keys.end());
+		inlined.insert(inlined.end(), own_inlined.begin(), own_inlined.end());
 	}
+	const auto record_of = [&](uint32_t address) {
+		for (size_t named = 0; named < named_sources.size(); ++named) {
+			if (!accepted[named]) continue;
+			if (auto record = RecordOf(store, address, std::get<1>(named_sources[named]))) return record;
+		}
+		return std::optional<Record> {};
+	};
 	const auto tied = [&](const Form& form, uint32_t named) {
 		const auto top  = store.F(named);
 		auto       rest = form.terms;
@@ -2188,7 +2249,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 				for (auto& inst: *block) {
 					if (inst.GetOpcode() != ValueOpcode::LoadAddressU32) continue;
 					const bool blas = std::ranges::any_of(ev.Address(inst), [&](uint32_t address) {
-						const auto record = RecordOf(store, address, header);
+						const auto record = record_of(address);
 						return record && (record->indexed ? record->offset == indexed->offset && record->stride == indexed->stride
 						                                  : record->key == fields.inline_key && !inlined.empty() && record->offset == inlined.front().second);
 					});
@@ -2209,14 +2270,34 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	}
 	OracleWalks walks;
 	std::vector<std::pair<uint32_t, uint32_t>> reach;
+	std::vector<uint32_t> listed(named_sources.size(), UINT32_MAX);
+	for (size_t named = 0; named < named_sources.size(); ++named) {
+		if (!accepted[named]) continue;
+		const auto& source = std::get<0>(named_sources[named]);
+		listed[named]      = static_cast<uint32_t>(walks.headers.size());
+		walks.headers.push_back({source.user_sgpr, source.header_offset, source.header_vsharp, 0, {}});
+	}
 	for (const auto& site: sites) {
 		if (!site.top) continue;
 		Block* header_block = OutermostLoop(program, site.bvh->Parent());
 		if (header_block == nullptr) return Refuse("a top-level intersection is not in a natural loop");
-		if (std::ranges::any_of(walks.loops, [&](const auto& loop) { return loop.first == header_block; })) continue;
-		Block* latch = nullptr;
-		if (!Reach(program, header_block, reach, latch)) return Refuse("the walk has no code range");
-		walks.loops.emplace_back(header_block, latch);
+		const auto known = std::ranges::find_if(walks.loops, [&](const auto& loop) { return loop.first == header_block; });
+		auto       at    = static_cast<size_t>(known - walks.loops.begin());
+		if (known == walks.loops.end()) {
+			Block* latch = nullptr;
+			if (!Reach(program, header_block, reach, latch)) return Refuse("the walk has no code range");
+			walks.loops.emplace_back(header_block, latch);
+			walks.loop_headers.emplace_back();
+			at = walks.loops.size() - 1;
+		}
+		for (const auto base: site.bases) {
+			const auto named = SourceOf(store, base);
+			if (!named) continue;
+			const auto found = std::ranges::find_if(named_sources, [&](const auto& entry) { return std::get<0>(entry) == *named; });
+			const auto index = listed[static_cast<size_t>(found - named_sources.begin())];
+			auto&      list  = walks.loop_headers[at];
+			if (index != UINT32_MAX && std::ranges::find(list, index) == list.end()) list.push_back(index);
+		}
 	}
 	for (const auto& site: sites) {
 		if (std::ranges::none_of(walks.loops, [&](const auto& loop) {

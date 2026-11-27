@@ -47,6 +47,8 @@ struct NativeTraversalOptions {
 	const Decoder::Program* decoded = nullptr;
 };
 
+[[nodiscard]] bool CompatibleRecordLayouts(std::array<uint32_t, 4> a, std::array<uint32_t, 4> b);
+
 [[nodiscard]] NativeTraversals TraceNativeTraversals(Program&                      program,
                                                      const NativeTraversalOptions& options);
 

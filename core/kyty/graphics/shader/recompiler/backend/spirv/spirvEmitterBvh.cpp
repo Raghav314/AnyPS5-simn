@@ -241,7 +241,7 @@ uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
 namespace {
 
 constexpr uint32_t ServedFlags    = IR::BvhIntersectNative | IR::BvhIntersectOracle | IR::BvhIntersectEmpty;
-constexpr uint32_t IntersectFlags = ServedFlags | IR::BvhIntersectOracleLane | IR::BvhIntersectStrict;
+constexpr uint32_t IntersectFlags = ServedFlags | IR::BvhIntersectOracleLane | IR::BvhIntersectStrict | IR::BvhIntersectOracleMulti;
 
 bool KeepsGuestLanes(const IR::Inst& init, const std::array<bool, IR::MaxRayQuerySites>* alpha_sites) {
 	const auto& allow = init.Arg(14);

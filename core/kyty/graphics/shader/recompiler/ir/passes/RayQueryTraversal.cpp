@@ -5550,6 +5550,22 @@ void RewriteClosestLaneWalk(Program& program, PacketWalk& w, uint32_t site) {
 
 }
 
+bool CompatibleRecordLayouts(std::array<uint32_t, 4> a, std::array<uint32_t, 4> b) {
+	const auto canonical = [](std::array<uint32_t, 4> layout) {
+		layout[1] &= ~(1u << 29u);
+		layout[2] &= ~(15u << 9u | 1u << 13u | 31u << 14u);
+		layout[3] &= ~(3u << 26u);
+		return layout;
+	};
+	const auto unmasked = [&](std::array<uint32_t, 4> layout) {
+		layout     = canonical(layout);
+		layout[2] &= ~(15u | 31u << 4u | 1u << 19u | 31u << 25u);
+		layout[3] &= ~(3u << 24u);
+		return layout;
+	};
+	return canonical(a) == canonical(b) || unmasked(a) == unmasked(b);
+}
+
 NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOptions& options) {
 	NativeTraversals result;
 	const bool       compute = program.stage == ShaderType::Compute;
@@ -5572,6 +5588,8 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		LaneMaskWalk lane;
 		Block*       header = nullptr;
 		Block*       latch  = nullptr;
+		std::vector<RayQueryExtraSource> headers;
+		bool                             foreign = false;
 
 		LaneMaskWalk& Shape() { return kind == Kind::LaneMask || kind == Kind::Universal ? lane : packet.shape; }
 	};
@@ -5638,25 +5656,43 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		for (auto* bvh: intersections) {
 			if (!inside(bvh->Parent())) left.push_back(bvh);
 		}
-		const auto derived = left.empty() ? OracleWalks {} : DeriveOracleWalks(program, left);
-		if (!left.empty() && derived.refusal == nullptr) {
-			hypotheses   = derived.sources;
-			improvements = derived.improvements;
+		bool reached = false;
+		for (uint32_t pass = 0; pass < 4 && !left.empty(); ++pass) {
+			const auto derived = DeriveOracleWalks(program, left);
+			if (derived.refusal != nullptr) {
+				LOGF("%s universal ray tracing: hash=0x%016llx derives no source: %s (%u)\n", compute ? "CS" : "PS",
+				     static_cast<unsigned long long>(program.shader_hash), derived.refusal, derived.detail);
+				break;
+			}
+			if (pass == 0) {
+				hypotheses   = derived.sources;
+				improvements = derived.improvements;
+			}
 			Walk walk;
 			walk.kind                   = Kind::Universal;
 			walk.lane.source            = derived.sources.front();
 			walk.lane.layout.mask_shift = walk.lane.source.layout[2] >> 4u & 31u;
+			std::vector<Inst*> unserved;
 			for (size_t at = 0; at < derived.loops.size(); ++at) {
 				auto each   = walk;
 				each.header = derived.loops[at].first;
 				each.latch  = derived.loops[at].second;
-				if (at != 0) each.lane.source.reach.clear();
+				for (const auto index: derived.loop_headers[at]) {
+					const auto& named = derived.headers[index];
+					each.headers.push_back({named.user_sgpr, named.header_offset, named.header_vsharp, walk.lane.source.root, walk.lane.source.layout});
+				}
+				if (each.headers.empty()) {
+					for (auto* bvh: left) {
+						if (InLoop(program, bvh->Parent(), each.header, each.latch)) unserved.push_back(bvh);
+					}
+					continue;
+				}
+				if (reached || pass != 0) each.lane.source.reach.clear();
+				reached = true;
 				walks.push_back(std::move(each));
 			}
-			left.clear();
-		} else if (!left.empty()) {
-			LOGF("%s universal ray tracing: hash=0x%016llx derives no source: %s (%u)\n", compute ? "CS" : "PS",
-			     static_cast<unsigned long long>(program.shader_hash), derived.refusal, derived.detail);
+			if (unserved.size() == left.size()) break;
+			left = std::move(unserved);
 		}
 	}
 	if (walks.empty()) {
@@ -5672,18 +5708,6 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			reference = walk.Shape().source;
 		}
 	}
-	const auto canonical = [](std::array<uint32_t, 4> layout) {
-		layout[1] &= ~(1u << 29u);
-		layout[2] &= ~(15u << 9u | 1u << 13u | 31u << 14u);
-		layout[3] &= ~(3u << 26u);
-		return layout;
-	};
-	const auto unmasked = [&](std::array<uint32_t, 4> layout) {
-		layout     = canonical(layout);
-		layout[2] &= ~(15u | 31u << 4u | 1u << 19u | 31u << 25u);
-		layout[3] &= ~(3u << 24u);
-		return layout;
-	};
 	const auto shares = [&](Walk& each) {
 		auto&       walk   = each.Shape();
 		const auto& source = walk.source;
@@ -5693,7 +5717,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		}
 		if (source.layout == reference.layout) return true;
 		if (each.kind == Kind::Universal) {
-			if (canonical(source.layout) != canonical(reference.layout) && unmasked(source.layout) != unmasked(reference.layout)) return false;
+			if (!CompatibleRecordLayouts(source.layout, reference.layout)) return false;
 			walk.source.layout = reference.layout;
 			return true;
 		}
@@ -5735,8 +5759,56 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		extra_sources.push_back(extra);
 		return true;
 	};
+	const auto adopt = [&](Walk& each) {
+		auto&      source = each.Shape().source;
+		const auto same   = [&](const RayQueryExtraSource& a, uint32_t user_sgpr, uint32_t header_offset, uint32_t header_vsharp) {
+			return a.user_sgpr == user_sgpr && a.header_offset == header_offset && a.header_vsharp == header_vsharp;
+		};
+		if (each.headers.empty()) return false;
+		const bool primary = std::ranges::any_of(each.headers, [&](const RayQueryExtraSource& extra) {
+			return same(extra, reference.user_sgpr, reference.header_offset, reference.header_vsharp);
+		});
+		if (primary) std::erase_if(each.headers, [&](const RayQueryExtraSource& extra) {
+			return !same(extra, reference.user_sgpr, reference.header_offset, reference.header_vsharp);
+		});
+		bool foreign = false;
+		for (auto extra: each.headers) {
+			if (same(extra, reference.user_sgpr, reference.header_offset, reference.header_vsharp)) {
+				if (extra.root != reference.root || !CompatibleRecordLayouts(extra.layout, reference.layout)) return false;
+				continue;
+			}
+			foreign        = true;
+			const auto old = std::ranges::find_if(extra_sources, [&](const RayQueryExtraSource& other) {
+				return same(other, extra.user_sgpr, extra.header_offset, extra.header_vsharp);
+			});
+			if (old != extra_sources.end()) {
+				if (old->root != extra.root || !CompatibleRecordLayouts(old->layout, extra.layout)) return false;
+				continue;
+			}
+			if (extra_sources.size() + 1 >= MaxRayQuerySources) return false;
+			extra_sources.push_back(extra);
+		}
+		each.foreign = foreign;
+		if (!foreign) source.layout = reference.layout;
+		return true;
+	};
 	std::erase_if(walks, [&](Walk& walk) {
-		if (shares(walk) || separate(walk)) return false;
+		if (walk.kind == Kind::Universal) {
+			auto bound = extra_sources;
+			if (adopt(walk)) return false;
+			extra_sources = std::move(bound);
+			walk.foreign  = false;
+		}
+		if (shares(walk) || separate(walk)) {
+			const auto primary = [&](const RayQueryExtraSource& named) {
+				return named.user_sgpr == reference.user_sgpr && named.header_offset == reference.header_offset && named.header_vsharp == reference.header_vsharp;
+			};
+			if (walk.kind == Kind::Universal && !walk.headers.empty() && std::ranges::none_of(walk.headers, primary)) {
+				LOGF("%s universal ray tracing: hash=0x%016llx binds a walk that starts from another tree to the primary tree\n", compute ? "CS" : "PS",
+				     static_cast<unsigned long long>(program.shader_hash));
+			}
+			return false;
+		}
 		const auto kept = std::ranges::count_if(intersections, [&](const Inst* bvh) { return InLoop(program, bvh->Parent(), walk.header, walk.latch); });
 		LOGF("%s universal ray tracing: hash=0x%016llx keeps %zu intersections on the guest walk: another walk of the program names another source or layout\n",
 		     compute ? "CS" : "PS", static_cast<unsigned long long>(program.shader_hash), static_cast<size_t>(kept));
@@ -5773,8 +5845,11 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			for (auto* bvh: intersections) {
 				if (InLoop(program, bvh->Parent(), walk.header, walk.latch)) served.push_back(bvh);
 			}
-			if (RewriteResultsWalk(program, options, walk.header, walk.latch, served, result, site)) { ++result.sites; hypotheses.clear(); improvements.clear(); continue; }
+			if (!walk.foreign && RewriteResultsWalk(program, options, walk.header, walk.latch, served, result, site)) { ++result.sites; hypotheses.clear(); improvements.clear(); continue; }
 			if (const auto flags = options.emulation ? MarkOracleWalk(served) : 0u; flags != 0) {
+				if (walk.foreign) {
+					for (auto* bvh: served) bvh->SetFlags(bvh->Flags<uint32_t>() | BvhIntersectOracleMulti);
+				}
 				LOGF("%s universal ray tracing: hash=0x%016llx answers %zu intersections from the host query (%s mode, %s source)\n",
 				     compute ? "CS" : "PS", static_cast<unsigned long long>(program.shader_hash), served.size(),
 				     (flags & BvhIntersectOracleLane) != 0 ? "lane" : "wave", walk.kind == Kind::Universal ? "evaluated" : "form");

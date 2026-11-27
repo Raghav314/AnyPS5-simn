@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryResults.h"
 #include "graphics/shader/recompiler/ir/passes/RayQuerySource.h"
+#include "graphics/shader/recompiler/ir/passes/RayQueryTraversal.h"
 
 #include <array>
 #include <bit>
@@ -195,7 +196,7 @@ void TriangleIndexSpirv() {
 enum class HighWord { Exact, StrideBit, SwizzleBit };
 
 struct SourceWalk {
-    IR::Block              entry, header, body, latch, merge;
+    IR::Block              entry, header, body, latch, merge, second_header, second_body, second_latch, second_merge;
     IR::Program            program;
     IR::Block*             block = &entry;
     std::vector<IR::Inst*> sites;
@@ -243,55 +244,76 @@ void Link(IR::Block& from, IR::Block& to) {
     from.AddBranch(&to);
 }
 
-IR::OracleWalks DeriveWithHighWord(HighWord kind) {
-    using Op = IR::ValueOpcode;
-    SourceWalk walk;
-    walk.program.blocks = {&walk.entry, &walk.header, &walk.body, &walk.latch, &walk.merge};
-    walk.program.stage  = Libs::Graphics::ShaderType::Compute;
-    uint32_t pc = 0;
+struct Loop {
+    IR::Block& before;
+    IR::Block& header;
+    IR::Block& body;
+    IR::Block& latch;
+    IR::Block& merge;
+};
+
+void Number(SourceWalk& walk) {
+    walk.program.stage = Libs::Graphics::ShaderType::Compute;
+    uint32_t pc        = 0;
     for (auto* block: walk.program.blocks) {
         block->start_pc = pc;
         block->end_pc   = pc += 16;
     }
-    const auto u32  = [](uint32_t value) { return IR::Value(value); };
-    const auto word = static_cast<uint64_t>(IR::Type::U32);
-    const auto user = [&](uint32_t reg) { return walk.Add(Op::GetUserData, {IR::Value(IR::ScalarReg {reg})}); };
+}
+
+std::array<IR::Value, 2> UserHeader(SourceWalk& walk, uint32_t offset) {
+    using Op           = IR::ValueOpcode;
+    walk.block         = &walk.entry;
+    const auto user    = [&](uint32_t reg) { return walk.Add(Op::GetUserData, {IR::Value(IR::ScalarReg {reg})}); };
     const auto pointer = walk.Add(Op::GetAddressResource, {user(4), user(5)});
+    return {walk.LoadAddress(pointer, offset), walk.LoadAddress(pointer, offset + 4)};
+}
+
+std::array<IR::Value, 6> UserRay(SourceWalk& walk) {
+    walk.block = &walk.entry;
     std::array<IR::Value, 6> ray;
-    for (uint32_t k = 0; k < 6; ++k) ray[k] = user(8 + k);
-    const auto header_low  = walk.LoadAddress(pointer, 0x20);
-    const auto header_high = walk.LoadAddress(pointer, 0x24);
+    for (uint32_t k = 0; k < 6; ++k) ray[k] = walk.Add(IR::ValueOpcode::GetUserData, {IR::Value(IR::ScalarReg {8 + k})});
+    return ray;
+}
+
+void BuildWalk(SourceWalk& walk, const Loop& loop, std::array<IR::Value, 2> header, const std::array<IR::Value, 6>& ray, HighWord kind) {
+    using Op               = IR::ValueOpcode;
+    const auto u32         = [](uint32_t value) { return IR::Value(value); };
+    const auto word        = static_cast<uint64_t>(IR::Type::U32);
+    const auto header_low  = header[0];
+    const auto header_high = header[1];
+    walk.block             = &loop.before;
     const auto root        = walk.Add(Op::ShiftRightLogical64, {walk.Add(Op::CompositeConstructU64, {header_low, header_high}), u32(3)});
     const auto root_low    = walk.Add(Op::CompositeExtractU64, {root, u32(0)});
     const auto root_high   = walk.Add(Op::CompositeExtractU64, {root, u32(1)});
-    Link(walk.entry, walk.header);
+    Link(loop.before, loop.header);
 
-    walk.block      = &walk.header;
-    auto& base_low  = walk.header.AppendNewInst(Op::Phi, {}, word);
-    auto& base_high = walk.header.AppendNewInst(Op::Phi, {}, word);
-    auto& node      = walk.header.AppendNewInst(Op::Phi, {}, word);
+    walk.block      = &loop.header;
+    auto& base_low  = loop.header.AppendNewInst(Op::Phi, {}, word);
+    auto& base_high = loop.header.AppendNewInst(Op::Phi, {}, word);
+    auto& node      = loop.header.AppendNewInst(Op::Phi, {}, word);
     std::array<IR::Inst*, 6> rays {};
     std::array<IR::Value, 6> current;
     for (uint32_t k = 0; k < 6; ++k) {
-        rays[k]    = &walk.header.AppendNewInst(Op::Phi, {}, word);
+        rays[k]    = &loop.header.AppendNewInst(Op::Phi, {}, word);
         current[k] = IR::Value(rays[k]);
     }
-    Link(walk.header, walk.body);
-    walk.header.terminator.merge_block    = &walk.merge;
-    walk.header.terminator.continue_block = &walk.latch;
-    walk.header.terminator.loop_header    = true;
+    Link(loop.header, loop.body);
+    loop.header.terminator.merge_block    = &loop.merge;
+    loop.header.terminator.continue_block = &loop.latch;
+    loop.header.terminator.loop_header    = true;
 
-    walk.block       = &walk.body;
+    walk.block       = &loop.body;
     const auto bvh   = walk.Intersect(walk.Offset(IR::Value(&base_low), IR::Value(&base_high), IR::Value(&node)), current);
     const auto child = walk.Add(Op::CompositeExtractU32x4, {bvh, u32(0)});
-    walk.body.condition              = walk.Add(Op::IEqual32, {child, u32(0xffffffffu)});
-    walk.body.terminator.kind        = CFG::TerminatorKind::ConditionalBranch;
-    walk.body.terminator.true_block  = &walk.merge;
-    walk.body.terminator.false_block = &walk.latch;
-    walk.body.AddBranch(&walk.merge);
-    walk.body.AddBranch(&walk.latch);
+    loop.body.condition              = walk.Add(Op::IEqual32, {child, u32(0xffffffffu)});
+    loop.body.terminator.kind        = CFG::TerminatorKind::ConditionalBranch;
+    loop.body.terminator.true_block  = &loop.merge;
+    loop.body.terminator.false_block = &loop.latch;
+    loop.body.AddBranch(&loop.merge);
+    loop.body.AddBranch(&loop.latch);
 
-    walk.block       = &walk.latch;
+    walk.block       = &loop.latch;
     const auto table = walk.Add(Op::GetAddressResource, {header_low, header_high});
     const auto low   = walk.Add(Op::IAdd32, {header_low, walk.LoadAddress(table, 0x30)});
     const auto carry = walk.Add(Op::SelectU32, {walk.Add(Op::ULessThan32, {low, header_low}), u32(1), u32(0)});
@@ -320,19 +342,76 @@ IR::OracleWalks DeriveWithHighWord(HighWord kind) {
     const auto next_low  = pick(record(12), IR::Value(&base_low));
     const auto next_high = pick(walk.Add(Op::BitwiseAnd32, {record(13), u32(0x3fffffu)}), IR::Value(&base_high));
     const auto next_node = pick(record(14), child);
-    Link(walk.latch, walk.header);
-    base_low.AddPhiOperand(&walk.entry, root_low);
-    base_low.AddPhiOperand(&walk.latch, next_low);
-    base_high.AddPhiOperand(&walk.entry, root_high);
-    base_high.AddPhiOperand(&walk.latch, next_high);
-    node.AddPhiOperand(&walk.entry, u32(5));
-    node.AddPhiOperand(&walk.latch, next_node);
+    Link(loop.latch, loop.header);
+    base_low.AddPhiOperand(&loop.before, root_low);
+    base_low.AddPhiOperand(&loop.latch, next_low);
+    base_high.AddPhiOperand(&loop.before, root_high);
+    base_high.AddPhiOperand(&loop.latch, next_high);
+    node.AddPhiOperand(&loop.before, u32(5));
+    node.AddPhiOperand(&loop.latch, next_node);
     for (uint32_t k = 0; k < 6; ++k) {
-        rays[k]->AddPhiOperand(&walk.entry, ray[k]);
-        rays[k]->AddPhiOperand(&walk.latch, pick(local[k], current[k]));
+        rays[k]->AddPhiOperand(&loop.before, ray[k]);
+        rays[k]->AddPhiOperand(&loop.latch, pick(local[k], current[k]));
     }
-    walk.merge.AppendNewInst(Op::Phi, {}, word).AddPhiOperand(&walk.body, child);
+    loop.merge.AppendNewInst(Op::Phi, {}, word).AddPhiOperand(&loop.body, child);
+}
+
+IR::OracleWalks DeriveWithHighWord(HighWord kind) {
+    SourceWalk walk;
+    walk.program.blocks = {&walk.entry, &walk.header, &walk.body, &walk.latch, &walk.merge};
+    Number(walk);
+    const auto ray    = UserRay(walk);
+    const auto header = UserHeader(walk, 0x20);
+    BuildWalk(walk, {walk.entry, walk.header, walk.body, walk.latch, walk.merge}, header, ray, kind);
     return IR::DeriveOracleWalks(walk.program, walk.sites);
+}
+
+struct TwoWalks {
+    SourceWalk             walk;
+    IR::NativeTraversals   traced;
+    std::array<uint32_t, 2> flags {};
+};
+
+void TraceTwoWalks(TwoWalks& two, uint32_t second_offset) {
+    auto& walk          = two.walk;
+    walk.program.blocks = {&walk.entry, &walk.header, &walk.body, &walk.latch, &walk.merge,
+                           &walk.second_header, &walk.second_body, &walk.second_latch, &walk.second_merge};
+    Number(walk);
+    const auto ray    = UserRay(walk);
+    const auto first  = UserHeader(walk, 0x20);
+    const auto second = UserHeader(walk, second_offset);
+    BuildWalk(walk, {walk.entry, walk.header, walk.body, walk.latch, walk.merge}, first, ray, HighWord::Exact);
+    BuildWalk(walk, {walk.merge, walk.second_header, walk.second_body, walk.second_latch, walk.second_merge}, second, ray, HighWord::Exact);
+    two.traced = IR::TraceNativeTraversals(walk.program, {.wave_size = 32, .rewrite = true, .oracle = IR::OracleRemaining | IR::OracleOnly});
+    for (size_t at = 0; at < 2 && at < walk.sites.size(); ++at) two.flags[at] = walk.sites[at]->Flags<uint32_t>();
+}
+
+void TwoTlasWalks() {
+    const auto multi = [](uint32_t flags) { return (flags & IR::BvhIntersectOracleMulti) != 0; };
+    const auto host  = [](uint32_t flags) { return (flags & IR::BvhIntersectOracle) != 0; };
+    TwoWalks   two;
+    TraceTwoWalks(two, 0x40);
+    Expect(two.traced.sites == 2 && host(two.flags[0]) && host(two.flags[1]), "both walks of a program over two TLASes are answered from the host query");
+    Expect(two.traced.source_valid && two.traced.header_offset == 0x20u, "the first walk's TLAS is the primary source");
+    Expect(two.traced.extra_sources.size() == 1 && two.traced.extra_sources.front().user_sgpr == 4u &&
+               two.traced.extra_sources.front().header_offset == 0x40u,
+           "the second walk's TLAS is bound as an extra source");
+    Expect(!multi(two.flags[0]), "the walk over the primary TLAS keeps the single-TLAS query");
+    Expect(multi(two.flags[1]), "the walk over the other TLAS selects its TLAS per lane");
+    TwoWalks same;
+    TraceTwoWalks(same, 0x20);
+    Expect(same.traced.sites == 2 && same.traced.extra_sources.empty() && !multi(same.flags[0]) && !multi(same.flags[1]),
+           "two walks over one TLAS bind no extra source and keep the single-TLAS query");
+}
+
+void RecordLayouts() {
+    constexpr std::array<uint32_t, 4> masked {0x76543210u, 0x3dc6ba98u, 0x000801dfu, 0u};
+    constexpr std::array<uint32_t, 4> plain {0x76543210u, 0x3dc6ba98u, 0u, 0u};
+    constexpr std::array<uint32_t, 4> reordered {0x76543201u, 0x3dc6ba98u, 0u, 0u};
+    Expect(IR::CompatibleRecordLayouts(masked, masked), "a record layout is compatible with itself");
+    Expect(IR::CompatibleRecordLayouts(masked, plain) && IR::CompatibleRecordLayouts(plain, masked),
+           "layouts that differ only in the mask fields read the same records");
+    Expect(!IR::CompatibleRecordLayouts(plain, reordered), "layouts that place record fields differently are not compatible");
 }
 
 void DescriptorHighWord() {
@@ -409,6 +488,8 @@ void EntryLanes() {
 int main() {
     EntryLanes();
     PrologueFlag();
+    TwoTlasWalks();
+    RecordLayouts();
     DescriptorHighWord();
     Marking();
     EmptyWalks();
