@@ -491,17 +491,27 @@ struct ChasedWalks {
     uint32_t second = 0;
 };
 
-void TraceChasedWalks(ChasedWalks& chased, bool lane_varying, bool scalar = false) {
+enum class ChasedSource { Address, Scalar, Lane, ShortBuffer };
+
+void TraceChasedWalks(ChasedWalks& chased, ChasedSource source) {
     auto& walk          = chased.two.walk;
     walk.program.blocks = {&walk.entry, &walk.header, &walk.body, &walk.latch, &walk.merge,
                            &walk.second_header, &walk.second_body, &walk.second_latch, &walk.second_merge};
     Number(walk);
     const auto ray    = UserRay(walk);
     const auto named  = UserHeader(walk, 0x20);
+    const bool scalar = source == ChasedSource::Scalar;
     if (scalar) walk.address_kind = IR::ResourceKind::ScalarAddress;
-    const auto table  = scalar ? UserHeader(walk, 0x23, 7) : UserHeader(walk, 0x1b4);
-    auto       low    = table[0];
-    if (lane_varying) low = walk.Add(IR::ValueOpcode::IAdd32, {low, walk.Add(IR::ValueOpcode::LaneId, {})});
+    auto table = scalar ? UserHeader(walk, 0x23, 7) : UserHeader(walk, 0x1b4);
+    if (source == ChasedSource::ShortBuffer) {
+        using Op = IR::ValueOpcode;
+        const auto reg = [&](uint32_t n) { return walk.Add(Op::GetUserData, {IR::Value(IR::ScalarReg {n})}); };
+        const auto buffer = walk.Add(Op::GetBufferResource, {reg(4), reg(5), IR::Value(4u), IR::Value(0x4000u)});
+        table = {walk.Load(Op::ReadConstBuffer, {buffer, IR::Value(0u)}, 0x1b4, false),
+                 walk.Load(Op::ReadConstBuffer, {buffer, IR::Value(0u)}, 0x1b8, false)};
+    }
+    auto low = table[0];
+    if (source == ChasedSource::Lane) low = walk.Add(IR::ValueOpcode::IAdd32, {low, walk.Add(IR::ValueOpcode::LaneId, {})});
     const auto high     = walk.Add(IR::ValueOpcode::BitwiseAnd32, {table[1], IR::Value(uint32_t {0xffffu})});
     const auto resource = walk.Add(IR::ValueOpcode::GetAddressResource, {low, high});
     const uint32_t offset = scalar ? 0x43 : 0x40;
@@ -516,20 +526,20 @@ void TraceChasedWalks(ChasedWalks& chased, bool lane_varying, bool scalar = fals
     chased.second     = walk.sites[1]->Flags<uint32_t>();
 }
 
-void UntracedWalk() {
+void UntracedWalk(ChasedSource source) {
     ChasedWalks chased;
-    TraceChasedWalks(chased, true);
+    TraceChasedWalks(chased, source);
     const auto& traced = chased.two.traced;
     Expect(traced.sites == 1 && traced.source_valid && traced.header_offset == 0x20u && traced.extra_sources.empty(),
            "a walk over a named TLAS is served although another walk's TLAS is not traced");
     Expect((chased.first & IR::BvhIntersectOracle) != 0, "the walk over the named TLAS is answered from the host query");
     Expect((chased.second & IR::BvhIntersectOracle) == 0 && (chased.second & IR::BvhIntersectEmpty) != 0,
-           "the walk over a TLAS whose header differs per lane stays empty");
+           "the walk stays empty when its header depends on a lane or an unchecked buffer read");
 }
 
 void ComputedHeader(bool scalar) {
     ChasedWalks chased;
-    TraceChasedWalks(chased, false, scalar);
+    TraceChasedWalks(chased, scalar ? ChasedSource::Scalar : ChasedSource::Address);
     const auto& traced = chased.two.traced;
     Expect(traced.source_valid && traced.header_offset == 0x20u && traced.extra_sources.size() == 1,
            "a walk over a TLAS reached through a pointer chain is served as an extra tree");
@@ -753,7 +763,8 @@ int main() {
     ScalarHeaderWalk();
     TwoTlasWalks();
     RecordLayouts();
-    UntracedWalk();
+    UntracedWalk(ChasedSource::Lane);
+    UntracedWalk(ChasedSource::ShortBuffer);
     ComputedHeader(false);
     ComputedHeader(true);
     HeaderPrograms();

@@ -96,6 +96,11 @@ public:
 	uint32_t Of(uint32_t atom, uint32_t width) { return Make({width, 0, {{atom, 1}}}); }
 	uint32_t Op(uint32_t width, Key args) { return Of(Atomic(Kind::Op, width, std::move(args)), width); }
 
+	uint32_t Load(uint32_t address, uint32_t bytes, bool descriptor_bounds = false) {
+		const uint32_t width = bytes * 8u;
+		return Of(Atomic(Kind::Load, width, {address, bytes, descriptor_bounds}), width);
+	}
+
 	uint32_t Add(uint32_t a, uint32_t b, uint64_t factor = 1) {
 		auto       form  = m_forms[a];
 		const auto other = m_forms[b];
@@ -162,7 +167,7 @@ public:
 			if (atom.width == 32) return Constant(32, 0);
 			if (atom.kind == Kind::Pointer) return Of(Atomic(Kind::Word, 32, {atom.args[0] + 1u}), 32);
 			if (atom.kind == Kind::Load) {
-				return Of(Atomic(Kind::Load, 32, {Add(static_cast<uint32_t>(atom.args[0]), Constant(64, 4)), 4}), 32);
+				return Load(Add(static_cast<uint32_t>(atom.args[0]), Constant(64, 4)), 4, atom.args[2] != 0);
 			}
 			if (atom.kind == Kind::Join) return static_cast<uint32_t>(atom.args[1]);
 		}
@@ -181,7 +186,7 @@ public:
 			}
 			if (l.kind == Kind::Load && h.kind == Kind::Load && l.args[1] == 4 && h.args[1] == 4 &&
 			    h.args[0] == Add(static_cast<uint32_t>(l.args[0]), Constant(64, 4))) {
-				return Of(Atomic(Kind::Load, 64, {l.args[0], 8}), 64);
+				return Load(static_cast<uint32_t>(l.args[0]), 8, l.args[2] != 0 || h.args[2] != 0);
 			}
 			if (l.kind == Kind::Half && h.kind == Kind::Half && l.args[0] == h.args[0] && l.args[1] == 0 && h.args[1] == 1) {
 				return static_cast<uint32_t>(l.args[0]);
@@ -203,7 +208,7 @@ private:
 		if (atom.width == 32) return Of(id, 32);
 		switch (atom.kind) {
 			case Kind::Pointer: return Of(Atomic(Kind::Word, 32, {atom.args[0]}), 32);
-			case Kind::Load: return Of(Atomic(Kind::Load, 32, {atom.args[0], 4}), 32);
+			case Kind::Load: return Load(static_cast<uint32_t>(atom.args[0]), 4, atom.args[2] != 0);
 			case Kind::Join: return static_cast<uint32_t>(atom.args[0]);
 			default: return Of(Atomic(Kind::Half, 32, {Of(id, 64), 0}), 32);
 		}
@@ -685,7 +690,7 @@ public:
 	Choices LoadedBufferWord(const Inst& load, uint32_t component) {
 		Choices result;
 		for (const auto address: LoadedBufferAddress(load)) {
-			result.push_back(m_store.Of(m_store.Atomic(Kind::Load, 32, {m_store.Add(address, m_store.Constant(64, component * 4u)), 4}), 32));
+			result.push_back(m_store.Load(m_store.Add(address, m_store.Constant(64, component * 4u)), 4, true));
 		}
 		return result;
 	}
@@ -1055,13 +1060,13 @@ private:
 				break;
 			case ValueOpcode::ReadConstBuffer:
 				for (const auto address: BufferAddress(*inst)) {
-					const auto wide = m_store.Of(m_store.Atomic(Kind::Load, 64, {address, 8}), 64);
+					const auto wide = m_store.Load(address, 8, true);
 					result.push_back({wide, m_store.Hi(wide), {}});
 				}
 				break;
 			case ValueOpcode::LoadAddressU32:
 				for (const auto address: Address(*inst)) {
-					const auto wide = m_store.Of(m_store.Atomic(Kind::Load, 64, {address, 8}), 64);
+					const auto wide = m_store.Load(address, 8);
 					result.push_back({wide, m_store.Hi(wide), {}});
 				}
 				break;
@@ -1204,12 +1209,12 @@ private:
 			}
 			case ValueOpcode::LoadAddressU32: {
 				Choices result;
-				for (const auto address: Address(inst)) result.push_back(m_store.Of(m_store.Atomic(Kind::Load, 32, {address, 4}), 32));
+				for (const auto address: Address(inst)) result.push_back(m_store.Load(address, 4));
 				return result.empty() ? Choices {Opaque(inst, 32)} : result;
 			}
 			case ValueOpcode::ReadConstBuffer: {
 				Choices result;
-				for (const auto address: BufferAddress(inst)) result.push_back(m_store.Of(m_store.Atomic(Kind::Load, 32, {address, 4}), 32));
+				for (const auto address: BufferAddress(inst)) result.push_back(m_store.Load(address, 4, true));
 				return result.empty() ? Choices {Opaque(inst, 32)} : result;
 			}
 			case ValueOpcode::LoadBufferU32: {
@@ -1352,7 +1357,7 @@ private:
 				Emit(HeaderOp::Join);
 				return true;
 			case Kind::Load:
-				if (a.args[1] != 4 && a.args[1] != 8) return false;
+				if (a.args[2] != 0) return false;
 				if (!Form(static_cast<uint32_t>(a.args[0]), depth)) return false;
 				Emit(HeaderOp::Load, {static_cast<uint32_t>(a.args[1])});
 				return true;
@@ -1463,7 +1468,7 @@ std::optional<Source> ProgramSourceOf(const Store& store, uint32_t form) {
 	const auto atom = store.AtomOf(form);
 	if (!atom) return std::nullopt;
 	const auto& a = store.A(*atom);
-	if (a.kind != Kind::Load || a.args[1] != 8) return std::nullopt;
+	if (a.kind != Kind::Load || a.args[1] != 8 || a.args[2] != 0) return std::nullopt;
 	auto program = HeaderProgramWriter(store).Write(static_cast<uint32_t>(a.args[0]));
 	if (!program) return std::nullopt;
 	return Source {0, 0, RayQueryHeaderProgram, std::move(*program)};
