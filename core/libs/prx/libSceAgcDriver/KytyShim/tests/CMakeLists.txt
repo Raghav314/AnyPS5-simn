@@ -547,6 +547,9 @@ if(NOT ANYPS5_KYTY_DLL)
     add_test(NAME kyty_shim_recompiler_mad_not_fused COMMAND kyty_shim_recompiler_robustness_tests mad-not-fused)
     set_tests_properties(kyty_shim_recompiler_mad_not_fused PROPERTIES TIMEOUT 60
             FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+    add_test(NAME kyty_shim_recompiler_correlated_phi COMMAND kyty_shim_recompiler_robustness_tests correlated-phi)
+    set_tests_properties(kyty_shim_recompiler_correlated_phi PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "correlated-phi: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 endif()
 
 add_test_executable(kyty_shim_compute_execution_tests ${CMAKE_CURRENT_SOURCE_DIR}/ComputeExecution.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
@@ -563,6 +566,10 @@ set_tests_properties(kyty_shim_compute_execution PROPERTIES TIMEOUT 20 SKIP_RETU
 add_test(NAME kyty_shim_compute_sampler_spill COMMAND kyty_shim_compute_execution_tests sampler-spill)
 set_tests_properties(kyty_shim_compute_sampler_spill PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "sampler spill: 32/32 lanes sampled 1.0" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_test(NAME kyty_shim_compute_correlated_phi COMMAND kyty_shim_compute_execution_tests correlated-phi)
+set_tests_properties(kyty_shim_compute_correlated_phi PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "correlated phi execution: folded, all lane outputs checked"
+        FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
 add_test_executable(kyty_shim_pair_codegen_tests ${CMAKE_CURRENT_SOURCE_DIR}/PairCodegen.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_pair_codegen_tests PRIVATE ${LIBS_INCLUDE_DIR})
