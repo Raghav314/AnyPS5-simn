@@ -152,7 +152,7 @@ def ask_model(context, key, model, final):
             "content-type": "application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=240 if final else 90) as response:
+    with urllib.request.urlopen(request, timeout=240 if final else 150) as response:
         result = json.load(response)
     for part in result.get("content", []):
         if part.get("type") == "tool_use" and part.get("name") == "maintenance":
@@ -244,9 +244,9 @@ def review(number, key, words, *, targeted=False):
         context["follow_up"] = latest_human["body"][:4000]
     if pull:
         context["base_branch"] = pull["base"]["ref"]
-        files = gh(pull_api(number, "/files?per_page=30")) if pull["changed_files"] <= 25 else []
+        files = paginated(pull_api(number, "/files?per_page=100")) if pull["changed_files"] <= 100 else []
         diff = [{"file": item["filename"], "patch": item.get("patch")} for item in files]
-        diff_limit = 90_000 if follow_up else 45_000
+        diff_limit = 400_000 if follow_up else 250_000
         if (
             len(diff) != pull["changed_files"] or any(item["patch"] is None for item in diff)
             or len(json.dumps(diff)) > diff_limit
