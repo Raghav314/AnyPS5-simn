@@ -76,17 +76,20 @@ bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 
 void SetComputeIndirectFloors(size_t keys, size_t images);
 
+bool HasIndirectBuffers(const ResourcePlan& program);
+bool IndirectBufferMaterializationFailed();
+bool IndirectSamplerMaterializationFailed();
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
 bool ReadsStrideAtRunTime(const ResourcePlan& program, uint32_t index,
                           const ResourceSpecialization::Buffer& buffer);
 void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& specialization);
+uint32_t FormattedReadComponents(const ResourcePlan& program, uint32_t index);
 #if defined(ANYPS5_KYTY)
 bool SharesEmptyBuffers();
 void ShareNullBufferVariants(const ResourcePlan& program, ResourceSpecialization& specialization,
                              bool runtime_stride);
-uint32_t FormattedReadComponents(const ResourcePlan& program, uint32_t index);
 std::optional<uint32_t> EmptyBufferReadBits(const ResourceSpecialization::Buffer& buffer, uint32_t component);
 bool SpecializedBuffersValid(const ResourceSpecialization& specialization, bool compute);
 bool EmptyBufferServes(const ResourcePlan& program, const ResourceSnapshot& snapshot, uint32_t index,
@@ -94,12 +97,19 @@ bool EmptyBufferServes(const ResourcePlan& program, const ResourceSnapshot& snap
                        const ResourceSpecialization::Buffer& candidate);
 bool EmptyBuffersServe(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                        const ResourceSpecialization& requested, const ResourceSpecialization& candidate);
+bool PopulatedBuffersCoverEmptySpecialization(const ResourcePlan& program, const ResourceSpecialization& empty,
+                                              const ResourceSpecialization& populated);
 bool SameModuleCode(const ResourcePlan& program, const ResourceSpecialization& requested,
                     const ResourceSpecialization& candidate);
 bool GenericComputeVariants();
 bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                     const ResourceSpecialization& specialization, const ResourceSpecialization& target,
                     ResourceSnapshot* aligned);
+bool CanRebindComputeImages(const ResourcePlan& program, const ResourceSpecialization& specialization,
+                            const ResourceSpecialization& target);
+bool RebindComputeImages(const ResourcePlan& program, const SrtRuntime& runtime, const ResourceSnapshot& snapshot,
+                         const ResourceSpecialization& specialization, const ResourceSpecialization& target,
+                         ResourceSnapshot& aligned);
 bool WidenSpecialization(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                          const ResourceSpecialization&                       specialization,
                          std::span<const ResourceSpecialization* const>      known,
@@ -110,7 +120,9 @@ bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& sn
 
 bool ImageTableSlotCompatible(const ImageResource& root, const DescriptorValue& descriptor);
 
-void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
+DescriptorValue RuntimeSamplerCandidate(const SamplerResource& sampler);
+uint64_t ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization,
+                                 uint32_t sampler_limit = UINT32_MAX);
 
 bool ResourceSpecializationFits(const Program& program, const ResourceSpecialization& specialization);
 

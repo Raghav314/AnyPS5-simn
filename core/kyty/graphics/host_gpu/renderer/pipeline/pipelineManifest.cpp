@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineManifest.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineShaderOptions.h"
 
 #include "common/alignment.h"
@@ -9,14 +10,17 @@
 #endif
 #include "common/file.h"
 #include "common/hackNotice.h"
+#include "common/hostStats.h"
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/renderer/pipeline/manifestStartup.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/fileSystem.h"
 #include "loader/guestOodle.h"
@@ -25,6 +29,7 @@
 #include <SDL3/SDL.h>
 #include <stb_image.h>
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <cctype>
 #include <charconv>
@@ -32,6 +37,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <functional>
 #include <cstring>
 #include <deque>
@@ -60,6 +66,8 @@ namespace {
 
 using ManifestText::ParseNumber;
 using ManifestText::Split;
+
+constexpr size_t LargeSpirvWords = 50'000;
 
 std::string SafeFileName(std::string name) {
 	for (auto& c: name) {
@@ -213,8 +221,14 @@ struct PipelineCache::ManifestState {
 	std::vector<std::vector<uint32_t>> module_pipelines;
 	std::vector<uint8_t>               missing_modules;
 	std::vector<uint32_t>              module_rank;
+	std::vector<size_t>                module_words;
 	std::deque<uint32_t>               module_jobs;
 	std::deque<uint32_t>               pipeline_jobs;
+	struct ComputeJob {
+		const ShaderModule* module;
+		bool from_assets;
+	};
+	std::deque<ComputeJob>             large_compute;
 	std::condition_variable_any        available;
 	uint32_t                           running = 0;
 
@@ -227,8 +241,14 @@ struct PipelineCache::ManifestState {
 	uint32_t                              pipelines        = 0;
 	uint32_t                              pipelines_known  = 0;
 	uint32_t                              pipelines_failed = 0;
+	size_t                                restored_graphics = 0;
 	uint32_t                              compute          = 0;
+	uint32_t                              compute_cached   = 0;
 	uint32_t                              compute_failed   = 0;
+	uint32_t                              unsupported     = 0;
+	uint32_t                              unreadable      = 0;
+	uint32_t                              small_built      = 0;
+	std::chrono::steady_clock::time_point last_small;
 	std::atomic<uint32_t>                 dropped {0};
 	uint64_t                              build_ns         = 0;
 	uint64_t                              pipeline_ns      = 0;
@@ -246,11 +266,103 @@ struct PipelineCache::ManifestState {
 	std::jthread                                            code_thread;
 	std::atomic<bool>                                       scanning {true};
 
+	std::condition_variable_any startup_finished;
+	uint32_t startup_total = 0;
+	uint32_t startup_done  = 0;
+	bool startup = false;
+
+	std::optional<ManifestStartupWait> startup_wait;
+	std::chrono::steady_clock::time_point next_memory_sample;
+	ManifestMemoryPause memory;
+
+	void ReleaseStartup(std::string_view reason) {
+		startup = false;
+		startup_finished.notify_all();
+		available.notify_all();
+		const auto now = std::chrono::steady_clock::now();
+		const auto timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+		ManifestLog("[kyty-startup] manifest_release monotonic_ns={} result={} elapsed_s={:.2f} jobs_finished={} jobs_total={}",
+		            timestamp, reason, Seconds(now - start), startup_done, startup_total);
+	}
+
+	bool WaitForMemory(const std::stop_token& stop) {
+		std::unique_lock lock(mutex);
+		while (startup && !stop.stop_requested()) {
+			const auto now = std::chrono::steady_clock::now();
+			if (now >= next_memory_sample) {
+				next_memory_sample = now + std::chrono::milliseconds(250);
+				if (const auto sample = Common::ReadSystemMemory()) {
+					const bool paused = memory.since.has_value();
+					memory.Sample(now, sample->total, sample->available);
+					if (paused != memory.since.has_value()) {
+						ManifestLog("Pipeline manifest: compilation {} ({:.1f} GiB available)",
+						            paused ? "resumed" : "paused", static_cast<double>(sample->available) / (1ull << 30));
+						startup_finished.notify_all();
+					}
+				}
+			}
+			const auto previous = memory.worker;
+			if (memory.Admit(now, std::this_thread::get_id())) {
+				if (memory.worker != previous) ManifestLog("Pipeline manifest: resuming one job under memory pressure");
+				break;
+			}
+			startup_finished.wait_until(lock, stop, next_memory_sample, [&] { return !startup || !memory.since; });
+		}
+		return !stop.stop_requested();
+	}
+
+	std::array<const ShaderModule*, 4> PipelineStages(const ManifestPipeline& pipeline) const {
+		std::array<const ShaderModule*, 4> stages {};
+		for (size_t i = 0; i < stages.size(); ++i) {
+			if (pipeline.stages[i] != ManifestPipeline::NoStage) stages[i] = modules[pipeline.stages[i]];
+		}
+		if (pipeline.plain_pixel && stages[3] != nullptr) stages[3] = stages[3]->plain.get();
+		return stages;
+	}
+
+	std::optional<AsyncPipelineJob> GraphicsJob(const ManifestPipeline& pipeline) const {
+		AsyncPipelineJob job {.key = pipeline.key, .stages = PipelineStages(pipeline)};
+		if (job.stages[0] == nullptr) return std::nullopt;
+		for (size_t i = 0; i < job.stages.size(); ++i) {
+			const auto* stage = job.stages[i];
+			if (pipeline.stages[i] != ManifestPipeline::NoStage && stage == nullptr) return std::nullopt;
+			job.key.stage_ids[i] = stage != nullptr ? stage->id : 0;
+		}
+		return job;
+	}
+
+#if defined(ANYPS5_KYTY)
+	static void PrioritizeRestoredCompute(std::deque<AsyncPipelineJob>& jobs) {
+		if (!ShaderRecompiler::IR::GenericComputeVariants() || !ShaderRecompiler::IR::SharesEmptyBuffers()) return;
+		std::unordered_map<const ShaderRecompiler::IR::ResourcePlan*, std::vector<AsyncPipelineJob*>> programs;
+		for (auto& job: jobs) {
+			if (job.compute && job.module->plan != nullptr) programs[job.module->plan].push_back(&job);
+		}
+		for (const auto& group: programs | std::views::values) {
+			if (group.size() < 2) continue;
+			std::vector<const ShaderModule*> order;
+			order.reserve(group.size());
+			std::ranges::transform(group, std::back_inserter(order),
+			                       [](const AsyncPipelineJob* job) { return job->module; });
+			std::ranges::stable_partition(order, [&](const ShaderModule* module) {
+				return std::ranges::none_of(group, [&](const AsyncPipelineJob* candidate) {
+					return CanCoverEmptyComputePipeline(*module, *candidate->module);
+				});
+			});
+			for (size_t i = 0; i < group.size(); i++) group[i]->module = order[i];
+		}
+	}
+#endif
+
 	void QueueModule(uint32_t index) {
-		module_jobs.insert(std::upper_bound(module_jobs.begin(), module_jobs.end(), module_rank[index],
-		                                    [this](uint32_t value, uint32_t job) {
-			                                    return value < module_rank[job];
-		                                    }),
+		const auto& module = warm_modules[index];
+		const auto words = [this](uint64_t hash) {
+			return hash != 0 ? code.at(hash).words->size() : size_t {0};
+		};
+		module_words[index] = words(module.code_hash) + words(module.back_hash);
+		const auto priority = [this](uint32_t i) { return std::pair {module_rank[i], module_words[i]}; };
+		module_jobs.insert(std::upper_bound(module_jobs.begin(), module_jobs.end(), priority(index),
+		                                    [&](const auto& value, uint32_t job) { return value < priority(job); }),
 		                   index);
 	}
 
@@ -462,51 +574,69 @@ const ShaderModule* PipelineCache::FindCompiledModule(
 	return nullptr;
 }
 
+PipelineCache::ProgramKey PipelineCache::ManifestProgramKey(const ManifestModule& record, bool guest_traversal,
+                                                          const ShaderComputeInputInfo* compute_input) {
+	ProgramKey key {.stage = record.stage, .hash = record.ProgramHash(),
+	                .user_data_count = record.user_data_count, .guest_traversal = guest_traversal};
+	if (compute_input != nullptr) {
+		BuildStageStaticKey(*compute_input, key.static_state);
+	} else {
+		key.static_state = StaticKey(record);
+	}
+	if (record.runtime_buffers) key.static_state.push_back(RuntimeBuffersKey);
+	if (record.runtime_samplers) key.static_state.push_back(RuntimeSamplersKey);
+	return key;
+}
+
+namespace {
+
+std::string ManifestStem(const std::string& title) {
+	std::string version;
+	Loader::SystemContentParamSfoGetString("APP_VER", &version);
+	return SafeFileName(version.empty() ? title : title + "_" + version);
+}
+
+std::filesystem::path ManifestAssetFolder() {
+	if (const char* base = SDL_GetBasePath(); base != nullptr) {
+		return Common::PathFromUtf8(base) / "assets" / "pipelines";
+	}
+	return {};
+}
+
+}
+
+bool PipelineCache::HasStartupPipelineData() {
+	if (Config::StartupWaitSeconds() == 0) return false;
+	const auto store = ShaderStorePath();
+	std::error_code error;
+	if (!store.empty() && std::filesystem::file_size(store, error) > 0 && !error) return true;
+	if (!Config::PipelineManifestEnabled()) return false;
+	const auto title = PipelineCacheTitleId();
+	if (title.empty()) return false;
+	const auto stem = ManifestStem(title);
+	const auto assets = ManifestAssetFolder();
+	std::vector<std::filesystem::path> folders;
+	if (!assets.empty()) folders.push_back(assets);
+	folders.push_back(PipelineCacheDirectory());
+	return !FindManifestFiles(folders, title, stem).empty();
+}
+
 void PipelineCache::OpenManifest() {
 	const bool warm   = Config::PipelineManifestEnabled();
 	const bool record = Config::PipelineManifestRecord() || warm;
 	const auto title  = PipelineCacheTitleId();
-	if ((!warm && !record) || title.empty()) {
-		return;
-	}
-	std::string version;
-	Loader::SystemContentParamSfoGetString("APP_VER", &version);
-	const auto stem = SafeFileName(version.empty() ? title : title + "_" + version);
+	if ((!warm && !record) || title.empty()) return;
+
+	const auto stem = ManifestStem(title);
 	const auto name = stem + ".kpm";
 	OpenUseOrder(PipelineCacheDirectory() / (stem + ".use"));
+	const auto assets = ManifestAssetFolder();
 	std::vector<std::filesystem::path> folders;
-	std::filesystem::path              assets;
-	if (const char* base = SDL_GetBasePath(); base != nullptr) {
-		assets = Common::PathFromUtf8(base) / "assets" / "pipelines";
-		folders.push_back(assets);
-	}
+	if (!assets.empty()) folders.push_back(assets);
 	folders.push_back(PipelineCacheDirectory());
-	std::vector<std::filesystem::path> files;
-	for (const auto& folder: folders) {
-		if (Common::File::IsFileExisting(folder / name)) {
-			files.push_back(folder / name);
-		}
-	}
-	auto shared_name = name;
-	shared_name.resize(shared_name.size() - std::string_view(".kpm").size());
-	shared_name += ".shared.kpm";
-	const auto shared_path = folders.back() / shared_name;
-	if (files.empty()) {
-		for (const auto& folder: folders) {
-			std::error_code error;
-			for (const auto& entry: std::filesystem::directory_iterator(folder, error)) {
-				const auto file = Common::PathToString(entry.path().filename());
-				if (file.starts_with(title + "_") && file.ends_with(".kpm")) {
-					files.push_back(entry.path());
-				}
-			}
-		}
-	}
-
-	if (Common::File::IsFileExisting(shared_path) &&
-	    std::ranges::find(files, shared_path) == files.end()) {
-		files.push_back(shared_path);
-	}
+	const auto shared_path = folders.back() / (stem + ".shared.kpm");
+	const auto files = FindManifestFiles(folders, title, stem);
+	const auto compute_name = std::filesystem::path(stem + ".compute.kpm");
 
 	m_manifest.reset(new ManifestState());
 	auto& state = *m_manifest;
@@ -533,8 +663,13 @@ void PipelineCache::OpenManifest() {
 			const auto start = std::chrono::steady_clock::now();
 			file.read = LoadManifest(ReadFile(files[i]), file.manifest, &file.skipped, &file.unlinked);
 			file.time = std::chrono::steady_clock::now() - start;
-			if (file.read) {
+			if (!file.read) continue;
+			if (files[i].filename() != compute_name) {
 				manifests.push_back(&file.manifest);
+				continue;
+			}
+			for (const auto& module: file.manifest.modules) {
+				if (module.stage == ShaderType::Compute) m_baked_stride_programs.insert(module.ProgramHash());
 			}
 		}
 		DecideRuntimeStrides(manifests);
@@ -546,10 +681,12 @@ void PipelineCache::OpenManifest() {
 		const auto start    = std::chrono::steady_clock::now() - file.time;
 		const auto& unlinked = file.unlinked;
 		if (!file.read) {
+			++state.unreadable;
 			ManifestLog("Pipeline manifest: ignoring {} (another format)",
 			            Common::PathToString(path));
 			continue;
 		}
+		state.unreadable += skipped;
 		if (Common::PathToString(path.filename()).ends_with(".shared.kpm")) {
 			loaded.tessellation_layouts.clear();
 		}
@@ -643,8 +780,27 @@ void PipelineCache::OpenManifest() {
 	} else {
 		AddManifestRecords(all);
 	}
-	for (size_t i = 0; i < Common::ParallelThreads(); i++) {
-		state.threads.emplace_back([this](const std::stop_token& stop) { ManifestWorker(stop); });
+#if defined(ANYPS5_KYTY)
+	ManifestState::PrioritizeRestoredCompute(m_restore_jobs);
+	state.restored_graphics = std::ranges::count(m_restore_jobs, false, &AsyncPipelineJob::compute);
+#endif
+	state.startup_total = static_cast<uint32_t>(state.warm_modules.size() + state.warm_pipelines.size() +
+	                                            m_restore_jobs.size());
+	state.startup_done = state.found;
+	state.scanning.store(!state.code.empty(), std::memory_order_relaxed);
+	state.startup = state.startup_total != state.startup_done && Config::StartupWaitSeconds() != 0;
+	const auto workers = Common::ParallelThreads();
+	if (state.startup) {
+		ManifestLog("Pipeline manifest: startup with {} workers, {} jobs ({} modules restored)", workers,
+		            state.startup_total, state.found);
+	} else {
+		const auto result = state.unsupported != 0 || state.unreadable != 0 ? "partial" : "ready";
+		state.ReleaseStartup(state.startup_total == state.startup_done ? result : "skipped");
+	}
+	for (size_t i = 0; i < workers; i++) {
+		state.threads.emplace_back([this, i](const std::stop_token& stop) {
+			ManifestWorker(stop, i < m_large_manifest_workers);
+		});
 	}
 	state.code_path   = folders.back() / (stem + ".code");
 	state.code_thread = std::jthread([this](const std::stop_token& stop) { CodeStoreThread(stop); });
@@ -669,13 +825,20 @@ std::pair<uint32_t, uint32_t> PipelineCache::AddManifestRecords(PipelineManifest
 	std::vector<uint32_t> indices(loaded.modules.size(), ManifestPipeline::NoStage);
 	std::vector<uint32_t> new_modules;
 	std::vector<uint32_t> new_pipelines;
+	uint32_t unsupported = 0;
 	const auto supported = [&](const ManifestModule& module) {
 		return module.stage != ShaderType::Mesh || m_graphics.mesh_shader_enabled;
 	};
 	auto next_module = static_cast<uint32_t>(state.warm_modules.size());
 	for (uint32_t i = 0; i < loaded.modules.size(); i++) {
 		auto& module = loaded.modules[i];
-		if (!supported(module)) continue;
+		if (!supported(module)) {
+			++unsupported;
+			ManifestLog("[kyty-startup] unresolved_module stage={} program={:016x} variant={:016x} reason=unsupported_stage",
+			            static_cast<unsigned>(module.stage), module.ProgramHash(),
+			            ManifestModuleIdentity(module, StaticKey(module)));
+			continue;
+		}
 		const auto [found, inserted] = state.warm_index.try_emplace(
 		    ManifestModuleIdentity(module, StaticKey(module)), next_module);
 		if (inserted) {
@@ -686,20 +849,41 @@ std::pair<uint32_t, uint32_t> PipelineCache::AddManifestRecords(PipelineManifest
 	}
 	for (uint32_t i = 0; i < loaded.pipelines.size(); i++) {
 		auto& pipeline = loaded.pipelines[i];
-		bool  dropped  = false;
-		for (auto& stage: pipeline.stages) {
-			if (stage != ManifestPipeline::NoStage) {
-				stage   = indices[stage];
-				dropped = dropped || stage == ManifestPipeline::NoStage;
-			}
+		const bool unsupported_stage = std::ranges::any_of(pipeline.stages, [&](auto stage) {
+			return stage != ManifestPipeline::NoStage && indices[stage] == ManifestPipeline::NoStage;
+		});
+		if (unsupported_stage) {
+			++unsupported;
+			ManifestLog("[kyty-startup] unresolved_graphics variant={:016x} reason=unsupported_stage",
+			            ManifestPipelineIdentity(pipeline));
+			continue;
 		}
-		if (!dropped && state.warm_pipeline_ids.insert(ManifestPipelineIdentity(pipeline)).second) {
+		for (auto& stage: pipeline.stages) {
+			if (stage != ManifestPipeline::NoStage) stage = indices[stage];
+		}
+		if (state.warm_pipeline_ids.insert(ManifestPipelineIdentity(pipeline)).second) {
 			new_pipelines.push_back(i);
 		}
 	}
+	std::vector<const ShaderModule*> cached(loaded.modules.size());
 	uint32_t new_layouts = 0;
 	{
 		LockPrograms();
+#if defined(ANYPS5_KYTY)
+		if (state.threads.empty() && !m_program_cache.empty()) {
+			const bool native = RayTracing::NativeTraversals();
+			for (const auto i: new_modules) {
+				const auto& record = loaded.modules[i];
+				const auto* hit = FindCompiledModule(ManifestProgramKey(record, false),
+				                                     record.specialization, record.push_data_cursor);
+				if (hit && native && record.stage == ShaderType::Compute && hit->info.info.ray_query &&
+				    !FindCompiledModule(ManifestProgramKey(record, true), record.specialization, record.push_data_cursor)) {
+					continue;
+				}
+				cached[i] = hit;
+			}
+		}
+#endif
 		for (const auto& layout: loaded.tessellation_layouts) {
 			if (state.warm_layout_keys.insert(layout.first).second) {
 				m_tess_layouts.try_emplace(layout.first, layout.second);
@@ -708,20 +892,28 @@ std::pair<uint32_t, uint32_t> PipelineCache::AddManifestRecords(PipelineManifest
 		}
 		UnlockPrograms();
 	}
-	if (new_modules.empty() && new_pipelines.empty()) {
-		return {0, 0};
-	}
 	{
 		std::scoped_lock lock(state.mutex);
+		state.unsupported += unsupported;
+		if (new_modules.empty() && new_pipelines.empty()) return {0, 0};
 		for (const auto loaded_index: new_modules) {
 			const auto index = static_cast<uint32_t>(state.warm_modules.size());
 			state.warm_modules.push_back(std::move(loaded.modules[loaded_index]));
 			const auto& module = state.warm_modules.back();
 			state.missing_code.push_back(0);
 			state.module_rank.push_back(UseRank(module.ProgramHash()));
-			state.modules.push_back(nullptr);
+			state.module_words.push_back(0);
+			state.modules.push_back(cached[loaded_index]);
 			state.module_failed.push_back(0);
 			state.module_pipelines.emplace_back();
+			if (const auto* hit = cached[loaded_index]) {
+				const auto id = ManifestModuleIdentity(module, StaticKey(module));
+				const auto record = state.module_index.at(id);
+				state.module_records[hit->id] = {record, false};
+				if (hit->plain) state.module_records[hit->plain->id] = {record, true};
+				state.found++;
+				continue;
+			}
 			for (const auto hash: {module.code_hash, module.back_hash}) {
 				if (hash == 0) continue;
 				auto& code = state.code[hash];
@@ -735,10 +927,21 @@ std::pair<uint32_t, uint32_t> PipelineCache::AddManifestRecords(PipelineManifest
 				state.QueueModule(index);
 			}
 		}
+		std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> restored;
+		if (state.threads.empty()) {
+			for (const auto& job: m_restore_jobs) {
+				if (!job.compute) restored.insert(job.key);
+			}
+		}
 		for (const auto loaded_index: new_pipelines) {
-			const auto  index    = static_cast<uint32_t>(state.warm_pipelines.size());
-			const auto& pipeline = state.warm_pipelines.emplace_back(loaded.pipelines[loaded_index]);
-			auto&       missing  = state.missing_modules.emplace_back(0);
+			const auto& pipeline = loaded.pipelines[loaded_index];
+			if (!restored.empty()) {
+				const auto job = state.GraphicsJob(pipeline);
+				if (job && restored.contains(job->key)) continue;
+			}
+			const auto index = static_cast<uint32_t>(state.warm_pipelines.size());
+			state.warm_pipelines.push_back(pipeline);
+			auto& missing = state.missing_modules.emplace_back(0);
 			for (const auto stage: pipeline.stages) {
 				if (stage == ManifestPipeline::NoStage || state.modules[stage] != nullptr) continue;
 				if (state.module_failed[stage] != 0) {
@@ -751,6 +954,9 @@ std::pair<uint32_t, uint32_t> PipelineCache::AddManifestRecords(PipelineManifest
 			if (missing == 0) {
 				state.QueuePipeline(index);
 			}
+		}
+		if (state.startup) {
+			state.startup_total += static_cast<uint32_t>(new_modules.size() + new_pipelines.size());
 		}
 		state.logged_idle = false;
 	}
@@ -906,27 +1112,60 @@ bool ReadCodeRecord(const CodeRecord& record, const uint8_t* compressed, std::ve
 	       ZSTD_decompress(words.data(), bytes, compressed, record.compressed_bytes) == bytes;
 }
 
+constexpr std::string_view ShaderFooterMagic = "barefoot";
+constexpr size_t ShaderFooterSize = 0x30;
+
+std::span<const uint8_t> ShaderProgramAt(std::span<const uint8_t> data, size_t footer_offset) {
+	if (data.size() - footer_offset < ShaderFooterSize ||
+	    std::memcmp(data.data() + footer_offset, ShaderFooterMagic.data(), ShaderFooterMagic.size()) != 0) {
+		return {};
+	}
+	std::array<uint32_t, 8> footer {};
+	std::memcpy(footer.data(), data.data() + footer_offset, sizeof(footer));
+	const auto program = Common::AlignUp(uint64_t {footer[5]}, 16) + footer[6];
+	const auto before = Common::AlignUp(program, 16) + Common::AlignUp(uint64_t {footer[7]}, 16);
+	if (footer[4] != 1 || footer[5] == 0 || program % 4 != 0 || before > footer_offset) {
+		return {};
+	}
+	return data.subspan(footer_offset - before, program);
+}
+
 template <typename Found>
 uint32_t FindShaderPrograms(std::span<const uint8_t> data, Found&& found) {
-	constexpr std::string_view Magic      = "barefoot";
-	constexpr size_t           FooterSize = 0x30;
-	const std::string_view     text(reinterpret_cast<const char*>(data.data()), data.size());
-	uint32_t                   count = 0;
-	for (size_t at = text.find(Magic); at != std::string_view::npos; at = text.find(Magic, at + 1)) {
-		if (data.size() - at < FooterSize) {
-			break;
+	const std::string_view text(reinterpret_cast<const char*>(data.data()), data.size());
+	uint32_t count = 0;
+	for (size_t at = text.find(ShaderFooterMagic); at != std::string_view::npos;
+	     at = text.find(ShaderFooterMagic, at + 1)) {
+		const auto program = ShaderProgramAt(data, at);
+		if (!program.empty()) {
+			found(program);
+			count++;
 		}
-		std::array<uint32_t, 8> footer {};
-		std::memcpy(footer.data(), data.data() + at, sizeof(footer));
-		const auto program = Common::AlignUp(uint64_t {footer[5]}, 16) + footer[6];
-		const auto before  = Common::AlignUp(program, 16) + Common::AlignUp(uint64_t {footer[7]}, 16);
-		if (footer[4] != 1 || footer[5] == 0 || program % 4 != 0 || before > at) {
-			continue;
-		}
-		count++;
-		found(data.subspan(at - before, program));
 	}
 	return count;
+}
+
+template <typename Found>
+void FindShaderCreationRecords(std::span<const uint8_t> data, Found&& found) {
+	constexpr std::string_view Magic("1234\x18\0\0\0", 8);
+	constexpr size_t HeaderSize = 96;
+	const std::string_view text(reinterpret_cast<const char*>(data.data()), data.size());
+	for (size_t at = text.find(Magic); at != std::string_view::npos; at = text.find(Magic, at + Magic.size())) {
+		if (data.size() - at < HeaderSize) {
+			break;
+		}
+		std::array<uint32_t, 2> sizes {};
+		std::memcpy(sizes.data(), data.data() + at + 64, sizeof(sizes));
+		const auto [header, code] = sizes;
+		if (header < HeaderSize || header > data.size() - at || code < ShaderFooterSize ||
+		    code > data.size() - at - header) {
+			continue;
+		}
+		const auto program = ShaderProgramAt(data, at + header + code - ShaderFooterSize);
+		if (!program.empty() && program.data() == data.data() + at + header) {
+			found(data.subspan(at, size_t {header} + code));
+		}
+	}
 }
 
 bool Lz4Decompress(std::span<const uint8_t> src, std::span<uint8_t> dst) {
@@ -1057,14 +1296,14 @@ struct SpanReader {
 };
 
 template <typename Found>
-void ForEachUnrealShader(std::span<const uint8_t> archive, Found&& found) {
+bool ForEachUnrealShader(std::span<const uint8_t> archive, Found&& found) {
 	SpanReader reader {archive};
 	const auto array = [&](uint32_t element) {
 		const auto count = reader.Get<uint32_t>();
 		return reader.Skip(uint64_t {count} * element) ? count : 0;
 	};
 	if (reader.Get<uint32_t>() != 2) {
-		return;
+		return false;
 	}
 	array(20);
 	array(20);
@@ -1074,9 +1313,10 @@ void ForEachUnrealShader(std::span<const uint8_t> archive, Found&& found) {
 	array(16);
 	array(4);
 	if (!reader.ok) {
-		return;
+		return false;
 	}
 	const auto code = archive.subspan(reader.at);
+	bool complete = true;
 	for (uint32_t i = 0; i < shaders; i++) {
 		SpanReader entry {archive, table + i * 17};
 		const auto offset = entry.Get<uint64_t>();
@@ -1084,12 +1324,15 @@ void ForEachUnrealShader(std::span<const uint8_t> archive, Found&& found) {
 		const auto size   = entry.Get<uint32_t>();
 		if (offset <= code.size() && stored <= code.size() - offset) {
 			found(code.subspan(offset, stored), size);
+		} else {
+			complete = false;
 		}
 	}
+	return complete;
 }
 
 template <typename Read, typename Archive, typename Assets>
-bool ForEachUnrealEntry(uint64_t size, Read&& read, Archive&& archive, Assets&& assets) {
+bool ForEachUnrealEntry(uint64_t size, Read&& read, Archive&& archive, Assets&& assets, bool inventory) {
 	constexpr uint32_t   Magic    = 0x5A6F12E1u;
 	constexpr uint64_t   MaxAsset = 1u << 20u;
 	std::vector<uint8_t> data;
@@ -1128,24 +1371,32 @@ bool ForEachUnrealEntry(uint64_t size, Read&& read, Archive&& archive, Assets&& 
 	                       uint64_t blocks) {
 		std::ranges::transform(name, name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 		const bool is_archive = name.ends_with(".ushaderbytecode");
+		const bool is_manifest = inventory && name.ends_with(".kpm");
+		if (inventory && name.ends_with(".upipelinecache")) {
+			assets(name, {});
+			return;
+		}
 		const bool is_global  = name.ends_with(".bin");
 		const bool is_map     = name.ends_with(".umap");
 		const bool is_asset   = is_map || name.ends_with(".uexp") || name.ends_with(".uasset");
 		const uint64_t header = 8 + 8 + 8 + 4 + 20 + (method != 0 ? 4 + 16 * blocks : 0) + 1 + 4;
 		const bool     stored_archive = is_archive && method == 0;
-		const bool     readable_asset = (is_global || (is_asset && (method != 0 || is_map || length <= MaxAsset))) &&
+		const bool     readable_asset = (is_manifest || is_global || (is_asset && (method != 0 || is_map || length <= MaxAsset))) &&
 		                            (method == 0 || (method < zlib.size() && zlib[method]));
+		const uint64_t limit = is_manifest ? 64u << 20u : 256u << 20u;
 		if ((!stored_archive && !readable_asset) || offset > size || stored > size - offset ||
-		    header > size - offset - stored || length > (256u << 20u) || !read(offset, header + stored, entry_data)) {
+		    header > size - offset - stored || length > limit || !read(offset, header + stored, entry_data)) {
+			if (is_manifest) assets(name, {});
 			return;
 		}
 		SpanReader copy {entry_data, 8};
 		if (copy.Get<uint64_t>() != stored || copy.Get<uint64_t>() != length) {
+			if (is_manifest) assets(name, {});
 			return;
 		}
 		if (method == 0) {
 			const auto stored_data = std::span<const uint8_t>(entry_data).subspan(header);
-			is_archive ? archive(stored_data) : assets(stored_data);
+			is_archive ? archive(stored_data) : assets(name, stored_data);
 			return;
 		}
 		copy.Skip(4 + 20 + 4);
@@ -1166,7 +1417,8 @@ bool ForEachUnrealEntry(uint64_t size, Read&& read, Archive&& archive, Assets&& 
 			}
 			filled += static_cast<uint64_t>(out);
 		}
-		assets(std::span<const uint8_t>(inflated).first(filled));
+		assets(name, (is_manifest && filled != length) ? std::span<const uint8_t> {}
+		                                            : std::span<const uint8_t>(inflated).first(filled));
 	};
 	SpanReader index {data};
 	index.String();
@@ -1362,11 +1614,11 @@ void ForEachUnityShaderFile(uint64_t size, Read&& read, Found&& found) {
 		data_at = Common::AlignUp(data_at, 16);
 	}
 	std::vector<uint8_t> stored;
-	std::vector<uint8_t> table(table_size);
 	if (!reader.ok || table_at > size || table_stored > size - table_at || table_size > (64u << 20u) ||
 	    !read(table_at, table_stored, stored)) {
 		return;
 	}
+	std::vector<uint8_t> table(table_size);
 	const auto method = flags & 0x3fu;
 	if (method == 0 && table_stored == table_size) {
 		table = stored;
@@ -1836,22 +2088,22 @@ void ForEachFrostbiteShaderEntry(const std::vector<std::vector<uint8_t>>& tocs, 
 	}
 }
 
-}
+struct ShaderScanStats {
+	uint64_t bytes = 0;
+	uint32_t files = 0;
+	uint32_t read_failures = 0;
+	uint32_t skipped_entries = 0;
+	uint32_t unresolved_containers = 0;
+	uint32_t unresolved_container_blocks = 0;
+	uint32_t raw_files = 0;
+	uint32_t foreign_pipeline_caches = 0;
+};
 
-bool PipelineCache::ScanGameFiles(const std::stop_token&                                          stop,
-                                  const std::function<void(uint64_t, std::span<const uint32_t>)>& append) {
-	auto& state = *m_manifest;
-	std::filesystem::path root;
-	for (uint32_t tries = 0; tries < 200 && !stop.stop_requested(); tries++) {
-		root = LibKernel::FileSystem::GetRealFilename("/app0");
-		if (!root.empty()) {
-			break;
-		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(50));
-	}
-	if (root.empty()) {
-		return false;
-	}
+template <typename Search, typename Stop, typename Known, typename Provided, typename Recipe>
+ShaderScanStats ScanShaderFiles(const std::filesystem::path& root, const std::stop_token& stop,
+                                Search&& search, Stop&& nothing_missing, Known&& known, Provided&& provided,
+                                Recipe&& recipe, bool exhaustive,
+                                std::span<const std::filesystem::path> images = {}) {
 	constexpr uint32_t SampleFiles = 32;
 	constexpr uint64_t SampleBytes = 256ull << 20u;
 	constexpr uint32_t Piece   = 64u << 20u;
@@ -1861,55 +2113,10 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 	constexpr uint32_t RunPiece    = 8u << 20u;
 	constexpr uint64_t RunQuiet    = 16ull << 20u;
 	constexpr uint32_t ProbeFiles = 256;
-	const auto         start      = std::chrono::steady_clock::now();
-	size_t             listed     = 0;
-	{
-		std::scoped_lock lock(state.mutex);
-		listed = state.code.size();
-	}
-	std::unordered_set<uint64_t> found;
-	std::unordered_set<uint64_t> found_listed;
-	uint32_t                     provided = 0;
-	uint32_t                     files    = 0;
-	uint64_t                     bytes    = 0;
-	std::vector<uint8_t>         data;
-	std::vector<uint32_t>        code;
-	const auto search = [&](std::span<const uint8_t> chunk) {
-		return FindShaderPrograms(chunk, [&](std::span<const uint8_t> program) {
-			const auto hash = XXH3_64bits(program.data(), program.size());
-			if (!found.insert(hash).second) {
-				return;
-			}
-			{
-				std::scoped_lock lock(state.mutex);
-				const auto       entry = state.code.find(hash);
-				if (entry == state.code.end()) {
-					return;
-				}
-				found_listed.insert(hash);
-				if (entry->second.mapped) {
-					return;
-				}
-			}
-			code.resize(program.size() / sizeof(uint32_t));
-			std::memcpy(code.data(), program.data(), program.size());
-			if (ProvideCode(hash, code, false)) {
-				provided++;
-				append(hash, code);
-			}
-		});
-	};
-	auto       next_count      = start;
-	bool       missing         = true;
-	const auto nothing_missing = [&] {
-		if (const auto now = std::chrono::steady_clock::now(); now >= next_count) {
-			next_count = now + std::chrono::milliseconds(250);
-			std::scoped_lock lock(state.mutex);
-			missing = std::ranges::any_of(state.code | std::views::values,
-			                              [](const auto& entry) { return !entry.mapped; });
-		}
-		return !missing;
-	};
+	ShaderScanStats stats;
+	auto& bytes = stats.bytes;
+	auto& files = stats.files;
+	std::vector<uint8_t> data;
 	struct Run {
 		uint64_t end;
 		uint32_t shaders;
@@ -1967,37 +2174,66 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 			if (run.end >= reach && run.silent >= quiet) {
 				break;
 			}
-			kept = std::min<size_t>(data.size(), Overlap);
+			kept = std::min<size_t>(data.size(), exhaustive ? Piece : Overlap);
 			std::memmove(data.data(), data.data() + data.size() - kept, kept);
 		}
 		return run;
 	};
 	std::vector<uint8_t> shader;
 	const auto           search_archive = [&](std::span<const uint8_t> archive) {
-		ForEachUnrealShader(archive, [&](std::span<const uint8_t> stored, uint32_t size) {
+		return ForEachUnrealShader(archive, [&](std::span<const uint8_t> stored, uint32_t size) {
+			if (size == 0) {
+				stats.unresolved_container_blocks++;
+				return;
+			}
 			if (stored.size() == size) {
 				search(stored);
 				return;
 			}
 			if (size > (16u << 20u)) {
+				stats.unresolved_container_blocks++;
 				return;
 			}
 			shader.resize(size);
 			if (Lz4Decompress(stored, shader)) {
 				search(shader);
+			} else {
+				stats.unresolved_container_blocks++;
 			}
 		});
 	};
 	const auto read_file = [&](Common::File& file, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) {
 		uint32_t done = 0;
 		if (size > (1u << 30u) || !file.Seek(offset)) {
+			stats.read_failures++;
 			return false;
 		}
 		out.resize(size);
 		file.Read(out.data(), static_cast<uint32_t>(size), &done);
 		bytes += done;
+		if (done != size) stats.read_failures++;
 		return done == size;
 	};
+	const auto scan_file = [&](const std::filesystem::path& path, bool manifest) {
+		Common::File file;
+		if (!file.Open(path, Common::File::Mode::Read)) {
+			stats.read_failures++;
+			return;
+		}
+		files++;
+		const auto size = file.Size();
+		if (manifest) {
+			if (size <= Piece && read_file(file, 0, size, data)) recipe(data);
+			else stats.unresolved_containers++;
+			return;
+		}
+		stats.raw_files++;
+		if (read_run(file, 0, size, 0, size, Piece, 0).end != size) stats.read_failures++;
+	};
+	for (const auto& image: images) {
+		if (stop.stop_requested() || nothing_missing()) break;
+		scan_file(image, false);
+	}
 	const auto search_unreal = [&](const std::filesystem::path& path, const std::string& extension) {
 		Common::File file;
 		if (!file.Open(path, Common::File::Mode::Read)) {
@@ -2008,16 +2244,26 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 		};
 		std::vector<uint8_t> archive;
 		if (extension == ".pak") {
-			return ForEachUnrealEntry(file.Size(), read, search_archive, [&](std::span<const uint8_t> asset) {
-				search(asset);
-				FindCompressedShaders(asset, archive, [&](std::span<const uint8_t> shader) { search(shader); });
-			});
+			files++;
+			const auto archive_entry = [&](std::span<const uint8_t> contents) {
+				if (!search_archive(contents)) stats.unresolved_container_blocks++;
+			};
+			return ForEachUnrealEntry(file.Size(), read, archive_entry, [&](std::string_view name, std::span<const uint8_t> asset) {
+				if (exhaustive && name.ends_with(".kpm")) {
+					recipe(asset);
+				} else if (exhaustive && name.ends_with(".upipelinecache")) {
+					stats.foreign_pipeline_caches++;
+				} else {
+					search(asset);
+					FindCompressedShaders(asset, archive, [&](std::span<const uint8_t> shader) { search(shader); });
+				}
+			}, exhaustive);
 		}
 		if (!read(0, file.Size(), archive)) {
 			return false;
 		}
-		search_archive(archive);
-		return true;
+		files++;
+		return search_archive(archive);
 	};
 	const auto search_unity = [&](const std::filesystem::path& path) {
 		Common::File file;
@@ -2077,7 +2323,7 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 			return std::ranges::equal(
 			    method, name, [](char a, char b) { return std::tolower(a) == std::tolower(b); });
 		};
-		const auto decompress = [&](std::string_view method, std::span<const uint8_t> stored,
+		const auto decode = [&](std::string_view method, std::span<const uint8_t> stored,
 		                            std::span<uint8_t> out) {
 			if (method.empty() ? stored.size() >= 2 && (stored[0] & 0x0fu) == 0x0c
 			                   : named(method, "Oodle")) {
@@ -2090,6 +2336,12 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 				           static_cast<int>(stored.size())) == static_cast<int>(out.size());
 			}
 			return (method.empty() || named(method, "LZ4")) && Lz4Decompress(stored, out);
+		};
+		const auto decompress = [&](std::string_view method, std::span<const uint8_t> stored,
+		                            std::span<uint8_t> out) {
+			const bool decoded = decode(method, stored, out);
+			if (!decoded) stats.unresolved_container_blocks++;
+			return decoded;
 		};
 		return ForEachIoStoreShaderGroup(toc, read, decompress,
 		                                 [&](std::span<const uint8_t> group) { search(group); });
@@ -2150,9 +2402,9 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 		std::vector<FrostbiteEntry>                              todo;
 		std::vector<uint8_t>                                     run;
 		ForEachFrostbiteShaderEntry(
-		    tocs, FrostbiteQuiet, read,
+		    tocs, exhaustive ? UINT32_MAX : FrostbiteQuiet, read,
 		    [&](std::span<const FrostbiteEntry> shaders) {
-			    const auto known = found_listed.size();
+			    const auto before_known = known();
 			    todo.clear();
 			    for (const auto& entry: shaders) {
 				    if (seen.emplace(entry.patch, entry.chunk, entry.cas, entry.offset).second) {
@@ -2177,7 +2429,7 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 				    }
 				    i = next;
 			    }
-			    return found_listed.size() != known;
+			    return known() != before_known;
 		    },
 		    [&] { return stop.stop_requested() || nothing_missing(); });
 		return true;
@@ -2199,7 +2451,23 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 	while (!folders.empty() && !stop.stop_requested() && !nothing_missing()) {
 		const auto folder = std::move(folders.back());
 		folders.pop_back();
-		for (const auto& entry: Common::File::GetDirEntries(folder)) {
+		std::vector<Common::File::DirEntry> entries;
+		if (exhaustive) {
+			std::error_code error;
+			for (std::filesystem::directory_iterator it(folder, error), end; !error && it != end; it.increment(error)) {
+				std::error_code status_error;
+				const auto status = it->symlink_status(status_error);
+				if (!status_error && (std::filesystem::is_regular_file(status) || std::filesystem::is_directory(status))) {
+					entries.push_back({Common::PathToString(it->path().filename()), std::filesystem::is_regular_file(status)});
+				} else {
+					stats.skipped_entries++;
+				}
+			}
+			if (error) stats.read_failures++;
+		} else {
+			entries = Common::File::GetDirEntries(folder);
+		}
+		for (const auto& entry: entries) {
 			if (stop.stop_requested() || nothing_missing()) {
 				break;
 			}
@@ -2217,8 +2485,9 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 			if (frostbite && (extension == ".cas" || extension == ".toc")) {
 				continue;
 			}
-			if ((extension == ".pak" || extension == ".ushaderbytecode") && search_unreal(path, extension)) {
-				continue;
+			if (extension == ".pak" || extension == ".ushaderbytecode") {
+				if (search_unreal(path, extension)) continue;
+				stats.unresolved_containers++;
 			}
 			if (extension == ".ucas" || extension == ".utoc") {
 				const auto toc_path = iostore_toc(path);
@@ -2229,9 +2498,18 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 					iostore_read.insert(Common::PathToString(toc_path));
 					continue;
 				}
+				stats.unresolved_containers++;
 			}
 			if (extension == ".bundle" || extension == ".unity3d" || extension == ".assets") {
 				search_unity(path);
+			}
+			if (exhaustive && extension == ".upipelinecache") {
+				stats.foreign_pipeline_caches++;
+				continue;
+			}
+			if (exhaustive) {
+				scan_file(path, extension == ".kpm");
+				continue;
 			}
 			auto& kind = kinds[extension];
 			if (kind.files >= SampleFiles || kind.bytes >= SampleBytes) {
@@ -2270,7 +2548,7 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 		}
 		files += from == 0 ? 1 : 0;
 		const auto size   = file.Size();
-		const auto before = provided;
+		const auto before = provided();
 		uint64_t   read   = from;
 		for (uint64_t at = from; at < size && !stop.stop_requested() && !nothing_missing();) {
 			const auto window = std::min<uint64_t>(size, at + ProbeBytes);
@@ -2280,9 +2558,9 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 			}
 			const auto begin = std::max(read, at >= from + ProbeStride ? at - ProbeStride + ProbeBytes : from);
 			const auto floor = read;
-			const auto known = found_listed.size();
+			const auto before_known = known();
 			read             = read_run(file, begin, window, RunQuiet, size, RunPiece, 0).end;
-			for (uint64_t end = begin, silent = 0; found_listed.size() != known && end > floor &&
+			for (uint64_t end = begin, silent = 0; known() != before_known && end > floor &&
 			                                       silent < RunQuiet && !stop.stop_requested();) {
 				const auto back = std::max(floor, end - RunPiece);
 				const auto run  = read_run(file, back, 0, 0, std::min(size, end + Overlap),
@@ -2292,13 +2570,151 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 			}
 			at = std::max(at + ProbeStride, read);
 		}
-		kind->probed = provided != before ? 0 : kind->probed + 1;
+		kind->probed = provided() != before ? 0 : kind->probed + 1;
 	}
+	return stats;
+}
+
+}
+
+bool WriteShaderInventory(const std::filesystem::path& root, std::span<const std::filesystem::path> images,
+                          std::ostream& code_store,
+                          std::ostream& creation_records, std::ostream& shipped_recipes, std::ostream& report) {
+	code_store.write(reinterpret_cast<const char*>(&CodeStoreMagic), sizeof(CodeStoreMagic));
+	std::unordered_set<uint64_t> programs;
+	std::unordered_set<uint64_t> records;
+	std::vector<uint8_t> compressed;
+	const auto search = [&](std::span<const uint8_t> chunk) {
+		const auto found = FindShaderPrograms(chunk, [&](std::span<const uint8_t> program) {
+			const auto hash = XXH3_64bits(program.data(), program.size());
+			if (!programs.insert(hash).second) return;
+			compressed.resize(ZSTD_compressBound(program.size()));
+			const auto size = ZSTD_compress(compressed.data(), compressed.size(), program.data(), program.size(), 3);
+			if (ZSTD_isError(size) != 0 || size > UINT32_MAX) {
+				code_store.setstate(std::ios::failbit);
+				return;
+			}
+			const CodeRecord record {hash, static_cast<uint32_t>(program.size() / sizeof(uint32_t)),
+			                         static_cast<uint32_t>(size)};
+			code_store.write(reinterpret_cast<const char*>(&record), sizeof(record));
+			code_store.write(reinterpret_cast<const char*>(compressed.data()), size);
+		});
+		FindShaderCreationRecords(chunk, [&](std::span<const uint8_t> record) {
+			if (records.insert(XXH3_64bits(record.data(), record.size())).second) {
+				creation_records.write(reinterpret_cast<const char*>(record.data()), record.size());
+			}
+		});
+		return found;
+	};
+	PipelineManifest packaged;
+	uint32_t packaged_manifests = 0;
+	uint32_t invalid_manifests = 0;
+	uint32_t skipped_records = 0;
+	const auto recipe = [&](std::span<const uint8_t> bytes) {
+		PipelineManifest loaded;
+		uint32_t skipped = 0;
+		if (!LoadManifest(bytes, loaded, &skipped) || loaded.modules.size() > UINT32_MAX - packaged.modules.size()) {
+			invalid_manifests++;
+			return;
+		}
+		packaged_manifests++;
+		skipped_records += skipped;
+		const auto first = static_cast<uint32_t>(packaged.modules.size());
+		for (auto& pipeline: loaded.pipelines) {
+			for (auto& stage: pipeline.stages) {
+				if (stage != ManifestPipeline::NoStage) stage += first;
+			}
+		}
+		packaged.modules.insert(packaged.modules.end(), std::make_move_iterator(loaded.modules.begin()),
+		                        std::make_move_iterator(loaded.modules.end()));
+		packaged.pipelines.insert(packaged.pipelines.end(), loaded.pipelines.begin(), loaded.pipelines.end());
+		packaged.tessellation_layouts.insert(packaged.tessellation_layouts.end(), loaded.tessellation_layouts.begin(),
+		                                     loaded.tessellation_layouts.end());
+	};
+	const auto found_count = [&] { return programs.size(); };
+	const auto should_stop = [&] { return !code_store || !creation_records; };
+	const auto stats = ScanShaderFiles(root, {}, search, should_stop, found_count, found_count, recipe, true, images);
+	const auto serialized = SaveManifest(packaged);
+	shipped_recipes.write(reinterpret_cast<const char*>(serialized.data()), serialized.size());
+	report << fmt::format("{{\"shader_programs\":{},\"creation_records\":{},\"files_read\":{},\"bytes_read\":{},"
+	                      "\"read_failures\":{},\"skipped_entries\":{},\"unresolved_containers\":{},"
+	                      "\"unresolved_container_blocks\":{},\"raw_files\":{},\"foreign_pipeline_caches\":{},"
+	                      "\"packaged_manifests\":{},\"invalid_manifests\":{},\"skipped_packaged_records\":{}}}\n",
+	                      programs.size(), records.size(), stats.files, stats.bytes, stats.read_failures,
+	                      stats.skipped_entries, stats.unresolved_containers, stats.unresolved_container_blocks,
+	                      stats.raw_files, stats.foreign_pipeline_caches, packaged_manifests, invalid_manifests,
+	                      skipped_records);
+	return code_store && creation_records && shipped_recipes && report;
+}
+
+bool PipelineCache::ScanGameFiles(const std::stop_token&                                          stop,
+                                  const std::function<void(uint64_t, std::span<const uint32_t>)>& append) {
+	auto& state = *m_manifest;
+	std::filesystem::path root;
+	for (uint32_t tries = 0; tries < 200 && !stop.stop_requested(); tries++) {
+		root = LibKernel::FileSystem::GetRealFilename("/app0");
+		if (!root.empty()) {
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+	if (root.empty()) {
+		return false;
+	}
+	const auto         start      = std::chrono::steady_clock::now();
+	size_t             listed     = 0;
+	{
+		std::scoped_lock lock(state.mutex);
+		listed = state.code.size();
+	}
+	std::unordered_set<uint64_t> found;
+	std::unordered_set<uint64_t> found_listed;
+	uint32_t                     provided = 0;
+	std::vector<uint32_t>        code;
+	const auto search = [&](std::span<const uint8_t> chunk) {
+		return FindShaderPrograms(chunk, [&](std::span<const uint8_t> program) {
+			const auto hash = XXH3_64bits(program.data(), program.size());
+			if (!found.insert(hash).second) {
+				return;
+			}
+			{
+				std::scoped_lock lock(state.mutex);
+				const auto       entry = state.code.find(hash);
+				if (entry == state.code.end()) {
+					return;
+				}
+				found_listed.insert(hash);
+				if (entry->second.mapped) {
+					return;
+				}
+			}
+			code.resize(program.size() / sizeof(uint32_t));
+			std::memcpy(code.data(), program.data(), program.size());
+			if (ProvideCode(hash, code, false)) {
+				provided++;
+				append(hash, code);
+			}
+		});
+	};
+	auto       next_count      = start;
+	bool       missing         = true;
+	const auto nothing_missing = [&] {
+		if (const auto now = std::chrono::steady_clock::now(); now >= next_count) {
+			next_count = now + std::chrono::milliseconds(250);
+			std::scoped_lock lock(state.mutex);
+			missing = std::ranges::any_of(state.code | std::views::values,
+			                              [](const auto& entry) { return !entry.mapped; });
+		}
+		return !missing;
+	};
+	const auto stats = ScanShaderFiles(root, stop, search, nothing_missing,
+	                                  [&] { return found_listed.size(); }, [&] { return provided; },
+	                                  [](std::span<const uint8_t>) {}, false);
 	ManifestLog("[ShaderScan] game files: {} shaders found ({} of {} listed by the manifest, {} new), {:.1f} s "
 	            "({} files, {:.0f} MB read)",
 	            found.size(), found_listed.size(), listed, provided,
-	            Seconds(std::chrono::steady_clock::now() - start), files,
-	            static_cast<double>(bytes) / (1024.0 * 1024.0));
+	            Seconds(std::chrono::steady_clock::now() - start), stats.files,
+	            static_cast<double>(stats.bytes) / (1024.0 * 1024.0));
 	return true;
 }
 
@@ -2419,7 +2835,11 @@ void PipelineCache::CodeStoreThread(const std::stop_token& stop) {
 		            "and the last search did not find them)",
 		            still.size(), listed_code());
 	}
-	state.scanning.store(false, std::memory_order_release);
+	{
+		std::scoped_lock lock(state.mutex);
+		state.scanning.store(false, std::memory_order_release);
+		FinishStartupIfIdle();
+	}
 	Common::Thread::LowerCurrentPriority();
 	for (;;) {
 		std::pair<uint64_t, std::vector<uint32_t>> job;
@@ -2436,62 +2856,167 @@ void PipelineCache::CodeStoreThread(const std::stop_token& stop) {
 	}
 }
 
-void PipelineCache::ManifestWorker(const std::stop_token& stop) {
+void PipelineCache::FinishStartupIfIdle() {
+	auto& state = *m_manifest;
+	if (!state.startup || state.scanning.load(std::memory_order_relaxed) || state.running != 0 ||
+	    !m_restore_jobs.empty() || !state.module_jobs.empty() || !state.pipeline_jobs.empty() ||
+	    !state.large_compute.empty()) {
+		return;
+	}
+	{
+		std::lock_guard lock(m_driver_cache_mutex);
+		PostDueDriverCache(true);
+	}
+	const auto unresolved_modules = std::ranges::count(state.modules, nullptr);
+	const auto unresolved_graphics = std::ranges::count_if(state.missing_modules, [](auto missing) { return missing != 0; });
+	for (size_t i = 0; i < state.missing_modules.size(); ++i) {
+		if (state.missing_modules[i] == 0) continue;
+		ManifestLog("[kyty-startup] unresolved_graphics variant={:016x} reason=missing_stage",
+		            ManifestPipelineIdentity(state.warm_pipelines[i]));
+	}
+	for (size_t i = 0; i < state.modules.size(); ++i) {
+		if (state.modules[i] != nullptr) continue;
+		const auto& record = state.warm_modules[i];
+		ManifestLog("[kyty-startup] unresolved_module stage={} program={:016x} variant={:016x} reason={}",
+		            static_cast<unsigned>(record.stage), record.ProgramHash(),
+		            ManifestModuleIdentity(record, StaticKey(record)),
+		            state.module_failed[i] != 0 ? "failed" : "missing_code");
+	}
+	state.ReleaseStartup(unresolved_modules == 0 && unresolved_graphics == 0 &&
+	                             state.pipelines_failed == 0 && state.compute_failed == 0 &&
+	                             state.unsupported == 0 && state.unreadable == 0 ? "ready" : "partial");
+	ManifestLog("[kyty-startup] unresolved modules={} graphics_dependencies={} unsupported={} unreadable={}",
+	            unresolved_modules, unresolved_graphics, state.unsupported, state.unreadable);
+	ManifestLog("Pipeline manifest: startup modules {} built, {} cached, {} failed; graphics pipelines {} built, "
+	            "{} known, {} failed; compute pipelines {} built, {} cached, {} failed",
+	            state.built, state.found, state.failed, state.pipelines, state.pipelines_known, state.pipelines_failed,
+	            state.compute, state.compute_cached, state.compute_failed);
+	if (state.small_built != 0) {
+		ManifestLog("Pipeline manifest: {} modules up to 50000 SPIR-V words built by {:.2f} s",
+		            state.small_built, Seconds(state.last_small - state.start));
+	}
+}
+
+bool PipelineCache::WaitForStartupManifest(std::chrono::milliseconds timeout, uint32_t& done,
+                                           uint32_t& total, bool& memory_paused) {
+	if (!m_manifest_warm) return true;
+	auto& state = *m_manifest;
+	std::unique_lock lock(state.mutex);
+	if (!state.startup) return true;
+	const auto now = std::chrono::steady_clock::now();
+	if (!state.startup_wait) state.startup_wait.emplace(now, std::chrono::seconds(Config::StartupWaitSeconds()));
+	state.startup_finished.wait_until(lock, std::min(now + timeout, state.startup_wait->Deadline()), [&] { return !state.startup; });
+	if (state.startup) {
+		const auto reason = state.startup_wait->ReleaseReason(std::chrono::steady_clock::now());
+		if (!reason.empty()) state.ReleaseStartup(reason);
+	}
+	done = state.startup_done;
+	total = state.startup_total;
+	memory_paused = state.memory.since.has_value();
+	return !state.startup;
+}
+
+void PipelineCache::ManifestWorker(const std::stop_token& stop, bool allow_large) {
 	KYTY_PROFILER_THREAD("Thread_PipelineManifest");
 	Common::Thread::LowerCurrentPriority();
 	auto& state = *m_manifest;
+	const bool prefer_large = allow_large && Common::ParallelThreads() > m_large_manifest_workers;
 	for (;;) {
 		std::shared_ptr<const std::vector<uint32_t>> code;
 		std::shared_ptr<const std::vector<uint32_t>> back_code;
 		uint32_t                                     index    = 0;
 		bool                                         pipeline = false;
+		std::optional<AsyncPipelineJob> restore;
+		std::optional<ManifestState::ComputeJob> compute;
 		{
 			std::unique_lock lock(state.mutex);
+			auto module_job = state.module_jobs.end();
+			auto pipeline_job = state.pipeline_jobs.end();
+			auto restore_job = m_restore_jobs.end();
+			const auto small_stages = [](const auto& stages) {
+				return std::ranges::all_of(stages, [](const ShaderModule* stage) {
+					return stage == nullptr || stage->spirv_words <= LargeSpirvWords;
+				});
+			};
+			const auto eligible = [allow_large](auto& jobs, auto small) {
+				return allow_large ? jobs.begin() : std::ranges::find_if(jobs, small);
+			};
 			if (!state.available.wait(lock, stop, [&] {
-				    return !state.pipeline_jobs.empty() || !state.module_jobs.empty();
-			    })) {
+				    if (allow_large && !state.large_compute.empty()) return true;
+				    restore_job = eligible(m_restore_jobs, [&](const auto& job) {
+					    return job.compute ? job.module->spirv_words <= LargeSpirvWords : small_stages(job.stages);
+				    });
+				    if (restore_job != m_restore_jobs.end()) return true;
+				    module_job = NextManifestModule(state.module_jobs, state.module_rank, state.module_words, allow_large, prefer_large);
+				    pipeline_job = eligible(state.pipeline_jobs, [&](auto job) {
+					    return small_stages(state.PipelineStages(state.warm_pipelines[job]));
+				    });
+				    return module_job != state.module_jobs.end() || pipeline_job != state.pipeline_jobs.end();
+			    }) || stop.stop_requested()) {
 				return;
 			}
-			pipeline = !state.pipeline_jobs.empty() &&
-			           (state.module_jobs.empty() ||
-			            state.PipelineRank(state.pipeline_jobs.front()) <=
-			                state.module_rank[state.module_jobs.front()]);
-			auto& jobs = pipeline ? state.pipeline_jobs : state.module_jobs;
-			index      = jobs.front();
-			jobs.pop_front();
-			if (!pipeline) {
-				const auto& module = state.warm_modules[index];
-				for (auto [hash, words]: {std::pair {module.code_hash, &code},
-				                          std::pair {module.back_hash, &back_code}}) {
-					if (hash == 0) {
-						continue;
-					}
-					auto& entry = state.code.at(hash);
-					*words      = entry.words;
-					if (--entry.readers == 0) {
-						entry.words = nullptr;
+			if (allow_large && !state.large_compute.empty()) {
+				compute = state.large_compute.front();
+				state.large_compute.pop_front();
+			} else if (restore_job != m_restore_jobs.end()) {
+				restore = *restore_job;
+				m_restore_jobs.erase(restore_job);
+			} else {
+				pipeline = pipeline_job != state.pipeline_jobs.end() &&
+				           (module_job == state.module_jobs.end() ||
+				            state.PipelineRank(*pipeline_job) <= state.module_rank[*module_job]);
+				auto& jobs = pipeline ? state.pipeline_jobs : state.module_jobs;
+				const auto selected = pipeline ? pipeline_job : module_job;
+				index = *selected;
+				jobs.erase(selected);
+				if (!pipeline) {
+					const auto& module = state.warm_modules[index];
+					for (auto [hash, words]: {std::pair {module.code_hash, &code},
+					                          std::pair {module.back_hash, &back_code}}) {
+						if (hash == 0) {
+							continue;
+						}
+						auto& entry = state.code.at(hash);
+						*words      = entry.words;
+						if (--entry.readers == 0) {
+							entry.words = nullptr;
+						}
 					}
 				}
 			}
 			state.running++;
 		}
-		if (pipeline) {
-			CreateManifestPipeline(index);
+		if (compute) {
+			CreateManifestComputePipeline(*compute->module, compute->from_assets, stop);
+		} else if (restore) {
+			if (restore->compute) {
+				CreateManifestComputePipeline(*restore->module, false, stop);
+			} else {
+				CreateManifestGraphicsPipeline(restore->key, restore->stages, false, true, stop);
+			}
+		} else if (pipeline) {
+			CreateManifestPipeline(index, stop);
 		} else {
 			BuildManifestModule(index, *code,
 			                    back_code ? std::span<const uint32_t>(*back_code)
-			                              : std::span<const uint32_t> {});
+			                              : std::span<const uint32_t> {}, stop);
 		}
 		{
 			std::scoped_lock lock(state.mutex);
 			state.running--;
+			state.memory.Finished(std::this_thread::get_id());
+			if (state.startup) {
+				++state.startup_done;
+				if (state.startup_wait) state.startup_wait->last_progress = std::chrono::steady_clock::now();
+			}
+			FinishStartupIfIdle();
 		}
 		ManifestProgress(false);
 	}
 }
 
 void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t> code,
-                                        std::span<const uint32_t> back_code, bool guest_traversal) {
+                                        std::span<const uint32_t> back_code, const std::stop_token& stop, bool guest_traversal) {
 	auto&       state  = *m_manifest;
 	const auto& record = [&]() -> const ManifestModule& {
 		std::scoped_lock lock(state.mutex);
@@ -2501,26 +3026,46 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	auto        input  = record.input;
 	const std::vector<uint32_t>      user_data(record.user_data_count);
 	ShaderRecompiler::CompileOptions options;
-	ProgramKey                       key {.stage           = record.stage,
-	                                      .hash            = record.ProgramHash(),
-	                                      .user_data_count = record.user_data_count};
-	std::visit(
-	    [&]<typename InputInfo>(InputInfo& info) {
-		    options = StageCompileOptions(info);
-		    BuildStageStaticKey(info, key.static_state);
-	    },
-	    input);
 	const bool native = RayTracing::NativeTraversals() && !guest_traversal;
-	AppendNativeRayTracingKey(options.stage, key.static_state, native);
-	SetShaderCompileOptions(options, key.hash, user_data, back_code, native);
+	auto* compute = std::get_if<ShaderComputeInputInfo>(&input);
+	if (compute != nullptr) {
+		compute->async_compute = compute->async_compute && ShaderRecompiler::Decoder::ComputeShaderDependsOnQueue(code);
+	}
+	const auto key = ManifestProgramKey(record, guest_traversal, compute);
+	std::visit([&](const auto& info) { options = StageCompileOptions(info); }, input);
+	options.runtime_buffer_descriptors = record.runtime_buffers;
+	options.runtime_sampler_descriptors = record.runtime_samplers;
+	options.shader_hash        = key.hash;
+	options.user_data          = user_data;
+	options.back_code          = back_code;
+	options.dump_ir            = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+	options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
+	options.native_ray_tracing = native;
+	options.rt_oracle          = native ? Config::RayTracingOracle() : 0u;
+	options.rt_emulation       = Config::RayTracingEmulation();
 	std::vector<uint32_t> spirv;
 	std::vector<uint32_t> plain_spirv;
 
+	const auto build_compute = [&](const ShaderModule* module) {
+		if (module == nullptr || module->info.stage != ShaderType::Compute) return;
+		if (module->spirv_words <= LargeSpirvWords) {
+			CreateManifestComputePipeline(*module, record.from_assets, stop);
+			return;
+		}
+		std::scoped_lock lock(state.mutex);
+		state.large_compute.push_back({module, record.from_assets});
+		if (state.startup) ++state.startup_total;
+		state.available.notify_all();
+	};
 	const auto finish = [&](const ShaderModule* module, bool built) {
 		if (guest_traversal) {
-			if (module != nullptr && module->info.stage == ShaderType::Compute) {
-				CreateManifestComputePipeline(*module, record.from_assets);
+			if (module == nullptr) {
+				std::scoped_lock lock(state.mutex);
+				++state.compute_failed;
+				ManifestLog("[kyty-startup] unresolved_compute shader={:016x} variant={:016x} reason=traversal_translation_failed",
+				            record.ProgramHash(), ManifestModuleIdentity(record, StaticKey(record)));
 			}
+			build_compute(module);
 			return;
 		}
 		const auto elapsed =
@@ -2539,6 +3084,10 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 				(built ? state.built : state.found)++;
 				state.build_ns += built ? elapsed : 0u;
 				if (built) {
+					if (module->spirv_words <= LargeSpirvWords) {
+						state.small_built++;
+						state.last_small = std::chrono::steady_clock::now();
+					}
 					state.module_time.Add(static_cast<double>(elapsed) / 1e9);
 				}
 				if (recording) {
@@ -2564,12 +3113,10 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 			}
 		}
 		state.available.notify_all();
-		if (module != nullptr && module->info.stage == ShaderType::Compute) {
-			CreateManifestComputePipeline(*module, record.from_assets);
-		}
+		build_compute(module);
 		if (native && record.stage == ShaderType::Compute &&
 		    (module == nullptr || module->info.info.ray_query)) {
-			BuildManifestModule(index, code, back_code, true);
+			BuildManifestModule(index, code, back_code, stop, true);
 		}
 	};
 	auto                specialization = record.specialization;
@@ -2581,6 +3128,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		finish(compiled, false);
 		return;
 	}
+	if (!state.WaitForMemory(stop)) return;
 	std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 	std::optional<ShaderModule>                       module;
 	const auto what = fmt::format("module {:016x}", record.code_hash);
@@ -2652,33 +3200,33 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	finish(compiled, added);
 }
 
-void PipelineCache::CreateManifestPipeline(uint32_t index) {
-	auto&                              state  = *m_manifest;
-	std::array<const ShaderModule*, 4> stages {};
-	const auto& record = [&]() -> const ManifestPipeline& {
-		std::scoped_lock lock(state.mutex);
-		return state.warm_pipelines[index];
-	}();
-	auto key = record.key;
+void PipelineCache::CreateManifestPipeline(uint32_t index, const std::stop_token& stop) {
+	auto& state = *m_manifest;
+	std::optional<AsyncPipelineJob> job;
+	bool from_assets;
 	{
 		std::scoped_lock lock(state.mutex);
-		for (size_t i = 0; i < stages.size(); i++) {
-			if (record.stages[i] != ManifestPipeline::NoStage) {
-				stages[i] = state.modules[record.stages[i]];
-			}
+		const auto& record = state.warm_pipelines[index];
+		from_assets = record.from_assets;
+		job = state.GraphicsJob(record);
+		if (!job) {
+			state.pipelines_failed++;
+			ManifestLog("[kyty-startup] unresolved_graphics variant={:016x} reason=incompatible_stages",
+			            ManifestPipelineIdentity(record));
+			return;
 		}
 	}
-	if (record.plain_pixel && stages[3] != nullptr) {
-		stages[3] = stages[3]->plain.get();
-	}
-	if (stages[0] == nullptr ||
-	    (record.stages[3] != ManifestPipeline::NoStage && stages[3] == nullptr)) {
+	CreateManifestGraphicsPipeline(job->key, job->stages, from_assets, false, stop);
+}
+
+void PipelineCache::CreateManifestGraphicsPipeline(const GraphicsPipelineKey& key,
+                                                  const std::array<const ShaderModule*, 4>& stages,
+                                                  bool from_assets, bool stored, const std::stop_token& stop) {
+	auto& state = *m_manifest;
+	if (!SampledDescriptorBudgetFits(stages)) {
 		std::scoped_lock lock(state.mutex);
 		state.pipelines_failed++;
 		return;
-	}
-	for (size_t i = 0; i < stages.size(); i++) {
-		key.stage_ids[i] = stages[i] != nullptr ? stages[i]->id : 0u;
 	}
 	{
 		std::scoped_lock lock(m_async_mutex);
@@ -2693,13 +3241,20 @@ void PipelineCache::CreateManifestPipeline(uint32_t index) {
 	Pipeline   pipeline;
 	const auto key_hash = static_cast<uint64_t>(GraphicsPipelineKeyHash {}(key));
 	const auto what     = fmt::format("pipeline {:016x}", key_hash);
-	const bool ran = RunDroppable(state.dropped, record.from_assets, stages[0]->info.shader_hash,
+	bool cache_hit = false;
+	const bool ran = RunDroppable(state.dropped, from_assets, stages[0]->info.shader_hash,
 	                              key_hash, what, [&] {
-		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
+#if defined(ANYPS5_KYTY)
+		cache_hit = CreateGraphicsPipelineNow(pipeline, key, stages, false);
+		if (cache_hit) return;
+#endif
+		if (state.WaitForMemory(stop)) CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
 	});
 	const bool created = ran && pipeline.pipeline != nullptr && pipeline.pipeline_layout != nullptr;
 	if (created) {
-		NoteCreatedPipeline(start);
+		if (!stored) StorePipeline(key);
+		pipeline.stored = true;
+		if (!cache_hit) NoteCreatedPipeline(start);
 	}
 	{
 		std::scoped_lock lock(m_async_mutex);
@@ -2712,9 +3267,17 @@ void PipelineCache::CreateManifestPipeline(uint32_t index) {
 		}
 		m_async_pending_graphics.erase(key);
 	}
+#if defined(ANYPS5_KYTY)
+	if (created && m_libraries != nullptr) m_libraries->NotePreparedPipeline(key, stages);
+#endif
 	const auto elapsed = std::chrono::steady_clock::now() - start;
 	std::scoped_lock lock(state.mutex);
-	(created ? state.pipelines : state.pipelines_failed)++;
+	if (!created) ManifestLog("[kyty-startup] unresolved_graphics key={:016x} reason=creation_failed", key_hash);
+	if (cache_hit) {
+		state.pipelines_known++;
+	} else {
+		(created ? state.pipelines : state.pipelines_failed)++;
+	}
 	state.pipeline_ns += static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
 	if (created) {
@@ -2722,7 +3285,8 @@ void PipelineCache::CreateManifestPipeline(uint32_t index) {
 	}
 }
 
-void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module, bool from_assets) {
+void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module, bool from_assets, const std::stop_token& stop) {
+	if (!m_compile_compute_pipelines) return;
 #if defined(ANYPS5_KYTY)
 	std::atomic_ref<bool>(module.pipeline_requested).store(true, std::memory_order_relaxed);
 #endif
@@ -2737,11 +3301,15 @@ void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module, bo
 	Pipeline   pipeline;
 	auto&      state = *m_manifest;
 	const auto what  = fmt::format("compute pipeline {:016x}", module.info.shader_hash);
+	bool cache_hit = false;
 	const bool ran   = RunDroppable(state.dropped, from_assets, module.info.shader_hash, 0, what, [&] {
-		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+		cache_hit = FindComputePipeline(m_graphics, pipeline, module, m_driver_cache);
+		if (!cache_hit && state.WaitForMemory(stop)) {
+			CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+		}
 	});
 	const bool created = ran && pipeline.pipeline != nullptr && pipeline.pipeline_layout != nullptr;
-	if (created) {
+	if (created && !cache_hit) {
 		NoteCreatedPipeline(start);
 	}
 	{
@@ -2754,7 +3322,13 @@ void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module, bo
 		m_async_pending_compute.erase(module.id);
 	}
 	std::scoped_lock lock(state.mutex);
-	(created ? state.compute : state.compute_failed)++;
+	state.compute += created && !cache_hit ? 1u : 0u;
+	state.compute_cached += cache_hit ? 1u : 0u;
+	if (!created) {
+		++state.compute_failed;
+		ManifestLog("[kyty-startup] unresolved_compute shader={:016x} module={:016x} reason=creation_failed",
+		            module.info.shader_hash, module.id);
+	}
 	state.pipeline_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                               std::chrono::steady_clock::now() - start)
 	                                               .count());
@@ -2769,16 +3343,26 @@ PipelineCache::ManifestBacklog PipelineCache::GetManifestBacklog() const {
 	std::scoped_lock lock(state.mutex);
 	backlog.modules   = static_cast<uint32_t>(state.module_jobs.size());
 	backlog.pipelines = static_cast<uint32_t>(state.pipeline_jobs.size());
+	backlog.pipelines += static_cast<uint32_t>(m_restore_jobs.size() + state.large_compute.size());
 	backlog.running   = state.running;
+	backlog.startup_total = state.startup ? state.startup_total : 0;
+	backlog.startup_done  = state.startup_done;
+	backlog.memory_paused = state.startup && state.memory.since.has_value();
 	backlog.scanning  = state.scanning.load(std::memory_order_acquire);
 	for (const auto index: state.module_jobs) {
 		backlog.compute_modules += state.warm_modules[index].stage == ShaderType::Compute ? 1u : 0u;
 	}
 	backlog.modules_done     = state.built + state.found + state.failed;
+	backlog.modules_total    = state.warm_modules.size();
+	backlog.failures         = state.failed + state.pipelines_failed + state.compute_failed +
+	                           state.dropped.load(std::memory_order_relaxed);
 	backlog.pipelines_done   = state.pipelines + state.pipelines_known + state.pipelines_failed;
 	backlog.threads          = static_cast<uint32_t>(state.threads.size());
 	backlog.module_seconds   = state.module_time.Get();
 	backlog.pipeline_seconds = state.pipeline_time.Get();
+	backlog.modules_found     = state.found;
+	backlog.modules_built     = state.built;
+	backlog.pipelines_created = state.pipelines + state.compute;
 	return backlog;
 }
 
@@ -2791,9 +3375,11 @@ bool PipelineCache::WaitForManifestCompletion(std::chrono::milliseconds timeout)
 	std::unique_lock lock(state.mutex);
 	for (;;) {
 		const bool complete = !state.scanning.load(std::memory_order_acquire) &&
-		                      state.module_jobs.empty() && state.pipeline_jobs.empty() && state.running == 0 &&
+		                      state.module_jobs.empty() && state.pipeline_jobs.empty() &&
+		                      state.large_compute.empty() && m_restore_jobs.empty() && state.running == 0 &&
 		                      state.built + state.found + state.failed == state.warm_modules.size() &&
-		                      state.pipelines + state.pipelines_known + state.pipelines_failed == state.warm_pipelines.size() &&
+		                      state.pipelines + state.pipelines_known + state.pipelines_failed ==
+		                          state.warm_pipelines.size() + state.restored_graphics &&
 		                      std::ranges::all_of(state.missing_code, [](uint8_t missing) { return missing == 0; });
 		if (complete) {
 			return state.failed == 0 && state.pipelines_failed == 0 && state.compute_failed == 0 &&
@@ -2812,7 +3398,7 @@ void PipelineCache::ManifestProgress(bool force) {
 	std::scoped_lock lock(state.mutex);
 	const auto       now = std::chrono::steady_clock::now();
 	const bool       idle =
-	    state.module_jobs.empty() && state.pipeline_jobs.empty() && state.running == 0;
+	    state.module_jobs.empty() && state.pipeline_jobs.empty() && state.large_compute.empty() && m_restore_jobs.empty() && state.running == 0;
 	if (!force &&
 	    (state.logged_idle || (!idle && now - state.last_log < std::chrono::seconds(2)))) {
 		return;
@@ -2823,7 +3409,7 @@ void PipelineCache::ManifestProgress(bool force) {
 		waiting += missing != 0 ? 1u : 0u;
 	}
 	const auto modules   = state.warm_modules.size();
-	const auto pipelines = state.warm_pipelines.size();
+	const auto pipelines = state.warm_pipelines.size() + state.restored_graphics;
 	if (!idle && !force) {
 		ManifestLog("Pipeline manifest: {}/{} modules, {}/{} pipelines ({} modules wait for "
 		            "their shaders) at {:.1f} s",
@@ -2854,6 +3440,8 @@ void PipelineCache::RecordModule(const ProgramKey&                       key,
 	                       .code_hash        = key.hash,
 	                       .user_data_count  = key.user_data_count,
 	                       .push_data_cursor = push_data_cursor,
+	                       .runtime_buffers  = options.runtime_buffer_descriptors,
+	                       .runtime_samplers = options.runtime_sampler_descriptors,
 	                       .specialization   = module.specialization};
 	if (!options.back_code.empty()) {
 		record.code_hash = XXH3_64bits(code.data(), code.size_bytes());
@@ -2885,6 +3473,38 @@ void PipelineCache::RecordModule(const ProgramKey&                       key,
 		state.module_records[module.plain->id] = {found->second, true};
 	}
 	state.module_generation.fetch_add(1, std::memory_order_release);
+}
+
+void PipelineCache::CaptureQueuedPipeline(const GraphicsPipelineKey& key, const HW::Shader& shaders) {
+	static const bool enabled = std::getenv("KYTY_CAPTURE_QUEUED_PIPELINES") != nullptr;
+	if (!enabled || m_manifest == nullptr || m_manifest->record_path.empty()) {
+		return;
+	}
+	PipelineManifest capture;
+	ManifestPipeline recipe {.key = key, .float_modes = ReadManifestFloatModes(shaders, key.stage_ids)};
+	recipe.key.stage_ids = {};
+	const auto variant = GraphicsPipelineKeyHash {}(key);
+	{
+		std::scoped_lock lock(m_manifest->mutex);
+		for (size_t i = 0; i < key.stage_ids.size(); ++i) {
+			if (key.stage_ids[i] == 0) continue;
+			const auto found = m_manifest->module_records.find(key.stage_ids[i]);
+			if (found == m_manifest->module_records.end() || (found->second.second && i != 3)) {
+				ManifestLog("[kyty-queued-recipe] {:016x} missing stage={} module={:016x}",
+				            variant, i, key.stage_ids[i]);
+				return;
+			}
+			recipe.stages[i] = static_cast<uint32_t>(capture.modules.size());
+			recipe.plain_pixel |= found->second.second;
+			capture.modules.push_back(m_manifest->recorded.modules[found->second.first]);
+		}
+	}
+	capture.pipelines.push_back(recipe);
+	const auto bytes = SaveManifest(capture);
+	std::string_view text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+	for (auto line: ManifestText::Split(text, '\n')) {
+		if (!line.empty()) ManifestLog("[kyty-queued-recipe] {:016x} {}", variant, line);
+	}
 }
 
 bool PipelineCache::RecordPipeline(const GraphicsPipelineKey& key,

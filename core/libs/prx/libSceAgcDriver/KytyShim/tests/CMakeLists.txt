@@ -374,7 +374,8 @@ endif()
 
 add_test_executable(kyty_shim_presentation_upscale_tests ${CMAKE_CURRENT_SOURCE_DIR}/PresentationUpscale.cpp)
 configure_host_test_executable(kyty_shim_presentation_upscale_tests)
-target_include_directories(kyty_shim_presentation_upscale_tests PRIVATE ${CMAKE_SOURCE_DIR}/core/libs)
+target_include_directories(kyty_shim_presentation_upscale_tests PRIVATE ${CMAKE_SOURCE_DIR}/core/libs
+        ${CMAKE_SOURCE_DIR}/core/kyty ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
 add_test(NAME kyty_shim_presentation_upscale COMMAND kyty_shim_presentation_upscale_tests)
 set_tests_properties(kyty_shim_presentation_upscale PROPERTIES TIMEOUT 20)
 
@@ -397,6 +398,17 @@ target_include_directories(kyty_shim_rt_oracle_tests SYSTEM PRIVATE ${CMAKE_SOUR
 target_link_libraries(kyty_shim_rt_oracle_tests PRIVATE Kyty::gpu libkernel libc)
 add_test(NAME kyty_shim_rt_oracle COMMAND kyty_shim_rt_oracle_tests)
 set_tests_properties(kyty_shim_rt_oracle PROPERTIES TIMEOUT 20)
+add_test_executable(kyty_shim_rt_context_pick_tests ${CMAKE_CURRENT_SOURCE_DIR}/RtContextPick.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_rt_context_pick_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_include_directories(kyty_shim_rt_context_pick_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
+configure_host_test_executable(kyty_shim_rt_context_pick_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_rt_context_pick_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_rt_context_pick_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_rt_context_pick COMMAND kyty_shim_rt_context_pick_tests)
+set_tests_properties(kyty_shim_rt_context_pick PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_rt_context_pick: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
 add_test_executable(kyty_shim_rt_check_tests ${CMAKE_CURRENT_SOURCE_DIR}/RtCheck.cpp)
 target_include_directories(kyty_shim_rt_check_tests PRIVATE ${LIBS_INCLUDE_DIR})
@@ -443,6 +455,12 @@ add_test(NAME kyty_shim_empty_buffer_variants_off COMMAND kyty_shim_empty_buffer
 set_tests_properties(kyty_shim_empty_buffer_variants_off PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_SHARE_EMPTY_BUFFERS=0"
         PASS_REGULAR_EXPRESSION "kyty_shim_empty_buffer_variants_off: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
+add_test_executable(kyty_shim_manifest_startup_tests ${CMAKE_CURRENT_SOURCE_DIR}/ManifestStartup.cpp)
+configure_host_test_executable(kyty_shim_manifest_startup_tests)
+target_include_directories(kyty_shim_manifest_startup_tests PRIVATE ${CMAKE_SOURCE_DIR}/core/kyty)
+add_test(NAME kyty_shim_manifest_startup COMMAND kyty_shim_manifest_startup_tests)
+set_tests_properties(kyty_shim_manifest_startup PROPERTIES TIMEOUT 20)
+
 if(NOT ANYPS5_KYTY_DLL)
     add_test_executable(kyty_shim_manifest_float_modes_tests ${CMAKE_CURRENT_SOURCE_DIR}/ManifestFloatModes.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
     target_include_directories(kyty_shim_manifest_float_modes_tests PRIVATE ${LIBS_INCLUDE_DIR})
@@ -454,6 +472,16 @@ if(NOT ANYPS5_KYTY_DLL)
     add_test(NAME kyty_shim_manifest_float_modes COMMAND kyty_shim_manifest_float_modes_tests)
     set_tests_properties(kyty_shim_manifest_float_modes PROPERTIES TIMEOUT 20
             PASS_REGULAR_EXPRESSION "kyty_shim_manifest_float_modes: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
+    add_test_executable(kyty_shim_compute_recipes_tests ${CMAKE_CURRENT_SOURCE_DIR}/ComputeRecipes.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    target_include_directories(kyty_shim_compute_recipes_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    configure_host_test_executable(kyty_shim_compute_recipes_tests)
+    if(MINGW)
+        target_link_libraries(kyty_shim_compute_recipes_tests PRIVATE stdc++ gcc_eh)
+    endif()
+    target_link_libraries(kyty_shim_compute_recipes_tests PRIVATE Kyty::gpu libkernel libc)
+    add_test(NAME kyty_shim_compute_recipes COMMAND kyty_shim_compute_recipes_tests)
+    set_tests_properties(kyty_shim_compute_recipes PROPERTIES TIMEOUT 30)
 endif()
 
 add_test_executable(kyty_shim_gpu_control_loads_tests ${CMAKE_CURRENT_SOURCE_DIR}/GpuControlLoads.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
@@ -532,7 +560,7 @@ set_tests_properties(kyty_shim_mesh_per_primitive_block_draw PROPERTIES TIMEOUT 
         PASS_REGULAR_EXPRESSION "kyty_shim_mesh_per_primitive_block_draw: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
 if(NOT ANYPS5_KYTY_DLL)
-    add_test_executable(kyty_shim_recompiler_robustness_tests ${CMAKE_CURRENT_SOURCE_DIR}/RecompilerRobustness.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    add_test_executable(kyty_shim_recompiler_robustness_tests ${CMAKE_CURRENT_SOURCE_DIR}/RecompilerRobustness.cpp ${CMAKE_CURRENT_SOURCE_DIR}/FixedLoopTail.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
     target_include_directories(kyty_shim_recompiler_robustness_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../fuzz)
     target_include_directories(kyty_shim_recompiler_robustness_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
     configure_host_test_executable(kyty_shim_recompiler_robustness_tests)
@@ -733,8 +761,12 @@ add_dependencies(kyty_shim_depth_target_alias_tests agc_frame_replay)
 add_test(NAME kyty_shim_depth_target_alias COMMAND kyty_shim_depth_target_alias_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_depth_target_alias PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_depth_target_alias: ok")
+add_test(NAME kyty_shim_restored_graphics_wait COMMAND kyty_shim_depth_target_alias_tests $<TARGET_FILE:agc_frame_replay> --restored)
+set_tests_properties(kyty_shim_restored_graphics_wait PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        ENVIRONMENT "KYTY_PIPELINE_MANIFEST=1"
+        PASS_REGULAR_EXPRESSION "kyty_shim_restored_graphics_wait: ok")
 if(WIN32)
-    set_property(TEST kyty_shim_depth_target_alias APPEND PROPERTY
+    set_property(TEST kyty_shim_depth_target_alias kyty_shim_restored_graphics_wait APPEND PROPERTY
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
 endif()
 
@@ -813,6 +845,17 @@ target_link_libraries(kyty_shim_flattened_srt_uniform_tests PRIVATE Kyty::gpu li
 add_test(NAME kyty_shim_flattened_srt_uniform COMMAND kyty_shim_flattened_srt_uniform_tests)
 set_tests_properties(kyty_shim_flattened_srt_uniform PROPERTIES TIMEOUT 60
         PASS_REGULAR_EXPRESSION "kyty_shim_flattened_srt_uniform: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
+add_test_executable(kyty_shim_indirect_buffer_dst_sel_tests ${CMAKE_CURRENT_SOURCE_DIR}/IndirectBufferDstSel.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_indirect_buffer_dst_sel_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_indirect_buffer_dst_sel_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_indirect_buffer_dst_sel_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_indirect_buffer_dst_sel_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_indirect_buffer_dst_sel COMMAND kyty_shim_indirect_buffer_dst_sel_tests)
+set_tests_properties(kyty_shim_indirect_buffer_dst_sel PROPERTIES TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "kyty_shim_indirect_buffer_dst_sel: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
 add_test_executable(kyty_shim_uniform_scalar_loads_tests ${CMAKE_CURRENT_SOURCE_DIR}/UniformScalarLoads.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_uniform_scalar_loads_tests PRIVATE ${LIBS_INCLUDE_DIR})

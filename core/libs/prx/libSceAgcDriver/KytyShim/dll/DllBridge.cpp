@@ -40,6 +40,8 @@
 
 extern "C" void AgcDriverSubmitGraphics_nid_postfix(std::uint32_t* commands, std::uint32_t dwords);
 extern "C" void AgcDriverSuspendPoint_nid_postfix();
+extern "C" bool AgcDriverHasStartupPipelineData_nid_postfix();
+extern "C" bool AgcDriverWaitForStartupManifest_nid_postfix(uint32_t* done, uint32_t* total, bool* memoryPaused);
 extern "C" void AgcDriverWaitIdle_nid_postfix();
 extern "C" void AgcDriverPrestartGpu_nid_postfix();
 extern "C" void AgcDriverShutdown_nid_postfix();
@@ -143,7 +145,7 @@ KytyDllDisplayBuffer ToBuffer(const AgcDriver::DisplayBuffer& buffer) {
 }
 
 AgcDriver::PresentationWindow ToWindow(const KytyDllWindow& window) {
-    return {window.context, std::span<const char* const>(window.extensions, window.extension_count), window.create_surface, window.get_drawable_size, window.width, window.height, nullptr};
+    return {window.context, std::span<const char* const>(window.extensions, window.extension_count), window.create_surface, window.get_drawable_size, window.width, window.height, nullptr, window.idle, window.pump_events, window.recent_flip};
 }
 
 std::string HostPath(std::size_t (*resolve)(const char*, char*, std::size_t), const char* path) {
@@ -322,6 +324,12 @@ const KytyDllApi* MakeApi() {
         table.submit = [](const void* packet, std::uint32_t queue) { return Guard([&] { AgcDriver::Submit(static_cast<const Packet*>(packet), queue); }); };
         table.submit_graphics = [](std::uint32_t* commands, std::uint32_t dwords) { return Guard([&] { AgcDriverSubmitGraphics_nid_postfix(commands, dwords); }); };
         table.suspend_point = [] { return Guard([] { AgcDriverSuspendPoint_nid_postfix(); }); };
+        table.has_startup_pipeline_data = [](bool* available) {
+            return Guard([&] { *available = AgcDriverHasStartupPipelineData_nid_postfix(); });
+        };
+        table.wait_for_startup_manifest = [](uint32_t* done, uint32_t* total, bool* memoryPaused, bool* ready) {
+            return Guard([&] { *ready = AgcDriverWaitForStartupManifest_nid_postfix(done, total, memoryPaused); });
+        };
         table.wait_idle = [] { return Guard([] { AgcDriverWaitIdle_nid_postfix(); }); };
         table.prestart_gpu = [] { return Guard([] { AgcDriverPrestartGpu_nid_postfix(); }); };
         table.shutdown = [] { return Guard([] { AgcDriverShutdown_nid_postfix(); }); };

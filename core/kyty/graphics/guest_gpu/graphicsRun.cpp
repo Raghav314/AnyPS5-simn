@@ -241,12 +241,7 @@ bool GuestGpu::PostReadbackCommand(Common::UniqueFunction<void>&& command) {
 	if (!m_pipelined || IsGpuThread()) {
 		return false;
 	}
-	{
-		std::lock_guard lock(m_urgent_mutex);
-		m_urgent_commands.push_back(std::move(command));
-		m_urgent_pending.fetch_add(1, std::memory_order_release);
-	}
-	(m_resolving ? m_resolved : m_operations).Interrupt();
+	PostUrgentCommand(std::move(command), false);
 	return true;
 }
 
@@ -269,17 +264,21 @@ uint64_t GuestGpu::WaitForOrderedOperations(uint64_t begin, uint64_t end) {
 
 void GuestGpu::PostUrgentCommandSync(Common::UniqueFunction<void>&& command, bool drain_copies) {
 	std::binary_semaphore done {0};
+	PostUrgentCommand([operation = std::move(command), &done]() mutable {
+		operation();
+		done.release();
+	}, drain_copies);
+	done.acquire();
+}
+
+void GuestGpu::PostUrgentCommand(Common::UniqueFunction<void>&& command, bool drain_copies) {
 	{
 		std::lock_guard lock(m_urgent_mutex);
-		m_urgent_commands.push_back([operation = std::move(command), &done]() mutable {
-			operation();
-			done.release();
-		});
+		m_urgent_commands.push_back(std::move(command));
 		m_urgent_drains += drain_copies ? 1 : 0;
 		m_urgent_pending.fetch_add(1, std::memory_order_release);
 	}
 	(m_resolving ? m_resolved : m_operations).Interrupt();
-	done.acquire();
 }
 
 void GuestGpu::RunUrgentCommands() {
@@ -596,6 +595,7 @@ void GuestGpu::ResolveThread() {
 		} else if (operation->kind == GpuOperationKind::DispatchDirect ||
 		           operation->kind == GpuOperationKind::DispatchIndirect) {
 			operation->ahead_note = RenderExecutor::AheadNote::NotPrepared;
+			const ComputeDispatchTrace::Scope origin(operation->dispatch.origin);
 			if (operation->kind == GpuOperationKind::DispatchDirect) {
 				const uint32_t groups[] = {operation->dispatch.thread_group_x,
 				                           operation->dispatch.thread_group_y,
@@ -879,6 +879,7 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			break;
 		case GpuOperationKind::DispatchDirect: {
 			const auto& dispatch = operation.dispatch;
+			const ComputeDispatchTrace::Scope origin(dispatch.origin);
 			executor.BeginAheadOperation(operation.resolved, operation.ahead_note);
 			ExecuteDispatchDirect(operation, dispatch.thread_group_x, dispatch.thread_group_y,
 			                      dispatch.thread_group_z, dispatch.mode);
@@ -888,7 +889,8 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			}
 			break;
 		}
-		case GpuOperationKind::DispatchIndirect:
+		case GpuOperationKind::DispatchIndirect: {
+			const ComputeDispatchTrace::Scope origin(operation.dispatch.origin);
 			executor.BeginAheadOperation(operation.resolved, operation.ahead_note);
 			ExecuteDispatchIndirect(operation);
 			executor.EndAheadOperation();
@@ -896,6 +898,7 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
 			}
 			break;
+		}
 		case GpuOperationKind::Callback:
 			if (operation.callback) {
 				operation.callback();
@@ -2662,7 +2665,7 @@ void CommandProcessor::EmitPsrBlasBuilt() {
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
-                                      uint32_t thread_group_z, uint32_t mode) {
+                                      uint32_t thread_group_z, uint32_t mode, std::span<const uint32_t> packet) {
 	PsrBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr);
 	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr) ||
 	    HleBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
@@ -2674,7 +2677,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	operation.dispatch = {.thread_group_x = thread_group_x,
 	                      .thread_group_y = thread_group_y,
 	                      .thread_group_z = thread_group_z,
-	                      .mode           = mode};
+	                      .mode           = mode,
+	                      .origin         = ComputeDispatchTrace::Capture(packet, operation.submit_id)};
 	Emit(std::move(operation));
 	EmitPsrBlasBuilt();
 }
@@ -2696,7 +2700,7 @@ void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
 	});
 }
 
-void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode, std::span<const uint32_t> packet) {
 	PsrBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr);
 	if (HleTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr) ||
 	    HleBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
@@ -2706,7 +2710,8 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	GetShCtx().SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	auto operation     = MakeOperation(GpuOperationKind::DispatchIndirect);
-	operation.dispatch = {.mode = mode, .args_addr = args_addr};
+	operation.dispatch = {.mode = mode, .args_addr = args_addr,
+	                      .origin = ComputeDispatchTrace::Capture(packet, operation.submit_id)};
 	Emit(std::move(operation));
 	EmitPsrBlasBuilt();
 }

@@ -55,6 +55,15 @@ RenderContext::~RenderContext() {
 	m_command_scheduler.Shutdown();
 }
 
+void RenderContext::NoteFirstGuestCommand(bool compute) {
+	const uint8_t bit = compute ? 2 : 1;
+	if ((m_first_guest_commands.load(std::memory_order_relaxed) & bit) != 0 ||
+	    (m_first_guest_commands.fetch_or(bit, std::memory_order_relaxed) & bit) != 0) return;
+	const auto now = std::chrono::steady_clock::now().time_since_epoch();
+	std::fprintf(stderr, "[kyty-startup] first_%s monotonic_ns=%lld\n", compute ? "dispatch" : "draw",
+	             static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()));
+}
+
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
@@ -491,21 +500,11 @@ void RenderContext::CacheIndexedBufferReads(const ShaderStageRuntime& runtime) {
 
 void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 	const auto&      program   = runtime.module->info;
-	const auto&      user_data = runtime.resources->user_data;
+	const auto&      resources = *runtime.resources;
 	std::shared_lock lock(m_mapped_ranges_mutex);
 
-	const auto cache_after = [&](const std::array<uint32_t, 2>& pair, uint64_t window,
-	                             bool contiguous) {
-		const auto [low_reg, high_reg] = pair;
-		const auto low  = static_cast<uint64_t>(low_reg) - program.user_data_base;
-		const auto high = static_cast<uint64_t>(high_reg) - program.user_data_base;
-		if (low_reg < program.user_data_base || high_reg < program.user_data_base ||
-		    low >= user_data.size() || high >= user_data.size()) {
-			return;
-		}
-		const auto base =
-		    user_data[low] | (static_cast<uint64_t>(user_data[high] & 0xffffu) << 32u);
-		if (base > UINT64_MAX - window) {
+	const auto cache_range = [&](uint64_t base, uint64_t window, bool contiguous) {
+		if (base == 0 || base > UINT64_MAX - window) {
 			return;
 		}
 		m_mapped_ranges.ForEachInRange(base, window, [&](uint64_t start, uint64_t end) {
@@ -514,11 +513,31 @@ void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 			}
 		});
 	};
+	const auto cache_after = [&](const std::array<uint32_t, 2>& pair, uint64_t window,
+	                             bool contiguous) {
+		const auto [low_reg, high_reg] = pair;
+		const auto low  = static_cast<uint64_t>(low_reg) - program.user_data_base;
+		const auto high = static_cast<uint64_t>(high_reg) - program.user_data_base;
+		if (low_reg < program.user_data_base || high_reg < program.user_data_base ||
+		    low >= resources.user_data.size() || high >= resources.user_data.size()) {
+			return;
+		}
+		const auto base = resources.user_data[low] |
+		                  (static_cast<uint64_t>(resources.user_data[high] & 0xffffu) << 32u);
+		cache_range(base, window, contiguous);
+	};
 	for (const auto& pair: program.info.dma_base_registers) {
 		cache_after(pair, BufferCache::CACHING_PAGESIZE, false);
 	}
 	for (const auto& pair: program.info.vsharp_base_registers) {
 		cache_after(pair, VsharpBaseReach, true);
+	}
+	const auto& flat = resources.flattened_srt;
+	for (const auto& [low, high]: program.info.address_bases) {
+		if (low < flat.size() && high < flat.size()) {
+			const auto base = flat[low] | (uint64_t {flat[high]} << 32u);
+			cache_range(base, BufferCache::CACHING_PAGESIZE, false);
+		}
 	}
 	CacheTlasMemory(runtime);
 }
@@ -558,11 +577,23 @@ bool RenderContext::CacheSelfSizedBuffers(const ShaderStageRuntime& runtime) {
 }
 
 void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
-	const auto&                  program = runtime.module->info;
+	const auto&            program = runtime.module->info;
 	RayTracing::TlasSource source;
 	if (!RayTracing::FindGuestTlasSource(program.info, source)) {
 		return;
 	}
+	CacheTlasMemory(runtime, source, true);
+	if (!program.info.ray_query) {
+		return;
+	}
+	for (const auto& extra: program.info.ray_query_extra_sources) {
+		CacheTlasMemory(runtime, RayTracing::ExtraTlasSource(extra), false);
+	}
+}
+
+void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime, const RayTracing::TlasSource& source,
+                                    bool note_instances) {
+	const auto& program   = runtime.module->info;
 	const auto& resources = *runtime.resources;
 	const auto readable = [this](uint64_t address, uint64_t size) {
 		return GuestRange {address, size}.Valid() && m_mapped_ranges.Contains(address, size) &&
@@ -605,7 +636,7 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 			}
 		});
 	}
-	if (program.info.ray_query && m_ray_tracing->Enabled()) {
+	if (note_instances && program.info.ray_query && m_ray_tracing->Enabled()) {
 		m_ray_tracing->NoteTlasInstances(tlas.instances);
 	}
 }
@@ -1119,6 +1150,7 @@ bool RenderContext::AddRayTracingReach(const ShaderStageRuntime& runtime) {
 	uint64_t                     header    = 0;
 	uint64_t                     header_at = 0;
 	if (reach.empty() || reach.size() != 1u + uint64_t {reach[0]} * 2u || !m_ray_tracing->Enabled() ||
+	    !program.info.ray_query_extra_sources.empty() ||
 	    !RayTracing::FindGuestTlasSource(program.info, source) ||
 	    !GuestTlasHeader(runtime, source, header, header_at)) {
 		return false;
@@ -1174,6 +1206,7 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 	m_buffer_cache.PrepareFaultBuffer();
 	if (may_write) {
 		m_buffer_cache.NoteDeviceAddressUse();
+		m_indirect_write_tables.NotePendingWrites();
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	const std::array<uint64_t, 3> epochs {RegionManager::CpuDirtyEpoch(),
@@ -1193,11 +1226,21 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 	m_use_scan_pending      = true;
 }
 
+void RenderContext::PrepareHackMarks() {
+	m_buffer_cache.PrepareFaultBuffer();
+	m_hack_marks_pending = true;
+}
+
 void RenderContext::RunGarbageCollector() {
 	m_frame_number++;
+	m_descriptor_heap.TrimCompletedPools();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
+		m_hack_marks_pending    = true;
 		m_buffer_cache.ProcessFaultBuffer();
+	}
+	if (m_hack_marks_pending && m_buffer_cache.ProcessHackMarks()) {
+		m_hack_marks_pending = false;
 	}
 	m_image_heap.RunGarbageCollector();
 	if (m_use_scan_countdown != 0) {

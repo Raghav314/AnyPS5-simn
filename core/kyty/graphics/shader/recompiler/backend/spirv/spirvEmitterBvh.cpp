@@ -241,9 +241,9 @@ uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
 namespace {
 
 constexpr uint32_t ServedFlags    = IR::BvhIntersectNative | IR::BvhIntersectOracle | IR::BvhIntersectEmpty;
-constexpr uint32_t IntersectFlags = ServedFlags | IR::BvhIntersectOracleLane;
+constexpr uint32_t IntersectFlags = ServedFlags | IR::BvhIntersectOracleLane | IR::BvhIntersectStrict | IR::BvhIntersectOracleMulti;
 
-bool KeepsGuestLanes(const IR::Inst& init, const std::array<bool, 4>* alpha_sites) {
+bool KeepsGuestLanes(const IR::Inst& init, const std::array<bool, IR::MaxRayQuerySites>* alpha_sites) {
 	const auto& allow = init.Arg(14);
 	if (!allow.IsImmediate() || !allow.U1()) return true;
 	const auto variant = IR::RayQueryVariant(init.Flags<uint32_t>());
@@ -252,7 +252,7 @@ bool KeepsGuestLanes(const IR::Inst& init, const std::array<bool, 4>* alpha_site
 	       (variant & IR::RayQueryInitOpaqueOnly) == 0 && (alpha_sites == nullptr || !(*alpha_sites)[site]);
 }
 
-bool GuestLanes(const IR::Program& program, const std::array<bool, 4>* alpha_sites) {
+bool GuestLanes(const IR::Program& program, const std::array<bool, IR::MaxRayQuerySites>* alpha_sites) {
 	return std::ranges::any_of(program.blocks, [&](const IR::Block* block) {
 		return std::ranges::any_of(*block, [&](const IR::Inst& inst) {
 			return inst.GetOpcode() == IR::ValueOpcode::RayQueryInit && KeepsGuestLanes(inst, alpha_sites);
@@ -410,6 +410,15 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 			values[i] = Unary(s, spv::OpBitcast, TypeF32(s), ctx.Arg(*ray, first + i));
 		return Vector(s, TypeF32Vector(s, 3), values);
 	};
+	if ((inst.Flags<uint32_t>() & (IR::BvhIntersectStrict | IR::BvhIntersectNative)) == IR::BvhIntersectStrict) {
+		const auto u    = TypeU32(s);
+		const auto kind = Binary(s, spv::OpBitwiseAnd, u, ctx.Arg(*ray, 0), ConstantU32(s, 7));
+		const auto leaf = Binary(s, spv::OpULessThan, TypeBool(s), kind, ConstantU32(s, 4));
+		const std::array<uint32_t, 4> leaf_miss {0x7f800000u, 0x3f800000u, ~0u, 0u};
+		std::array<uint32_t, 4>       words;
+		for (uint32_t i = 0; i < 4; ++i) words[i] = Select(s, u, leaf, ConstantU32(s, leaf_miss[i]), ConstantU32(s, ~0u));
+		return Vector(s, TypeU32Vector(s, 4), words);
+	}
 	const auto descriptor = ctx.Arg(inst, 0);
 	const auto node   = node_words == 2u ? PackU64(s, ctx.Arg(*ray, 0), ctx.Arg(*ray, 1))
 	                                     : Unary(s, spv::OpUConvert, TypeU64(s), ctx.Arg(*ray, 0));

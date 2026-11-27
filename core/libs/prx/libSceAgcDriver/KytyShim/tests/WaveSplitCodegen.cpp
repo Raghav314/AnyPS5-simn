@@ -129,18 +129,18 @@ Module Inspect(const std::vector<uint32_t>& words) {
 	return module;
 }
 
-std::vector<uint32_t> Compile(const Program& program, uint64_t hash) {
+std::vector<uint32_t> Compile(const Program& program, uint64_t hash, uint32_t wave_size = WaveLanes,
+                              Recompiler::Spirv::Profile profile = {.maintenance8 = true, .robust_buffer_access = true}) {
 	ShaderComputeInputInfo compute;
 	compute.threads_num[0]     = program.threads;
 	compute.threads_num[1]     = 1u;
 	compute.threads_num[2]     = 1u;
 	compute.lds_size_dwords    = program.lds_bytes / 4u;
-	compute.wave_size          = WaveLanes;
+	compute.wave_size          = wave_size;
 	compute.host_subgroup_size = 32u;
 	compute.thread_ids_num     = 1;
 	compute.group_id[0]        = true;
 	compute.workgroup_register = static_cast<int>(UserDataDwords);
-	static Recompiler::Spirv::Profile profile {.maintenance8 = true, .robust_buffer_access = true};
 	alignas(256) static std::array<uint32_t, 16384> output_words {};
 	const auto output_address = reinterpret_cast<uintptr_t>(output_words.data());
 	std::array<uint32_t, UserDataDwords> user_data {};
@@ -150,7 +150,7 @@ std::vector<uint32_t> Compile(const Program& program, uint64_t hash) {
 	user_data[7] = (0x01016facu & ~(0x7fu << 12u)) | (20u << 12u) | (3u << 28u);
 	Recompiler::CompileOptions options;
 	options.stage              = ShaderType::Compute;
-	options.wave_size          = WaveLanes;
+	options.wave_size          = wave_size;
 	options.user_data_base     = 0u;
 	options.shader_hash        = hash;
 	options.profile            = &profile;
@@ -258,6 +258,33 @@ std::vector<uint32_t> LoopModule(uint32_t threads, uint32_t values) {
 	return words;
 }
 
+void FirstLaneProfiles() {
+	const Program program {"first-lane", FirstLane32Code, 64, 0, false};
+	const auto compute_stage = 1u << static_cast<uint32_t>(ShaderType::Compute);
+	uint64_t hash = 0x5711fa0000u;
+	for (const bool stage: {false, true}) {
+		for (const bool ballot: {false, true}) {
+			for (const bool arithmetic: {false, true}) {
+				Recompiler::Spirv::Profile profile {.maintenance8 = true, .robust_buffer_access = true};
+				profile.subgroup_stages = stage ? compute_stage : 0;
+				profile.subgroup_ballot = ballot;
+				profile.subgroup_arithmetic = arithmetic;
+				const auto words = Compile(program, ++hash, 32, profile);
+				bool reduction = false, shuffle = false, arithmetic_cap = false;
+				for (size_t at = 5; at < words.size(); at += words[at] >> 16u) {
+					const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+					reduction |= op == spv::OpGroupNonUniformBitwiseOr;
+					shuffle |= op == spv::OpGroupNonUniformShuffle;
+					arithmetic_cap |= op == spv::OpCapability && words[at + 1] == spv::CapabilityGroupNonUniformArithmetic;
+				}
+				const bool expected = stage && ballot && arithmetic;
+				Check(reduction == expected && shuffle != expected && arithmetic_cap == expected,
+					  "ReadFirstLane uses the stage's advertised subgroup operations");
+			}
+		}
+	}
+}
+
 void RegisterRelief() {
 	struct Shape {
 		uint32_t threads;
@@ -334,6 +361,7 @@ int main() {
 			      std::string(program.name) + ": the wave's store to one LDS word goes through the exchange first");
 		}
 	}
+	FirstLaneProfiles();
 	ComputeDerivatives();
 	RegisterRelief();
 	if (g_failures != 0) return 1;

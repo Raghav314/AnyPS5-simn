@@ -959,7 +959,7 @@ void Translator::IMAGE_BVH8(const Decoder::Instruction& inst) {
 
 void Translator::EmitMemory(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
-		case Decoder::Opcode::S_DCACHE_INV: return;
+		case Decoder::Opcode::S_DCACHE_INV: program.scalar_cache_invalidates = true; return;
 		case Decoder::Opcode::BUFFER_GL0_INV:
 		case Decoder::Opcode::BUFFER_GL1_INV:
 			ir.Emit(IR::ValueOpcode::DataCacheInvalidate);

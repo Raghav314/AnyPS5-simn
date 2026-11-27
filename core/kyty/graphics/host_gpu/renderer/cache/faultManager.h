@@ -27,6 +27,7 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
 	void                  PrepareFaultBuffer();
 	void                  ProcessFaultBuffer();
+	bool                  ProcessHackMarkBuffer() { return ProcessHackMarks(); }
 	void                  ProcessWriteBuffer(PagesHandler&& handler);
 	void                  ProcessUseBuffer(PagesHandler&& handler);
 
@@ -41,7 +42,7 @@ private:
 	};
 
 	void Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&& handler);
-	void ProcessHackMarks();
+	bool ProcessHackMarks();
 
 	GraphicContext&         m_graphics;
 	CommandScheduler&       m_scheduler;

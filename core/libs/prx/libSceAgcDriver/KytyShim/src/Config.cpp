@@ -51,6 +51,7 @@ constexpr Flag Flags[] = {
     {"KYTY_OCCLUSION_QUERIES", &Options::occlusion_queries_enabled},
     {"KYTY_RELAXED_SHADER_FLOAT", &Options::relaxed_shader_float},
     {"KYTY_RT_STATS", &Options::rt_stats_enabled},
+    {"KYTY_RT_EMULATION", &Options::rt_emulation},
     {"KYTY_COMMAND_BUFFER_DUMP", &Options::command_buffer_dump_enabled},
     {"KYTY_GRAPHICS_DEBUG_DUMP", &Options::graphics_debug_dump_enabled},
     {"KYTY_PROFILE", &Options::profiler_enabled},
@@ -66,6 +67,7 @@ struct Number {
 };
 
 constexpr Number Numbers[] = {
+    {"KYTY_STARTUP_WAIT_SECONDS", &Options::startup_wait_seconds, 0, 0xffffffffu},
     {"KYTY_VBLANK_FREQUENCY", &Options::vblank_frequency, 0, 0xffffffffu},
     {"KYTY_RT_CHECK", &Options::rt_check_period, 0, 0xffffffffu},
     {"KYTY_RT_CHECK_PPM", &Options::rt_check_ppm, 0, 1000000u},

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -27,6 +28,14 @@ struct VramBudgetTestAccess {
 	static uint64_t TextureCritical(const TextureCache& cache) { return cache.m_critical_gc_memory; }
 	static uint64_t BufferTrigger(const BufferCache& cache) { return cache.m_trigger_gc_memory; }
 	static uint64_t BufferCritical(const BufferCache& cache) { return cache.m_critical_gc_memory; }
+
+	static std::vector<vk::DescriptorPool> PendingDescriptorPools(const DescriptorHeap& heap) {
+		std::vector<vk::DescriptorPool> pools;
+		for (const auto& [pool, tick]: heap.m_pending_pools) {
+			pools.push_back(pool.pool);
+		}
+		return pools;
+	}
 
 	static ImageId CreateImage(TextureCache& cache, const ImageInfo& info) {
 		Common::ScopedLock lock {cache.m_lock};
@@ -50,7 +59,59 @@ constexpr uint64_t GiB          = 1024ull * 1024 * 1024;
 constexpr uint64_t GuestBytes   = 0x20000;
 constexpr int      CpuReadWrite = 0x03;
 
+const char* CheckDescriptorPoolRetirement(GraphicContext& graphics) {
+	MasterSemaphore timeline(graphics);
+	DescriptorHeap heap(graphics, timeline);
+	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eStorageBuffer, 1,
+	                                               vk::ShaderStageFlagBits::eCompute};
+	vk::DescriptorSetLayoutCreateInfo create {};
+	create.bindingCount = 1;
+	create.pBindings = &binding;
+	vk::DescriptorSetLayout layout;
+	if (graphics.device.createDescriptorSetLayout(&create, nullptr, &layout) != vk::Result::eSuccess) {
+		return "could not create the test descriptor layout";
+	}
+	DescriptorHeap::RegisterLayout(layout, std::span {&binding, 1});
+	constexpr uint32_t SetsPerPool = 1024;
+	for (uint32_t i = 0; i < 3 * SetsPerPool + 1; i++) {
+		(void)heap.Commit(layout);
+	}
+	const auto first = timeline.NextTick();
+	for (uint32_t i = 0; i < SetsPerPool; i++) {
+		(void)heap.Commit(layout);
+	}
+	const auto last = timeline.NextTick();
+	const auto pending = VramBudgetTestAccess::PendingDescriptorPools(heap);
+	heap.TrimCompletedPools();
+	const auto in_flight = VramBudgetTestAccess::PendingDescriptorPools(heap);
+
+	vk::SemaphoreSignalInfo signal {};
+	signal.semaphore = timeline.Handle();
+	signal.value = first;
+	EXIT_IF(graphics.device.signalSemaphore(&signal) != vk::Result::eSuccess);
+	heap.TrimCompletedPools();
+	const auto partial = VramBudgetTestAccess::PendingDescriptorPools(heap);
+
+	signal.value = last;
+	EXIT_IF(graphics.device.signalSemaphore(&signal) != vk::Result::eSuccess);
+	heap.TrimCompletedPools();
+	const auto ready = VramBudgetTestAccess::PendingDescriptorPools(heap);
+	graphics.device.destroyDescriptorSetLayout(layout, nullptr);
+
+	if (pending.size() != 4 || in_flight != pending) {
+		return "descriptor trimming did not preserve pools awaiting GPU completion";
+	}
+	if (partial.size() != 2 || partial[0] != pending[2] || partial[1] != pending[3] ||
+	    ready.size() != 1 || ready[0] != pending[3]) {
+		return "descriptor trimming failed to retain one completed pool and all pending pools";
+	}
+	return nullptr;
+}
+
 const char* CheckVramBudget(GraphicContext& graphics, TextureCache& textures, BufferCache& buffers) {
+	if (const auto* failure = CheckDescriptorPoolRetirement(graphics)) {
+		return failure;
+	}
 	const auto tex_trigger_large  = VramBudgetTestAccess::TextureTrigger(textures);
 	const auto tex_pressure_large = VramBudgetTestAccess::TexturePressure(textures);
 	const auto tex_critical_large = VramBudgetTestAccess::TextureCritical(textures);

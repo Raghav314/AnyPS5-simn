@@ -1,0 +1,5 @@
+# libSceVideoOut
+
+## change [sceVideoOutGetOutputStatus]
+
+- [sceVideoOutGetOutputStatus](../../../core/libs/prx/libSceVideoOut/src/Output.cpp) (libSceVideoOut) - the status after a buffer is registered, a 1440p output, a display below 4K with the console's resolution on Automatic and `flags` in a title that enables HDR output were not measured. A payload process on a PS5 (firmware 12.70) with no buffer registered reported `resolution` 2 right after `sceVideoOutOpen(0xff, 0, 0, NULL)` with the console's resolution on Automatic on a 4K display and 1 with it set to 1080p, and `dynamicRange` 2 with `flags` 0, as here, on an HDR display with HDR on. `resolution` is 2 when the current display mode SDL reports for the window's display is at least 2560 pixels wide and 1440 high and 1 otherwise, read with the refresh rate and independent of the registered buffers; on Wayland SDL's mode is the output's logical size (from SDL's source, not run), so a 3840x2160 output scaled by 2 reports 1. `APS5_OUTPUT_RESOLUTION` replaces that size

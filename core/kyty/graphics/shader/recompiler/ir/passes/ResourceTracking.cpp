@@ -510,11 +510,15 @@ private:
 	std::map<std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>, uint32_t> m_predicates;
 };
 
+thread_local bool t_runtime_sampler_stop = false;
+
 class Tracker {
 public:
 	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
-	        ShaderStageInputInfo input)
+	        ShaderStageInputInfo input, bool runtime_buffer_descriptors, bool runtime_sampler_descriptors)
 	    : m_program(program), m_decoded(decoded), m_native_cfg(native_cfg), m_input(input),
+	      m_runtime_buffer_descriptors(runtime_buffer_descriptors),
+	      m_runtime_sampler_descriptors(runtime_sampler_descriptors),
 	      m_scalar_writes(std::move(program.scalar_writes)), m_info(program.info) {
 		std::ranges::sort(m_scalar_writes, {}, &Program::ScalarWrite::pc);
 		m_info.buffers.clear();
@@ -713,6 +717,15 @@ public:
 				const auto uses = read->Uses();
 				for (const auto& use: uses) use.user->SetArg(use.operand, key);
 			}
+		}
+		for (const auto& [use, resource]: m_view_uses) {
+			const auto* handle = use->Arg(0).ResolveInstruction();
+			auto* block = use->Parent();
+			const auto where = std::ranges::find_if(block->Instructions(), [&](const auto& inst) { return &inst == use; });
+			const auto view = block->PrependNewInst(where, ValueOpcode::GetImageResource,
+			    {handle->Arg(0), handle->Arg(1), handle->Arg(2), handle->Arg(3),
+			     handle->Arg(4), handle->Arg(5), handle->Arg(6), handle->Arg(7)}, resource);
+			use->SetArg(0, Value(&*view));
 		}
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
@@ -4555,12 +4568,15 @@ private:
 						    })) return;
 						plan.read_dwords = 4u;
 					}
-					if (TryMakeNestedDescriptor(*handle, descriptor, plan) ||
-					    TryMakeRecordTableDescriptor(*handle, descriptor, plan) ||
-					    (sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
-					    TryMakeTableDescriptor(*handle, descriptor, plan) ||
-					    (!sampler && (TryMakeFiniteDescriptor(*handle, plan) ||
-					                  TryMakeIndirectBuffer(*handle, descriptor, plan)))) {
+					const bool runtime_sampler = sampler && m_runtime_sampler_descriptors;
+					if ((runtime_sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
+					    (!runtime_sampler &&
+					     (TryMakeNestedDescriptor(*handle, descriptor, plan) ||
+					      TryMakeRecordTableDescriptor(*handle, descriptor, plan) ||
+					      (sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
+					      TryMakeTableDescriptor(*handle, descriptor, plan) ||
+					      (!sampler && (TryMakeFiniteDescriptor(*handle, plan) ||
+					                    TryMakeIndirectBuffer(*handle, descriptor, plan)))))) {
 						for (const auto& previous: m_indirect_descriptors) {
 							if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
 							    !EquivalentValue(m_program, previous.key, plan.key))
@@ -4572,6 +4588,9 @@ private:
 				if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw) {
 					plan_handle(inst.Arg(1), 4u, memory.sampler * 4u, true);
 				}
+				if (m_runtime_buffer_descriptors && IndirectBufferAccess(inst) &&
+				    memory.SupportsIndirectBufferAccess(inst.GetOpcode()))
+					continue;
 				plan_handle(inst.Arg(0), IndirectBufferAccess(inst) ? 4u : 8u,
 				            memory.resource * 4u, false);
 			}
@@ -4698,10 +4717,29 @@ private:
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
+			t_runtime_sampler_stop = expected == ValueOpcode::GetSamplerResource && !m_runtime_sampler_descriptors;
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
 			                     ValueOpcodeName(expected), bad_dword));
 		}
 		source = InternSource(descriptor);
+		return true;
+	}
+
+	bool RuntimeSamplerHandle(Value value, uint32_t pc, uint32_t base_reg, bool sample_adjust) {
+		auto* handle = value.Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetSamplerResource || handle->NumArgs() != 4u)
+			return false;
+		DescriptorSource descriptor;
+		MakeSource(*handle, 4u, true, sample_adjust, base_reg, descriptor, pc);
+		uint32_t bad_dword = 0;
+		if (ValidateSource(descriptor, bad_dword)) return false;
+		if (bad_dword == 3u) {
+			descriptor.dwords[3] = RuntimeOrOperand(descriptor.dwords[3]);
+			if (ValidateSource(descriptor, bad_dword)) return false;
+		}
+		for (uint32_t word = 0; word < 4u; ++word) {
+			if (handle->Arg(word).Resolve().GetType() != Type::U32) return false;
+		}
 		return true;
 	}
 
@@ -5451,7 +5489,8 @@ private:
 		                           memory.kind == ResourceKind::ScalarBuffer;
 	}
 
-	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
+	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc,
+	                  bool paired, bool raw = false) {
 		const auto resource_class = ImageOpcodeInfoOf(op).resource_class;
 		const bool atomic64 = ImageOpcodeInfoOf(op).access == ImageAccess::Atomic &&
 		                      memory.data_bits == 64u;
@@ -5466,7 +5505,8 @@ private:
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
 			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
-			    image.atomic64 == atomic64) {
+			    image.atomic64 == atomic64 && paired == (image.paired_view != ImageResource::NoIndirectImage) &&
+			    image.skip_degamma == raw) {
 				image.cube |= memory.image_cube;
 				Merge(image, op, pc);
 				return i;
@@ -5485,6 +5525,7 @@ private:
 		image.r128           = memory.image_r128;
 		image.cube           = memory.image_cube;
 		image.atomic64       = atomic64;
+		image.skip_degamma   = raw;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -5502,9 +5543,9 @@ private:
 		image.sample_access_only &= op == ValueOpcode::ImageSampleRaw;
 	}
 
-	uint32_t AddSampler(uint32_t source, uint32_t pc) {
+	uint32_t AddSampler(uint32_t source, uint32_t pc, bool runtime = false) {
 		for (uint32_t i = 0; i < m_info.samplers.size(); i++) {
-			if (m_info.samplers[i].source == source) {
+			if (m_info.samplers[i].source == source && m_info.samplers[i].runtime_descriptor == runtime) {
 				m_info.samplers[i].first_use_pc = std::min(m_info.samplers[i].first_use_pc, pc);
 				return i;
 			}
@@ -5514,6 +5555,10 @@ private:
 		}
 		m_info.samplers.push_back({source, pc});
 		const auto root = static_cast<uint32_t>(m_info.samplers.size() - 1);
+		if (runtime) {
+			m_info.samplers[root].runtime_descriptor = true;
+			return root;
+		}
 		const auto* descriptor = Source(source);
 		if (descriptor != nullptr && descriptor->indirect_descriptor) {
 			const auto& sources = descriptor->indirect_descriptor->sources;
@@ -5539,10 +5584,17 @@ private:
 		m_info.sampled_pairs.push_back({image, sampler, pc});
 	}
 
-	void AddHandlePatch(Inst* handle, uint32_t resource, uint32_t pc) {
+	void AddHandlePatch(Inst* handle, uint32_t resource, uint32_t pc, Inst* image_use = nullptr) {
 		for (const auto& patch: m_handle_patches) {
 			if (patch.handle == handle) {
 				if (patch.resource != resource) {
+					if (image_use != nullptr &&
+					    m_info.images[resource].source == m_info.images[patch.resource].source &&
+					    (m_info.images[resource].paired_view != ImageResource::NoIndirectImage ||
+					     m_info.images[patch.resource].paired_view != ImageResource::NoIndirectImage)) {
+						m_view_uses.emplace_back(image_use, resource);
+						return;
+					}
 					Fail(pc, fmt::format("{} is reused with incompatible resource classes",
 					                     ValueOpcodeName(handle->GetOpcode())));
 				}
@@ -5630,7 +5682,8 @@ private:
 				if (indirect_store) {
 					AddIndirectWriteTable(table_source, table_offset, flags.pc);
 				} else if (m_program.stage == ShaderType::Compute && handle != nullptr &&
-				           memory.kind == ResourceKind::Buffer && memory.SupportsIndirectBufferWrite(op) &&
+				           memory.kind == ResourceKind::Buffer &&
+				           (memory.SupportsIndirectBufferWrite(op) || memory.SupportsIndirectFormattedStore(op)) &&
 				           DerivesFromMemory(*handle)) {
 					CollectDmaBase(*handle, true);
 					m_program.has_address_writes = true;
@@ -5732,12 +5785,8 @@ private:
 			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc,
 			          memory.resource * 4u, handle, source);
 		}
-		resource = AddImage(source, memory, op, flags.pc);
-		if (resource == UINT32_MAX) {
-			Fail(flags.pc, "image resource limit exceeded");
-		}
-		AddHandlePatch(handle, resource, flags.pc);
 		uint32_t sampler = 0;
+		bool paired = false;
 		if (image_info.needs_sampler) {
 			if (inst.NumArgs() < 2) {
 				Fail(flags.pc, "sampled image operation has no sampler handle");
@@ -5749,13 +5798,21 @@ private:
 			sampler_handle = inst.Arg(1).Resolve().TryInstruction();
 			const auto* selected_sampler = sampler_handle != nullptr
 			    ? FindIndirectDescriptor(*sampler_handle) : nullptr;
+			bool runtime_sampler = false;
 			if (selected_sampler != nullptr) {
 				sampler_source = selected_sampler->source;
+			} else if (m_runtime_sampler_descriptors &&
+			           RuntimeSamplerHandle(inst.Arg(1), flags.pc, memory.sampler * 4u, sample_adjust)) {
+				DescriptorSource runtime_source;
+				runtime_source.dword_count = 4u;
+				runtime_source.dwords.fill(Value(0u));
+				sampler_source  = InternSource(runtime_source);
+				runtime_sampler = true;
 			} else {
 				GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
 				          memory.sampler * 4u, sampler_handle, sampler_source, true, sample_adjust);
 			}
-			sampler = AddSampler(sampler_source, flags.pc);
+			sampler = AddSampler(sampler_source, flags.pc, runtime_sampler);
 			if (sampler == UINT32_MAX) {
 				Fail(flags.pc, "sampler resource limit exceeded");
 			}
@@ -5763,8 +5820,20 @@ private:
 			    op == ValueOpcode::ImageGatherRaw &&
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagLod) != 0u;
 			AddHandlePatch(sampler_handle, sampler, flags.pc);
-			AddSampledPair(resource, sampler, flags.pc);
+			paired = runtime_sampler && (op == ValueOpcode::ImageSampleRaw || op == ValueOpcode::ImageGatherRaw) &&
+			         (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) == 0u;
 		}
+		resource = AddImage(source, memory, op, flags.pc, paired);
+		if (resource == UINT32_MAX) Fail(flags.pc, "image resource limit exceeded");
+		if (paired) {
+			const auto raw = AddImage(source, memory, op, flags.pc, paired, true);
+			if (raw == UINT32_MAX) Fail(flags.pc, "image view limit exceeded");
+			m_info.images[resource].paired_view = raw;
+			m_info.images[raw].paired_view = resource;
+			AddSampledPair(raw, sampler, flags.pc);
+		}
+		AddHandlePatch(handle, resource, flags.pc, &inst);
+		if (image_info.needs_sampler) AddSampledPair(resource, sampler, flags.pc);
 		AddMemoryPatch(flags.index, resource, sampler, image_info.needs_sampler, flags.pc);
 	}
 
@@ -5776,6 +5845,8 @@ private:
 	const Decoder::Program&                    m_decoded;
 	const CFG::Graph&                          m_native_cfg;
 	ShaderStageInputInfo                       m_input;
+	bool                                       m_runtime_buffer_descriptors = false;
+	bool                                       m_runtime_sampler_descriptors = false;
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::vector<ScalarReadStep>                m_srt_walk;
@@ -5785,6 +5856,7 @@ private:
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
+	std::vector<std::pair<Inst*, uint32_t>>     m_view_uses;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
@@ -5916,9 +5988,15 @@ UniformFillPlan RecognizeReplicateFill(Program& program, const Decoder::Program&
 
 }
 
+bool TakeRuntimeSamplerStop() {
+	return std::exchange(t_runtime_sampler_stop, false);
+}
+
 void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
-                    ShaderStageInputInfo input) {
-	Tracker(program, decoded, native_cfg, input).Run();
+                    ShaderStageInputInfo input, bool runtime_buffer_descriptors,
+                    bool runtime_sampler_descriptors) {
+	t_runtime_sampler_stop = false;
+	Tracker(program, decoded, native_cfg, input, runtime_buffer_descriptors, runtime_sampler_descriptors).Run();
 	program.uniform_fill = RecognizePatternFill(program, decoded, input);
 	if (program.uniform_fill.fill.kind == UniformFillKind::None) {
 		program.uniform_fill = RecognizeReplicateFill(program, decoded, input);

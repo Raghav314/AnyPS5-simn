@@ -252,7 +252,20 @@ bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& re
 	if (list.root == nullptr) {
 		return false;
 	}
-	const auto profile = Profile(IR::ImageHeapResource(*list.root, 0u), false);
+	const auto* table = list.table;
+	size_t first = 1, step = 1, count = list.values.size();
+	if (table != nullptr) {
+		if ((table->offset & 31u) != 0 || table->mapping.empty() ||
+		    table->mapping[0] != table->mapping.size() - 1u) return false;
+		first = table->offset / 4u;
+		step = 8;
+		count = table->mapping[0];
+		if (count == 0 || first + count * uint64_t {8} > uint64_t {IR::MaxIndirectDescriptorProbes} * 8u ||
+		    std::ranges::any_of(std::span(table->mapping).subspan(1), [&](uint32_t index) {
+			    return index >= table->slots.size();
+		    })) return false;
+	}
+	const auto profile = Profile(table != nullptr ? *list.root : IR::ImageHeapResource(*list.root, 0u), table != nullptr);
 	auto memory = std::ranges::find_if(m_list_memories, [&](const auto& candidate) {
 		return candidate->views.front()->profile == profile;
 	});
@@ -263,16 +276,32 @@ bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& re
 		memory = m_list_memories.insert(m_list_memories.end(), std::move(created));
 	}
 	auto& view = *(*memory)->views.front();
-	auto& held = m_lists[{list.owner, list.resource}];
-	held.view  = &view;
-	m_scratch.clear();
-	m_scratch.reserve(list.values.size());
-	for (auto value: list.values) {
-		const auto kind = IR::ImageHeapKind(m_profiles[profile], value);
-		m_scratch.push_back(
-		    kind == 0u ? 0u : Intern(view, kind, {.value = value, .profile = m_key_profiles[profile]}));
+	const ListKey key {list.owner, list.resource};
+	const auto slots = first + (count == 0 ? 0 : (count - 1u) * step + 1u) + 1u;
+	if (table != nullptr) {
+		size_t total = slots;
+		for (const auto& [other_key, item]: m_lists) {
+			if (item.view != nullptr && m_table_profiles[item.view->profile] && other_key != key) {
+				total += item.slots.capacity();
+			}
+		}
+		if (total > 4u * 1024u * 1024u) return false;
 	}
-	const auto slots = list.values.size() + 2u;
+	m_scratch.assign(slots, 0u);
+	for (size_t index = 0; index < count; ++index) {
+		auto value = table != nullptr ? table->slots[table->mapping[index + 1u]] : list.values[index];
+		const auto kind = table != nullptr ? IR::ImageTableHeapKind(m_profiles[profile], value)
+		                                   : IR::ImageHeapKind(m_profiles[profile], value);
+		if (kind == 0u) continue;
+		const auto element = Intern(view, kind, {.value = value, .profile = m_key_profiles[profile]});
+		if (table != nullptr && element == 0u) {
+			for (const auto pending: m_scratch) Release(pending);
+			return false;
+		}
+		m_scratch[first + index * step] = element;
+	}
+	auto& held = m_lists[key];
+	held.view = &view;
 	for (auto slot = slots - 1u; slot < held.slots.size(); ++slot) Assign(held, slot, 0u);
 	const auto previous = held.slots.size();
 	held.slots.resize(slots, 0u);
@@ -280,7 +309,7 @@ bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& re
 	if (previous < slots) Widen(held.dirty_begin, held.dirty_end, previous, slots);
 	held.dirty_end   = std::min(held.dirty_end, slots);
 	held.dirty_begin = std::min(held.dirty_begin, held.dirty_end);
-	for (size_t value = 0; value < m_scratch.size(); ++value) Assign(held, value + 1u, m_scratch[value]);
+	for (size_t slot = 0; slot < m_scratch.size(); ++slot) Assign(held, slot, m_scratch[slot]);
 	if (held.buffer == nullptr || slots * sizeof(uint32_t) > held.buffer->Size()) {
 		if (held.buffer != nullptr && m_context.GetCommandScheduler().Active()) {
 			m_context.GetCommandScheduler().DeferOperation([buffer = std::move(held.buffer)] {});

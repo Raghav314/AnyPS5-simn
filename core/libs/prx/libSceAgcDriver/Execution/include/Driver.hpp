@@ -42,6 +42,8 @@ extern "C" void AgcDriverRetireGpuOwners_nid_no_patch(std::uint64_t address, std
 extern "C" void AgcDriverOmitGpuOwnersForTest_nid_no_patch(bool omit);
 extern "C" void AgcDriverGuestMemoryTransaction_nid_no_patch(void (*body)(void* context), void* context, std::exception_ptr* failure);
 extern "C" void AgcDriverSetGuestMemoryTransactionHookForTest_nid_no_patch(void (*hook)());
+extern "C" bool AgcDriverHasStartupPipelineData_nid_postfix();
+extern "C" bool AgcDriverWaitForStartupManifest_nid_postfix(std::uint32_t* done, std::uint32_t* total, bool* memoryPaused);
 extern "C" void AgcDriverWaitIdle_nid_postfix();
 extern "C" void AgcDriverSubmitGraphics_nid_postfix(std::uint32_t* commands, std::uint32_t dwords);
 extern "C" void AgcDriverUseGcnShaders_nid_postfix();

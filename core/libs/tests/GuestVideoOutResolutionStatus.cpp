@@ -73,6 +73,18 @@ int main() {
     RequireSize(handle, 1920, 1080, 1);
     SetOutputResolution("3840x2160");
     RequireSize(handle, 3840, 2160, 2);
+    SetOutputResolution("2560x1440");
+    RequireSize(handle, 3840, 2160, 2);
+    SetOutputResolution("3440x1440");
+    RequireSize(handle, 3840, 2160, 2);
+    SetOutputResolution("1920x1200");
+    RequireSize(handle, 1920, 1080, 1);
+    SetOutputResolution("2560x1080");
+    RequireSize(handle, 1920, 1080, 1);
+    SetOutputResolution("3840x1080");
+    RequireSize(handle, 1920, 1080, 1);
+    SetOutputResolution("1280x720");
+    RequireSize(handle, 1920, 1080, 1);
     SetOutputResolution("1920x1080");
 
     std::array<std::byte, 96> fresh;

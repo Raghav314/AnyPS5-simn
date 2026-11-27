@@ -2,6 +2,7 @@
 
 #include "prx/libSceAgc/Command/include/Memory.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
+#include "prx/libSceAgc/Command/include/DispatchTrace.hpp"
 #include <cstdint>
 #include <cstddef>
 #include "SceTypes.hpp"
@@ -12,7 +13,9 @@ extern "C" {
 uint32_t* APS5_VABI sceAgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes, uint32_t flags) {
     // Graphics queues read the arguments at an offset from the base set by SetBaseDispatchIndirectArgs.
     Agc::Command::CheckBits(flags, 0xa038u | 0x41u, __func__);
-    return Agc::Command::Emit(buf, 0x16u, {data_offset_in_bytes, flags | 0x41u}, __func__);
+    auto* packet = Agc::Command::Emit(buf, 0x16u, {data_offset_in_bytes, flags | 0x41u}, __func__);
+    Agc::Command::TraceDispatch(packet, 3, __builtin_extract_return_addr(__builtin_return_address(0)));
+    return packet;
 }
 
 std::uint32_t APS5_VABI sceAgcDcbDispatchIndirectGetSize() {

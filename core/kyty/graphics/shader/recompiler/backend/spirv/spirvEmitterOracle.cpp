@@ -31,7 +31,7 @@ constexpr uint32_t ContextFlags     = 76;
 constexpr uint32_t SlotBlas         = 40;
 constexpr uint32_t SlotRoot         = 48;
 constexpr uint32_t OracleFlags      = IR::BvhIntersectNative | IR::BvhIntersectOracle | IR::BvhIntersectOracleLane |
-                                      IR::BvhIntersectEmpty;
+                                      IR::BvhIntersectEmpty | IR::BvhIntersectStrict | IR::BvhIntersectOracleMulti;
 
 struct Call {
 	uint32_t descriptor = 0;
@@ -57,12 +57,12 @@ struct Call {
 	uint32_t has        = 0;
 };
 
-LaneVariables QueryLane(EmitterState& s, uint32_t half) {
+LaneVariables QueryLane(EmitterState& s, uint32_t half, bool multi) {
 	LaneVariables lane;
 	lane.query = s.oracle.lanes[half].query;
 	lane.state = s.oracle.lanes[half].state;
-	lane.nodes = s.oracle.nodes;
-	lane.slots = s.oracle.slots;
+	lane.nodes       = multi ? s.oracle.lanes[half].nodes : s.oracle.nodes;
+	lane.slots       = multi ? s.oracle.lanes[half].slots : s.oracle.slots;
 	return lane;
 }
 
@@ -123,6 +123,14 @@ void DeclareOracleVariables(EmitterState& s) {
 		s.builder.AddFunction(spv::OpVariable, TypePointer(s, spv::StorageClassFunction, pointee), id,
 		                      spv::StorageClassFunction);
 	};
+	s.oracle.multi = false;
+	if (!s.program.info.ray_query_extra_sources.empty()) {
+		for (const auto* block: s.program.blocks) {
+			for (const auto& inst: *block) {
+				if (inst.GetOpcode() == IR::ValueOpcode::BvhIntersect && (inst.Flags<uint32_t>() & IR::BvhIntersectOracleMulti) != 0) s.oracle.multi = true;
+			}
+		}
+	}
 	for (uint32_t half = 0; half < s.lane_count; half++) {
 		auto& lane = s.oracle.lanes[half];
 		declare(s.builder.Type(spv::OpTypeRayQueryKHR), lane.query);
@@ -131,6 +139,12 @@ void DeclareOracleVariables(EmitterState& s) {
 		}
 		declare(wide, lane.blas);
 		declare(wide, lane.proposed_blas);
+		if (s.oracle.multi) {
+			declare(wide, lane.first);
+			declare(u, lane.top_root);
+			declare(wide, lane.nodes);
+			declare(wide, lane.slots);
+		}
 	}
 	for (auto* variable: {&s.oracle.valid, &s.oracle.root, &s.oracle.counting, &s.oracle.per_lane, &s.oracle.served,
 	                      &s.oracle.returned, &s.oracle.proposed, &s.oracle.resumed}) {
@@ -138,6 +152,12 @@ void DeclareOracleVariables(EmitterState& s) {
 	}
 	for (auto* variable: {&s.oracle.context, &s.oracle.header, &s.oracle.tlas, &s.oracle.nodes, &s.oracle.slots}) {
 		declare(wide, *variable);
+	}
+	s.oracle.extra.resize(s.oracle.multi ? s.program.info.ray_query_extra_sources.size() : 0);
+	for (auto& extra: s.oracle.extra) {
+		declare(u, extra.valid);
+		declare(u, extra.root);
+		for (auto* variable: {&extra.first, &extra.tlas, &extra.nodes, &extra.slots}) declare(wide, *variable);
 	}
 }
 
@@ -173,6 +193,25 @@ void InitializeOracleVariables(EmitterState& s) {
 		Store(s, s.oracle.root, LoadAddressU32(s, AddressPlus(s, context, ContextRoot)));
 		Store(s, s.oracle.per_lane, And(s, LoadAddressU32(s, AddressPlus(s, context, ContextFlags)), 1u));
 	});
+	for (size_t index = 0; index < s.oracle.extra.size(); ++index) {
+		const auto& extra = s.oracle.extra[index];
+		const auto  entry = AddressPlus(s, context, static_cast<uint32_t>(index + 1) * ContextStride);
+		Store(s, extra.valid, U32(s, 0));
+		Store(s, extra.root, U32(s, None));
+		for (const auto variable: {extra.first, extra.tlas, extra.nodes, extra.slots}) Store(s, variable, ConstantU64(s, 0));
+		EmitIfCondition(s, present, [&] {
+			const auto usable = Binary(s, spv::OpINotEqual, b, LoadAddressU32(s, AddressPlus(s, entry, ContextValid)), U32(s, 0));
+			EmitIfCondition(s, usable, [&] {
+				const auto root = LoadAddressU32(s, AddressPlus(s, entry, ContextRoot));
+				Store(s, extra.valid, U32(s, 1));
+				Store(s, extra.root, root);
+				Store(s, extra.first, NodeAddress(s, LoadAddressU64(s, AddressPlus(s, entry, ContextHeader)), Wide(s, root)));
+				Store(s, extra.tlas, LoadAddressU64(s, AddressPlus(s, entry, ContextTlas)));
+				Store(s, extra.nodes, LoadAddressU64(s, AddressPlus(s, entry, ContextInstanceNodes)));
+				Store(s, extra.slots, LoadAddressU64(s, AddressPlus(s, entry, ContextSlots)));
+			});
+		});
+	}
 	for (uint32_t half = 0; half < s.lane_count; half++) {
 		const auto& lane = s.oracle.lanes[half];
 		Store(s, lane.state, U32(s, 0));
@@ -182,6 +221,12 @@ void InitializeOracleVariables(EmitterState& s) {
 		Store(s, lane.t, U32(s, 0));
 		Store(s, lane.blas, ConstantU64(s, 0));
 		Store(s, lane.proposed_blas, ConstantU64(s, 0));
+		if (s.oracle.multi) {
+			Store(s, lane.first, ConstantU64(s, 0));
+			Store(s, lane.top_root, U32(s, None));
+			Store(s, lane.nodes, ConstantU64(s, 0));
+			Store(s, lane.slots, ConstantU64(s, 0));
+		}
 	}
 }
 
@@ -204,10 +249,30 @@ uint32_t EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto first  = NodeAddress(s, Load(s, wide, s.oracle.header), Wide(s, root));
 	const auto again  = Binary(s, spv::OpIAdd, wide, first, ConstantU64(s, 64));
 	const auto slack  = ConstantF32Value(s, 1.0001f);
+	const bool multi  = s.oracle.multi && (inst.Flags<uint32_t>() & IR::BvhIntersectOracleMulti) != 0;
+	struct Bound {
+		uint32_t valid = 0;
+		uint32_t first = 0;
+		uint32_t root  = 0;
+		uint32_t tlas  = 0;
+		uint32_t nodes = 0;
+		uint32_t slots = 0;
+	};
+	std::vector<Bound> bound;
+	auto               any_valid = valid;
+	if (multi) {
+		bound.push_back({valid, first, root, Load(s, wide, s.oracle.tlas), Load(s, wide, s.oracle.nodes), Load(s, wide, s.oracle.slots)});
+		for (const auto& extra: s.oracle.extra) {
+			const auto usable = Binary(s, spv::OpINotEqual, b, Load(s, u, extra.valid), U32(s, 0));
+			bound.push_back({usable, Load(s, wide, extra.first), Load(s, u, extra.root), Load(s, wide, extra.tlas), Load(s, wide, extra.nodes),
+			                 Load(s, wide, extra.slots)});
+			any_valid = LogicalOr(s, any_valid, usable);
+		}
+	}
 	for (uint32_t half = 0; half < s.lane_count; half++) {
 		auto&       c    = calls[half];
 		const auto& vars = s.oracle.lanes[half];
-		const auto  lane = QueryLane(s, half);
+		const auto  lane = QueryLane(s, half, multi);
 		c.descriptor     = ctx.HalfArg(inst, 0, half);
 		c.node           = ctx.HalfArg(*ray, 0, half);
 		c.wide           = node_words == 2u ? PackU64(s, c.node, ctx.HalfArg(*ray, 1, half)) : Wide(s, c.node);
@@ -234,10 +299,28 @@ uint32_t EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst) {
 		c.address       = NodeAddress(s, c.base, c.wide);
 		const auto kind = And(s, c.node, 7u);
 		c.box           = LogicalOr(s, Equal(s, kind, U32(s, 4)), Equal(s, kind, U32(s, 5)));
-		const auto on   = LogicalAnd(s, LogicalAnd(s, c.exec, valid), c.box);
+		const auto on   = LogicalAnd(s, LogicalAnd(s, c.exec, any_valid), c.box);
 		const auto before = Load(s, u, vars.state);
-		const auto at_again = LogicalAnd(s, on, Binary(s, spv::OpIEqual, b, c.address, again));
-		c.start   = LogicalAnd(s, on, Binary(s, spv::OpIEqual, b, c.address, first));
+		const auto resume_at = multi ? Binary(s, spv::OpIAdd, wide, Load(s, wide, vars.first), ConstantU64(s, 64)) : again;
+		const auto at_again = LogicalAnd(s, on, Binary(s, spv::OpIEqual, b, c.address, resume_at));
+		Bound picked;
+		if (multi) {
+			auto matched = ConstantBool(s, false);
+			picked       = {0, ConstantU64(s, 0), U32(s, None), ConstantU64(s, 0), ConstantU64(s, 0), ConstantU64(s, 0)};
+			for (size_t index = bound.size(); index-- > 0;) {
+				const auto& each  = bound[index];
+				const auto  match = LogicalAnd(s, each.valid, Binary(s, spv::OpIEqual, b, c.address, each.first));
+				matched           = LogicalOr(s, matched, match);
+				picked.first      = Select(s, wide, match, each.first, picked.first);
+				picked.root       = Select(s, u, match, each.root, picked.root);
+				picked.tlas       = Select(s, wide, match, each.tlas, picked.tlas);
+				picked.nodes      = Select(s, wide, match, each.nodes, picked.nodes);
+				picked.slots      = Select(s, wide, match, each.slots, picked.slots);
+			}
+			c.start = LogicalAnd(s, on, matched);
+		} else {
+			c.start = LogicalAnd(s, on, Binary(s, spv::OpIEqual, b, c.address, first));
+		}
 		c.resume  = LogicalAnd(s, at_again, BitSet(s, before, Active));
 		c.drained = LogicalAnd(s, at_again, LogicalNot(s, BitSet(s, before, Active)));
 		c.top     = LogicalOr(s, c.start, c.resume);
@@ -247,9 +330,16 @@ uint32_t EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst) {
 				traced = LogicalAnd(s, traced, Finite(s, parts[i]));
 			}
 			Store(s, vars.state, Select(s, u, traced, U32(s, Active), U32(s, Active | Dead)));
+			if (multi) {
+				Store(s, vars.first, picked.first);
+				Store(s, vars.top_root, picked.root);
+				Store(s, vars.nodes, picked.nodes);
+				Store(s, vars.slots, picked.slots);
+			}
 			EmitIfCondition(s, traced, [&] {
 				const auto structure = Unary(s, spv::OpConvertUToAccelerationStructureKHR,
-				                             s.builder.Type(spv::OpTypeAccelerationStructureKHR), Load(s, wide, s.oracle.tlas));
+				                             s.builder.Type(spv::OpTypeAccelerationStructureKHR),
+				                             multi ? picked.tlas : Load(s, wide, s.oracle.tlas));
 				s.builder.AddFunction(spv::OpRayQueryInitializeKHR, lane.query, structure, U32(s, RayFlagNoOpaque),
 				                      U32(s, 0xffu), c.origin, ConstantF32Value(s, 0.0f), c.direction, c.extent);
 			});
@@ -287,7 +377,7 @@ uint32_t EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst) {
 								const auto slot = s.builder.AllocateId();
 								s.builder.AddFunction(spv::OpRayQueryGetIntersectionInstanceCustomIndexKHR, u, slot, lane.query,
 								                      U32(s, CandidateIntersection));
-								const auto info = ScaledAddress(s, Load(s, wide, s.oracle.slots), slot, SlotStride);
+								const auto info = ScaledAddress(s, Load(s, wide, multi ? vars.slots : s.oracle.slots), slot, SlotStride);
 								Store(s, vars.leaf, InstanceNode(s, lane, CandidateIntersection));
 								Store(s, vars.entry, candidate.entry);
 								Store(s, vars.t, Unary(s, spv::OpBitcast, u, t));
@@ -360,7 +450,7 @@ uint32_t EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto proposed_blas = Load(s, wide, vars.proposed_blas);
 		const auto proposed_root = Load(s, u, vars.proposed_root);
 		const auto blas_base     = Binary(s, spv::OpBitwiseAnd, wide, proposed_blas, ConstantU64(s, ~uint64_t {0xff}));
-		const auto ongoing = LogicalAnd(s, LogicalAnd(s, c.exec, LogicalAnd(s, valid, c.box)),
+		const auto ongoing = LogicalAnd(s, LogicalAnd(s, c.exec, LogicalAnd(s, any_valid, c.box)),
 		                                LogicalAnd(s, LogicalNot(s, LogicalOr(s, c.top, c.drained)),
 		                                           LogicalAnd(s, BitSet(s, c.state, Active), BitSet(s, c.state, Proposed))));
 		const auto nested  = LogicalAnd(s, ongoing,
@@ -380,7 +470,8 @@ uint32_t EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                      c.extent, c.origin, c.direction, c.inverse);
 			return result;
 		});
-		const std::array<uint32_t, 4> top {Select(s, u, c.has, c.leaf, none), Select(s, u, c.has, Add(s, root, U32(s, 8)), none),
+		const auto                    top_root = multi ? Load(s, u, vars.top_root) : root;
+		const std::array<uint32_t, 4> top {Select(s, u, c.has, c.leaf, none), Select(s, u, c.has, Add(s, top_root, U32(s, 8)), none),
 		                                   none, none};
 		std::array<uint32_t, 4> words {};
 		for (uint32_t i = 0; i < 4; i++) {
@@ -407,7 +498,8 @@ void FlushOracleCounts(EmitterState& s) {
 	if (s.oracle.valid == 0) return;
 	const auto b        = TypeBool(s);
 	const auto counting = Binary(s, spv::OpINotEqual, b, Load(s, TypeU32(s), s.oracle.counting), U32(s, 0));
-	EmitIfCondition(s, s.ray_stats ? ConstantBool(s, true) : counting, [&] {
+	const auto stats    = RayStatsEnabled(s);
+	EmitIfCondition(s, LogicalOr(s, counting, stats), [&] {
 		const auto rays     = SubgroupSum(s, s.oracle.served);
 		const auto guest    = SubgroupSum(s, s.oracle.returned);
 		const auto proposed = SubgroupSum(s, s.oracle.proposed);
@@ -426,9 +518,8 @@ void FlushOracleCounts(EmitterState& s) {
 			AtomicAdd(s, AddressPlus(s, context, ContextWaves), waves);
 			AtomicAdd(s, AddressPlus(s, context, ContextProposed), proposed);
 		});
-		if (!s.ray_stats || s.fault_buffer_variable == 0) return;
 		const auto marked = Binary(s, spv::OpINotEqual, b, Or(s, Or(s, rays, guest), proposed), U32(s, 0));
-		EmitIfCondition(s, LogicalAnd(s, elected, marked), [&] {
+		EmitIfCondition(s, LogicalAnd(s, stats, LogicalAnd(s, elected, marked)), [&] {
 			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_RETURNED, guest);
 			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_RAYS, rays);
 			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_CANDIDATES, proposed);

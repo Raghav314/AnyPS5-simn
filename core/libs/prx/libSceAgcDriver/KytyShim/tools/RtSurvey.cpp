@@ -243,7 +243,6 @@ void Prepare(Prepared& prepared, const SurveySettings& settings, std::span<const
     options.dump_ir = false;
     options.emit_debug_info = false;
     options.native_ray_tracing = true;
-    options.ray_stats = false;
     options.rt_oracle = settings.oracle;
     options.profile = &Profile();
     options.plain_mip_stats_variant = options.stage == ShaderType::Pixel;

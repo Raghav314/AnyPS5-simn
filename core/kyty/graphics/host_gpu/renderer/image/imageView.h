@@ -23,6 +23,15 @@ namespace ImageViewOps {
 		default: return false;
 	}
 }
+
+[[nodiscard]] inline bool IsStencilViewFormat(vk::Format format) noexcept {
+	switch (format) {
+		case vk::Format::eS8Uint:
+		case vk::Format::eR8Uint:
+		case vk::Format::eR8Unorm: return true;
+		default: return false;
+	}
+}
 }
 
 [[nodiscard]] inline bool IsSupportedSampledDepthFormat(vk::Format image_format,

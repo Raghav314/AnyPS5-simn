@@ -710,12 +710,12 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 
 template <typename Emit>
 auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
-                     const Emit& emit, uint32_t key_override = 0u) {
+                     const Emit& emit, uint32_t key_override = 0u, uint32_t view = IR::ImageResource::NoIndirectImage) {
 	auto& state = ctx.state;
-	const auto& mem = ctx.Memory(inst);
-	const auto& image = state.program.info.images.at(mem.resource);
-	if (image.table_capacity != 0u) return emit(mem.resource, ImageTableElement(ctx, inst, image, key_override));
-	if (image.indirect_root != mem.resource) return emit(mem.resource, 0u);
+	if (view == IR::ImageResource::NoIndirectImage) view = ctx.Memory(inst).resource;
+	const auto& image = state.program.info.images.at(view);
+	if (image.table_capacity != 0u) return emit(view, ImageTableElement(ctx, inst, image, key_override));
+	if (image.indirect_root != view) return emit(view, 0u);
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	const auto* source = image.source < state.program.descriptor_sources.size()
 	                         ? &state.program.descriptor_sources[image.source]
@@ -812,11 +812,11 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 }
 
 template <typename Emit>
-uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit& emit,
-                         uint32_t key_override = 0u) {
+uint32_t EmitImageViewResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit& emit,
+                             uint32_t key_override, uint32_t view) {
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
-	const auto& image = state.program.info.images[mem.resource];
+	const auto& image = state.program.info.images[view];
 	const bool gather = inst.GetOpcode() == IR::ValueOpcode::ImageGatherRaw;
 	const bool dref = HasFlag(mem, Decoder::ImageSampleFlagCompare);
 	const bool scalar = dref && !gather;
@@ -842,13 +842,42 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 		                    scalar, candidate_mem, gather);
 	};
 	const auto value = EmitImageAccess(
-	    ctx, inst, mixed ? TypeU32Vector(state, 4) : native_type(mem.resource),
+	    ctx, inst, mixed ? TypeU32Vector(state, 4) : native_type(view),
 	    [&](uint32_t resource, uint32_t array_index) {
 		    const auto native = emit(resource, array_index, native_type(resource));
 		    return mixed ? result_bits(resource, native) : native;
 	    },
-	    key_override);
-	return mixed ? value : result_bits(mem.resource, value);
+	    key_override, view);
+	return mixed ? value : result_bits(view, value);
+}
+
+uint32_t SelectImageVector(EmitterState& state, uint32_t components, uint32_t type, uint32_t condition,
+                           uint32_t yes, uint32_t no) {
+	const auto mask = state.builder.AllocateId();
+	const std::array lanes {condition, condition, condition, condition};
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeBoolVector(state, components), mask,
+	                          std::span(lanes).first(components));
+	return Select(state, type, mask, yes, no);
+}
+
+template <typename Emit>
+uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit& emit,
+                         uint32_t key_override = 0u) {
+	auto& state = ctx.state;
+	const auto view = ctx.Memory(inst).resource;
+	const auto decoded = EmitImageViewResult(ctx, inst, emit, key_override, view);
+	const auto raw_view = state.program.info.images[view].paired_view;
+	if (raw_view == IR::ImageResource::NoIndirectImage) return decoded;
+	const auto& raw = state.program.info.images[raw_view];
+	if (!raw.skip_degamma && !raw.heap && raw.table_capacity == 0u &&
+	    std::ranges::none_of(raw.indirect_resources, [&](uint32_t child) {
+		    return state.program.info.images[child].skip_degamma;
+	    })) return decoded;
+	const auto* handle = inst.Arg(1).ResolveInstruction();
+	const auto skip = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state),
+	                         ctx.Def(handle->Arg(0)), ConstantU32(state, 0x80000000u));
+	const auto encoded = EmitImageViewResult(ctx, inst, emit, key_override, raw_view);
+	return SelectImageVector(state, 4u, TypeU32Vector(state, 4), skip, encoded, decoded);
 }
 
 uint32_t SamplerArrayIndex(EmitterState& state, uint32_t ordinal,
@@ -871,7 +900,73 @@ uint32_t SamplerArrayIndex(EmitterState& state, uint32_t ordinal,
 struct ImageSampler {
 	uint32_t id = 0;
 	bool dynamic = false;
+	uint32_t texel_coords = 0;
 };
+
+uint32_t RuntimeSamplerOrdinal(ValueEmitContext& ctx, const IR::Inst& handle, const IR::SamplerResource& sampler,
+                               uint32_t& texel_coords) {
+	auto&      state = ctx.state;
+	const auto u32   = TypeU32(state);
+	const auto field = [&](uint32_t word, uint32_t offset, uint32_t mask) {
+		const auto shifted = offset == 0u ? word : Binary(state, spv::OpShiftRightLogical, u32, word,
+		                                                  ConstantU32(state, offset));
+		return Binary(state, spv::OpBitwiseAnd, u32, shifted, ConstantU32(state, mask));
+	};
+	const auto address_class = [&](uint32_t clamp) {
+		const auto shift = Binary(state, spv::OpShiftLeftLogical, u32, clamp, ConstantU32(state, 1u));
+		return Binary(state, spv::OpBitwiseAnd, u32,
+		              Binary(state, spv::OpShiftRightLogical, u32,
+		                     ConstantU32(state, IR::SamplerResource::RuntimeAddressClassTable), shift),
+		              ConstantU32(state, 3u));
+	};
+	const auto mul_add = [&](uint32_t value, uint32_t factor, uint32_t addend) {
+		return Binary(state, spv::OpIAdd, u32, Binary(state, spv::OpIMul, u32, value, ConstantU32(state, factor)),
+		              addend);
+	};
+	const auto w0         = ctx.Def(handle.Arg(0));
+	const auto w2         = ctx.Def(handle.Arg(2));
+	const auto address_x  = address_class(field(w0, 0u, 7u));
+	const auto mag        = field(w2, 20u, 3u);
+	const auto min        = field(w2, 22u, 3u);
+	const auto filters    = Binary(state, spv::OpBitwiseOr, u32, mag, min);
+	const auto linear     = Binary(state, spv::OpBitwiseAnd, u32, filters, ConstantU32(state, 1u));
+	const auto address_y = address_class(field(w0, 3u, 7u));
+	const auto address = mul_add(address_x, IR::SamplerResource::RuntimeAddressClasses, address_y);
+	const auto raw_mip = field(w2, 26u, 3u);
+	const auto mip = Select(state, u32, Binary(state, spv::OpULessThan, TypeBool(state), raw_mip,
+	                                          ConstantU32(state, IR::SamplerResource::RuntimeMipClasses)),
+	                        raw_mip, ConstantU32(state, IR::SamplerResource::RuntimeMipClasses - 1u));
+	if (sampler.depth_compare) {
+		const auto function = mul_add(field(w0, 12u, 7u), 2u, linear);
+		return mul_add(mul_add(function, IR::SamplerResource::RuntimeAddressClasses *
+		                                IR::SamplerResource::RuntimeAddressClasses, address),
+		               IR::SamplerResource::RuntimeMipClasses, mip);
+	}
+	texel_coords = Binary(state, spv::OpINotEqual, TypeBool(state), field(w0, 15u, 1u), ConstantU32(state, 0u));
+	if (sampler.integer_border) {
+		const auto enabled = Select(state, u32, Binary(state, spv::OpINotEqual, TypeBool(state), mip,
+		                                               ConstantU32(state, 0u)), ConstantU32(state, 1u), mip);
+		return Select(state, u32, texel_coords, ConstantU32(state, IR::SamplerResource::RuntimeClampEdgeXY * 2u),
+		              mul_add(address, 2u, enabled));
+	}
+	const auto aniso     = Binary(state, spv::OpINotEqual, TypeBool(state),
+	                              Binary(state, spv::OpBitwiseAnd, u32, filters, ConstantU32(state, 2u)),
+	                              ConstantU32(state, 0u));
+	const auto blend     = Binary(state, spv::OpBitwiseOr, u32,
+	                              Binary(state, spv::OpShiftLeftLogical, u32,
+	                                     Binary(state, spv::OpBitwiseAnd, u32, mag, ConstantU32(state, 1u)),
+	                                     ConstantU32(state, 1u)),
+	                              Binary(state, spv::OpBitwiseAnd, u32, min, ConstantU32(state, 1u)));
+	const auto filter    = Select(state, u32, aniso, ConstantU32(state, 4u), blend);
+	const auto plain = mul_add(mul_add(address, IR::SamplerResource::RuntimeFilterClasses, filter),
+	                           IR::SamplerResource::RuntimeMipClasses, mip);
+	constexpr auto edge = IR::SamplerResource::RuntimeClampEdgeXY * IR::SamplerResource::RuntimeFilterClasses;
+	const auto unnormalized_key = Select(state, u32, Binary(state, spv::OpINotEqual, TypeBool(state),
+	                                                       field(w2, 20u, 1u), ConstantU32(state, 0u)),
+	                                     ConstantU32(state, (edge + 3u) * IR::SamplerResource::RuntimeMipClasses),
+	                                     ConstantU32(state, edge * IR::SamplerResource::RuntimeMipClasses));
+	return Select(state, u32, texel_coords, unnormalized_key, plain);
+}
 
 std::array<ImageSampler, 2> LoadImageSamplers(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
@@ -899,8 +994,11 @@ std::array<ImageSampler, 2> LoadImageSamplers(ValueEmitContext& ctx, const IR::I
 			const auto* handle = inst.Arg(1).ResolveInstruction();
 			if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetSamplerResource)
 				ctx.Fail(inst, "has invalid finite sampler key provenance");
-			auto selected = ctx.Def(handle->Arg(0));
-			if (samplers[index].indirect_root != IR::SamplerResource::NoIndirectSampler)
+			auto selected = samplers[index].runtime_descriptor
+			                    ? RuntimeSamplerOrdinal(ctx, *handle, samplers[index], sampler.texel_coords)
+			                    : ctx.Def(handle->Arg(0));
+			if (!samplers[index].runtime_descriptor &&
+			    samplers[index].indirect_root != IR::SamplerResource::NoIndirectSampler)
 				selected = IsRecordTableSource(state, samplers[index].source)
 				    ? EmitRecordTableIndex(state, selected, ctx.Def(handle->Arg(1)),
 				                           samplers[index].indirect_mapping_offset,
@@ -910,12 +1008,37 @@ std::array<ImageSampler, 2> LoadImageSamplers(ValueEmitContext& ctx, const IR::I
 				          samplers[index].indirect_search_iterations, 0u);
 			array_index = SamplerArrayIndex(state, selected, candidates);
 		}
-		sampler = {LoadSamplerDescriptor(state, index, array_index), array_index != 0u};
+		sampler.id = LoadSamplerDescriptor(state, index, array_index);
+		sampler.dynamic = array_index != 0u;
 	};
 	const auto& image = state.program.info.images[mem.resource];
 	load(image);
 	for (const auto candidate: image.indirect_resources) load(state.program.info.images[candidate]);
 	return result;
+}
+
+uint32_t SampleCoordinates(EmitterState& state, const ImageSampler& sampler, uint32_t resource,
+                           uint32_t array_index, uint32_t coords, bool spatial_only = false) {
+	if (sampler.texel_coords == 0u) return coords;
+	const auto dimension = state.program.info.images[resource].dimension;
+	const auto& info = ImageDimensionInfoFor(dimension);
+	const auto count = (spatial_only ? info.spatial_components : info.coordinate_components) + info.one_dimensional;
+	const auto size = state.builder.AllocateId();
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	state.builder.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, dimension), size,
+	                          LoadImageDescriptor(state, resource, 0u, array_index), ConstantU32(state, 0u));
+	std::array<uint32_t, 3> scale;
+	for (uint32_t i = 0; i < count; ++i) {
+		scale[i] = ConstantF32Value(state, 1.0f);
+		if (i >= info.spatial_components) continue;
+		const auto extent = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), extent, size, i);
+		scale[i] = Unary(state, spv::OpConvertUToF, TypeF32(state), EmitUMax32(state, extent, ConstantU32(state, 1u)));
+	}
+	const auto type = TypeF32Vector(state, count);
+	const auto divisor = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, type, divisor, std::span(scale).first(count));
+	return SelectImageVector(state, count, type, sampler.texel_coords, Binary(state, spv::OpFDiv, type, coords, divisor), coords);
 }
 
 constexpr uint32_t MipStatsEntries       = 257;
@@ -1031,17 +1154,18 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	if (op == IR::ValueOpcode::ImageQueryLod) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
-		const auto sampler = LoadSamplerDescriptor(state, mem.sampler);
+		const auto samplers = LoadImageSamplers(ctx, inst);
 		const auto lod = EmitImageAccess(ctx, inst, TypeF32Vector(state, 2),
 		    [&](uint32_t resource, uint32_t array_index) {
 			    const auto& candidate = state.program.info.images[resource];
+			    const auto sampler = samplers[candidate.numeric_class != Prospero::TextureNumericClass::Float];
 			    const auto query = state.builder.AllocateId();
 			    state.builder.AddFunction(
 			        spv::OpImageQueryLod, TypeF32Vector(state, 2), query,
-			        MakeSampledImage(state, resource, sampler, 0u, array_index),
-			        CoordF32(ctx, mem, *address, 0,
-			                 ImageDimensionInfoFor(candidate.dimension).spatial_components,
-			                 candidate.cube, RowCenter(state, candidate.dimension)));
+			        MakeSampledImage(state, resource, sampler.id, 0u, array_index, sampler.dynamic),
+			        SampleCoordinates(state, sampler, resource, array_index,
+			                          CoordF32(ctx, mem, *address, 0, ImageDimensionInfoFor(candidate.dimension).spatial_components,
+			                                   candidate.cube, RowCenter(state, candidate.dimension)), true));
 			    return query;
 		    });
 		uint32_t values[4] = {ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0),
@@ -1177,7 +1301,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					const std::array operands {operand_mask, offset};
 					state.builder.AddFunction(
 					    dref ? spv::OpImageDrefGather : spv::OpImageGather, result_type,
-					    sample, sampled, coord, component_or_dref,
+					    sample, sampled, SampleCoordinates(state, sampler, resource, array_index, coord), component_or_dref,
 					    std::span(operands).first(operand_mask != 0u ? 2u : 0u));
 					return sample;
 				};
@@ -1279,7 +1403,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto sampled = MakeSampledImage(state, resource, sampler.id, 0u, array_index,
 			                                      sampler.dynamic);
 			const auto sample = state.builder.AllocateId();
-			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
+			state.builder.AddFunction(opcode, result_type, sample, sampled,
+			                          SampleCoordinates(state, sampler, resource, array_index, coord),
 			                          std::span(&dref_value, dref ? 1u : 0u),
 			                          std::span<const uint32_t>(sample_operands).first(sample_operand_count));
 			if (state.mip_stats_variable != 0 && state.mip_stats_records && array_index == 0u &&
@@ -1304,9 +1429,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 						state.builder.AddFunction(
 						    spv::OpImageQueryLod, TypeF32Vector(state, 2), query,
 						    MakeSampledImage(state, resource, sampler.id, 0u, 0u, sampler.dynamic),
-						    CoordF32(ctx, mem, *address, layout.coord,
-						             ImageDimensionInfoFor(candidate.dimension).spatial_components,
-						             candidate.cube, RowCenter(state, candidate.dimension)));
+						    SampleCoordinates(state, sampler, resource, 0u,
+						                      CoordF32(ctx, mem, *address, layout.coord, ImageDimensionInfoFor(candidate.dimension).spatial_components,
+						                               candidate.cube, RowCenter(state, candidate.dimension)), true));
 						lod = state.builder.AllocateId();
 						state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), lod,
 						                          query, 1u);
@@ -1377,7 +1502,8 @@ uint32_t EmitImageTableSampleLod(ValueEmitContext& ctx, const IR::Inst& sample, 
 	auto&       state    = ctx.state;
 	const auto& mem      = ctx.Memory(sample);
 	const auto& image    = state.program.info.images.at(mem.resource);
-	if (image.heap) return EmitImageSampleLodAtKey(ctx, sample, key, u, v, lod);
+	if (image.heap || state.program.info.samplers[mem.sampler].runtime_descriptor)
+		return EmitImageSampleLodAtKey(ctx, sample, key, u, v, lod);
 	const auto  samplers = LoadImageSamplers(ctx, sample);
 	const auto& sampler  = samplers[0];
 	const auto  sampled  = MakeSampledImage(state, mem.resource, sampler.id, 0u,
@@ -1420,7 +1546,8 @@ uint32_t EmitImageSampleLodAtKey(ValueEmitContext& ctx, const IR::Inst& sample, 
 		    const auto  sampler   = samplers[candidate.numeric_class != Prospero::TextureNumericClass::Float];
 		    const auto  sampled   = MakeSampledImage(state, resource, sampler.id, 0u, array_index, sampler.dynamic);
 		    const auto  texel     = state.builder.AllocateId();
-		    state.builder.AddFunction(spv::OpImageSampleExplicitLod, result_type, texel, sampled, coord,
+		    state.builder.AddFunction(spv::OpImageSampleExplicitLod, result_type, texel, sampled,
+		                              SampleCoordinates(state, sampler, resource, array_index, coord),
 		                              spv::ImageOperandsLodMask, lod);
 		    return texel;
 	    },

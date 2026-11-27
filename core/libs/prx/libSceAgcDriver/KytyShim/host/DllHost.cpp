@@ -120,7 +120,7 @@ KytyDllDisplayBuffer ToSeam(const AgcDriver::DisplayBuffer& buffer) {
 }
 
 KytyDllWindow ToSeam(const AgcDriver::PresentationWindow& window) {
-    return {window.context, window.extensions.data(), window.extensions.size(), window.createSurface, window.getDrawableSize, window.width, window.height};
+    return {window.context, window.extensions.data(), window.extensions.size(), window.createSurface, window.getDrawableSize, window.width, window.height, window.idle, window.pumpEvents, window.recentFlip};
 }
 
 KytyDllKernelEvent ToSeam(const KernelEvent& event) {
@@ -414,6 +414,18 @@ extern "C" void AgcDriverSuspendPoint_nid_postfix() {
     Call(Api().suspend_point);
 }
 
+extern "C" bool AgcDriverHasStartupPipelineData_nid_postfix() {
+    bool available = false;
+    Check(Api().has_startup_pipeline_data(&available));
+    return available;
+}
+
+extern "C" bool AgcDriverWaitForStartupManifest_nid_postfix(uint32_t* done, uint32_t* total, bool* memoryPaused) {
+    bool ready = false;
+    Check(Api().wait_for_startup_manifest(done, total, memoryPaused, &ready));
+    return ready;
+}
+
 extern "C" void AgcDriverWaitIdle_nid_postfix() {
     Call(Api().wait_idle);
 }
@@ -477,6 +489,9 @@ extern "C" void* AgcDriverStaticTable_nid_postfix() {
 extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address, std::size_t bytes) {
     Check(Api().prepare_command_write(address, bytes));
 }
+
+extern "C" void AgcDriverRecordComputePacketOrigin_nid_no_patch(const std::uint32_t*, std::uint32_t,
+                                                                std::uint64_t) {}
 
 extern "C" void AgcDriverNoteCommandSegment_nid_no_patch(std::uint64_t address, std::size_t bytes) {
     Check(Api().note_command_segment(address, bytes));

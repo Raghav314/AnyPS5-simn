@@ -24,6 +24,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/KytyShim/src/CompileNotice.hpp"
 #include "prx/libSceAgcDriver/KytyShim/src/Replay.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -38,6 +39,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -51,7 +53,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <semaphore>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -70,7 +71,6 @@ std::shared_ptr<AgcDriver::IVideoOutput> VideoOutput(std::uint32_t handle);
 namespace KytyShim::Present {
 
 void WaitRendering(std::uint32_t handle, std::uint32_t index);
-
 namespace {
 
 constexpr std::array<std::array<float, 4>, AgcDriver::OverlayColorCount> OverlayBasePalette{{{0.0f, 0.0f, 0.0f, 0.6f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.35f, 0.8f, 0.35f, 1.0f}, {0.06f, 0.07f, 0.09f, 0.94f}, {0.22f, 0.24f, 0.29f, 1.0f}, {1.0f, 0.78f, 0.2f, 1.0f}, {0.0f, 0.0f, 0.0f, 1.0f}}};
@@ -102,6 +102,8 @@ struct PresentationState {
     std::uint64_t nextFlip = 1;
     void* windowHandle = nullptr;
     bool attaching = false;
+    std::mutex repeat;
+    void (*getDrawableSize)(void*, std::uint32_t*, std::uint32_t*) = nullptr;
     VkSurfaceKHR (*createSurface)(void* context, VkInstance instance) = nullptr;
 };
 
@@ -301,12 +303,11 @@ Libs::Graphics::WindowContext& AttachedWindow(const AgcDriver::PresentationWindo
     return *state.window;
 }
 
-void UpdateDrawableSize(Libs::Graphics::WindowContext& host, const AgcDriver::PresentationWindow& window) {
-    if (window.getDrawableSize == nullptr) throw std::runtime_error("kyty presentation: missing window drawable size query");
+void UpdateDrawableSize(Libs::Graphics::WindowContext& host, void* context, decltype(PresentationState::getDrawableSize) getDrawableSize) {
+    if (getDrawableSize == nullptr) throw std::runtime_error("kyty presentation: missing window drawable size query");
     std::uint32_t width = 0;
     std::uint32_t height = 0;
-    window.getDrawableSize(window.context, &width, &height);
-    if (width == 0 || height == 0) return;
+    getDrawableSize(context, &width, &height);
     Common::LockGuard lock(host.mutex);
     host.graphic_ctx.screen_width = width;
     host.graphic_ctx.screen_height = height;
@@ -419,6 +420,47 @@ void WaitRendering(std::uint32_t handle, std::uint32_t index) {
 
 Libs::Graphics::ImageInfo DisplayBufferImage(const AgcDriver::DisplayBuffer& buffer) {
     return DisplayImageInfo(buffer);
+}
+
+namespace {
+
+constexpr auto RepeatPeriod = std::chrono::milliseconds(100);
+constexpr auto RepeatAfter = std::chrono::milliseconds(300);
+
+using Clock = std::chrono::steady_clock;
+
+thread_local Clock::time_point nextRepeat;
+thread_local bool gameImageShown = false;
+thread_local bool (*recentFlip)() = nullptr;
+thread_local bool noticeInFrame = false;
+thread_local bool noticeOnScreen = false;
+
+void RepeatWhenIdle(bool (*flipReady)(void*), void* readyContext) noexcept {
+    if ((CompileNotice::Revision() & 1u) == 0 && !noticeOnScreen) return;
+    try {
+        const auto now = Clock::now();
+        if (now < nextRepeat) return;
+        if (recentFlip != nullptr && recentFlip()) return;
+        nextRepeat = now + RepeatPeriod;
+        auto& state = State();
+        std::lock_guard repeat(state.repeat);
+        Libs::Graphics::WindowContext* host;
+        void* context;
+        {
+            std::lock_guard lock(state.mutex);
+            context = state.windowHandle;
+            if (context == nullptr || state.attaching) return;
+            host = state.window.get();
+        }
+        UpdateDrawableSize(*host, context, state.getDrawableSize);
+        noticeInFrame = false;
+        if (host->presenter->PresentRepeat(flipReady, readyContext)) noticeOnScreen = noticeInFrame;
+    } catch (const ProcessShutdown&) {
+    } catch (...) {
+        Stop("compile notice presentation", std::current_exception());
+    }
+}
+
 }
 
 }
@@ -569,6 +611,7 @@ void WindowShutdown() {
     std::unique_ptr<WindowContext> window;
     {
         auto& state = KytyShim::Present::State();
+        std::lock_guard repeat(state.repeat);
         std::lock_guard lock(state.mutex);
         window = std::move(state.window);
         state.windowHandle = nullptr;
@@ -578,6 +621,7 @@ void WindowShutdown() {
 struct SystemOverlay::Impl {
     vk::Extent2D extent;
     AgcDriver::OverlayLayout layout;
+    bool hdr = false;
 };
 
 SystemOverlay::SystemOverlay(GraphicContext&): m_impl(std::make_unique<Impl>()) {}
@@ -586,9 +630,14 @@ SystemOverlay::~SystemOverlay() = default;
 
 bool SystemOverlay::PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t) {
     try {
+        KytyShim::Present::noticeInFrame = false;
+        m_impl->hdr = IsHdrSwapchainFormat(format);
         auto layout = AgcDriver::SystemOverlayLayout(VkExtent2D{extent.width, extent.height});
-        if (!layout.has_value()) return false;
-        if (format != vk::Format::eB8G8R8A8Unorm && format != vk::Format::eR8G8B8A8Unorm) throw std::runtime_error("kyty presentation: system dialogs and the system keyboard are drawn only into an 8-bit SDR swapchain");
+        if ((KytyShim::CompileNotice::Revision() & 1u) != 0) {
+            if (!layout.has_value()) layout.emplace();
+            KytyShim::Present::noticeInFrame = KytyShim::CompileNotice::LayOut(*layout, VkExtent2D{extent.width, extent.height}, !KytyShim::Present::gameImageShown);
+        }
+        if (!layout.has_value() || layout->rects.empty()) return false;
         m_impl->extent = extent;
         m_impl->layout = std::move(*layout);
         return true;
@@ -614,7 +663,24 @@ void SystemOverlay::Record(vk::CommandBuffer command, vk::ImageView target) {
         std::size_t runColor = AgcDriver::OverlayColorCount;
         const auto flush = [&] {
             if (run.empty()) return;
-            const auto& color = KytyShim::Present::OverlayBasePalette[runColor];
+            static const auto hdrPalette = [] {
+                auto palette = KytyShim::Present::OverlayBasePalette;
+                for (auto& color : palette) {
+                    const auto linear = [&](float c) {
+                        c *= color[3];
+                        return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+                    };
+                    const float r = linear(color[0]), g = linear(color[1]), b = linear(color[2]);
+                    const auto pq = [](float c) {
+                        const float p = std::pow(c * (250.0f / 10000.0f), 2610.0f / 16384.0f);
+                        return std::pow((3424.0f / 4096.0f + (2413.0f / 128.0f) * p) / (1.0f + (2392.0f / 128.0f) * p), 2523.0f / 32.0f);
+                    };
+                    color = {pq(0.627404f*r + 0.329283f*g + 0.043313f*b), pq(0.069097f*r + 0.919540f*g + 0.011362f*b),
+                             pq(0.016391f*r + 0.088013f*g + 0.895595f*b), 1.0f};
+                }
+                return palette;
+            }();
+            const auto& color = (m_impl->hdr ? hdrPalette : KytyShim::Present::OverlayBasePalette)[runColor];
             vk::ClearAttachment clear{};
             clear.aspectMask = vk::ImageAspectFlagBits::eColor;
             clear.colorAttachment = 0;
@@ -647,7 +713,8 @@ void SystemOverlay::Record(vk::CommandBuffer command, vk::ImageView target) {
 void SystemOverlay::ReleaseVulkan() {}
 
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
-    return {AgcDriver::SystemOverlayShown(), 0};
+    const auto revision = KytyShim::CompileNotice::Revision();
+    return {AgcDriver::SystemOverlayShown() || (revision & 1u) != 0, revision};
 }
 
 void ShutdownSystemOverlayInput() {}
@@ -655,24 +722,6 @@ void ShutdownSystemOverlayInput() {}
 bool PerformanceOverlayEnabled() noexcept {
     return false;
 }
-
-bool ManifestProgressVisible() noexcept {
-    return false;
-}
-
-void ShowManifestProgress(const ManifestProgress&) {}
-
-void HideManifestProgress() {}
-
-void ShowPrecompileNotice(const PrecompileNotice& notice) {
-    static std::atomic<bool> told{false};
-    if (notice.visible && !told.exchange(true)) {
-        std::fprintf(stderr, "[kyty-videoout] the pipeline precompile notice is not drawn by the Kyty GPU driver: the game waits for its pipelines without it\n");
-        std::fflush(stderr);
-    }
-}
-
-void HidePrecompileNotice() {}
 
 }
 
@@ -712,6 +761,7 @@ extern "C" void AgcDriverAttachWindow_nid_postfix(const AgcDriver::PresentationW
             if (!enabled) throw std::runtime_error(std::string("kyty presentation: the window needs the Vulkan instance extension ") + needed + ", which the Kyty instance did not enable");
         }
         state.createSurface = window.createSurface;
+        state.getDrawableSize = window.getDrawableSize;
         state.attaching = true;
         host = state.window.get();
     }
@@ -722,11 +772,15 @@ extern "C" void AgcDriverAttachWindow_nid_postfix(const AgcDriver::PresentationW
     if (host->graphic_ctx.physical_device.getSurfaceSupportKHR(host->graphic_ctx.queue_family, host->surface, &supported) != vk::Result::eSuccess || supported != VK_TRUE) throw std::runtime_error("kyty presentation: the Vulkan queue the Kyty renderer selected cannot present to this window");
     host->RefreshSurfaceCapabilities();
     if (!(host->surface_capabilities.capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eTransferDst)) throw std::runtime_error("kyty presentation: the window surface cannot be a blit destination");
-    KytyShim::Present::UpdateDrawableSize(*host, window);
+    KytyShim::Present::UpdateDrawableSize(*host, window.context, window.getDrawableSize);
     host->presenter->AttachSurface();
-    std::lock_guard lock(state.mutex);
-    state.windowHandle = window.context;
-    state.attaching = false;
+    {
+        std::lock_guard lock(state.mutex);
+        state.windowHandle = window.context;
+        state.attaching = false;
+    }
+    KytyShim::Present::recentFlip = window.recentFlip;
+    if (window.idle != nullptr) *window.idle = &KytyShim::Present::RepeatWhenIdle;
 }
 
 namespace KytyShim::Present {
@@ -745,41 +799,66 @@ std::optional<GuestImage> DescribeGuestImage(const AgcDriver::DisplayBuffer* buf
 }
 
 struct PreparedFrames {
-    std::binary_semaphore done{0};
+    std::promise<void> done;
     std::uint64_t tick = 0;
     Libs::Graphics::Presenter::Frame* main = nullptr;
     Libs::Graphics::Presenter::Frame* overlay = nullptr;
 };
 
-std::shared_ptr<PreparedFrames> PrepareGuestFrames(Libs::Graphics::RenderContext& renderer, Libs::Graphics::Presenter& presenter, const std::optional<GuestImage>& main, const std::optional<GuestImage>& overlay) {
+std::shared_ptr<PreparedFrames> PrepareGuestFrames(Libs::Graphics::RenderContext& renderer, Libs::Graphics::Presenter& presenter, const std::optional<GuestImage>& main, const std::optional<GuestImage>& overlay, void (*pumpEvents)()) {
     auto prepared = std::make_shared<PreparedFrames>();
-    renderer.GetGpu().SendUrgentCommandSync([&renderer, &presenter, main, overlay, prepared] {
+    auto done = prepared->done.get_future();
+    renderer.GetGpu().PostUrgentCommand([&renderer, &presenter, main, overlay, prepared] {
         auto& scheduler = renderer.GetCommandScheduler();
         if (main.has_value()) prepared->main = &presenter.PrepareFrame(scheduler.Current(), main->info, main->pixelFormat, false);
         if (overlay.has_value()) prepared->overlay = &presenter.PrepareFrame(scheduler.Current(), overlay->info, overlay->pixelFormat, false);
-        if (main.has_value()) scheduler.DeferHostOperation([prepared] { prepared->done.release(); }, true);
+        if (main.has_value()) scheduler.DeferHostOperation([prepared] { prepared->done.set_value(); }, true);
         prepared->tick = scheduler.CurrentTick();
         scheduler.Flush();
-    });
-    if (main.has_value()) prepared->done.acquire();
-    else renderer.GetCommandScheduler().GetMasterSemaphore().Wait(prepared->tick);
+        if (!main.has_value()) prepared->done.set_value();
+    }, true);
+    const auto ready = [](void* context) {
+        return static_cast<std::future<void>*>(context)->wait_for(Clock::duration::zero()) == std::future_status::ready;
+    };
+    while (done.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
+        if (pumpEvents != nullptr) pumpEvents();
+        RepeatWhenIdle(ready, &done);
+    }
+    if (!main.has_value()) {
+        auto& scheduler = renderer.GetCommandScheduler();
+        struct TimelineWait {
+            Libs::Graphics::CommandScheduler& scheduler;
+            std::uint64_t tick;
+        } wait{scheduler, prepared->tick};
+        const auto complete = [](void* context) {
+            const auto& wait = *static_cast<TimelineWait*>(context);
+            return wait.scheduler.IsFree(wait.tick);
+        };
+        const auto semaphore = scheduler.GetMasterSemaphore().Handle();
+        const vk::SemaphoreWaitInfo info{.semaphoreCount = 1, .pSemaphores = &semaphore, .pValues = &wait.tick};
+        while (!complete(&wait)) {
+            const auto result = scheduler.Graphics().device.waitSemaphores(&info, 10'000'000);
+            if (result == vk::Result::eSuccess) break;
+            if (result != vk::Result::eTimeout) Libs::Graphics::RequireVulkanSuccess(result, "wait for prepared overlay");
+            if (pumpEvents != nullptr) pumpEvents();
+            RepeatWhenIdle(complete, &wait);
+        }
+    }
     return prepared;
 }
 
-void PresentLayers(Libs::Graphics::Presenter& presenter, Libs::Graphics::Presenter::Frame& main, Libs::Graphics::Presenter::Frame* overlay) {
-    if (overlay == nullptr) {
-        presenter.ClearLayer(OverlayBus);
-        presenter.Present(main);
+void PresentLayers(Libs::Graphics::Presenter& presenter, Libs::Graphics::Presenter::Frame& main, Libs::Graphics::Presenter::Frame* overlay, bool guestImage) {
+    const std::array<Libs::Graphics::Presenter::Layer, 2> layers{{{&main, 0, false}, {overlay, OverlayBus, true}}};
+    const bool previous = gameImageShown;
+    gameImageShown = previous || guestImage;
+    noticeInFrame = false;
+    if (!presenter.Present(std::span(layers))) {
+        gameImageShown = previous;
         return;
     }
-    const std::array<Libs::Graphics::Presenter::Layer, 2> layers{{{&main, 0, false}, {overlay, OverlayBus, true}}};
-    presenter.Present(std::span(layers));
-}
-
-void PresentGuestLayers(Libs::Graphics::WindowContext& host, Libs::Graphics::Presenter& presenter, Libs::Graphics::Presenter::Frame& main, Libs::Graphics::Presenter::Frame* overlay) {
-    const auto before = host.loop.presented_frames.load(std::memory_order_relaxed);
-    PresentLayers(presenter, main, overlay);
-    if (host.loop.presented_frames.load(std::memory_order_relaxed) != before) LibcRunReportFramePresented_nid_no_patch();
+    noticeOnScreen = noticeInFrame;
+    if (noticeOnScreen) nextRepeat = Clock::now() + RepeatAfter;
+    if (guestImage) LibcRunReportFramePresented_nid_no_patch();
 }
 
 }
@@ -788,20 +867,20 @@ void PresentGuestLayers(Libs::Graphics::WindowContext& host, Libs::Graphics::Pre
 extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::PresentationWindow& window, const AgcDriver::DisplayBuffer& buffer, const AgcDriver::DisplayBuffer* plane, void (*gpuReady)(void*), void* context) {
     if (gpuReady == nullptr || context == nullptr) throw std::runtime_error("kyty presentation: missing GPU completion callback");
     auto& host = KytyShim::Present::AttachedWindow(window);
-    KytyShim::Present::UpdateDrawableSize(host, window);
+    KytyShim::Present::UpdateDrawableSize(host, window.context, window.getDrawableSize);
     auto& presenter = *host.presenter;
     auto& renderer = *host.render_context;
     const auto overlayImage = KytyShim::Present::DescribeGuestImage(plane);
     const auto flip = KytyShim::Present::TakeReadyFlip(context, presenter);
     if (flip.has_value() && flip->frame != nullptr && flip->source == buffer) {
-        const auto overlay = overlayImage.has_value() ? KytyShim::Present::PrepareGuestFrames(renderer, presenter, std::nullopt, overlayImage) : nullptr;
-        KytyShim::Present::PresentGuestLayers(host, presenter, *flip->frame, overlay != nullptr ? overlay->overlay : nullptr);
+        const auto overlay = overlayImage.has_value() ? KytyShim::Present::PrepareGuestFrames(renderer, presenter, std::nullopt, overlayImage, window.pumpEvents) : nullptr;
+        KytyShim::Present::PresentLayers(presenter, *flip->frame, overlay != nullptr ? overlay->overlay : nullptr, true);
         gpuReady(context);
         return;
     }
     if (flip.has_value() && flip->frame != nullptr) presenter.Discard(*flip->frame);
-    const auto prepared = KytyShim::Present::PrepareGuestFrames(renderer, presenter, KytyShim::Present::DescribeGuestImage(&buffer), overlayImage);
-    KytyShim::Present::PresentGuestLayers(host, presenter, *prepared->main, prepared->overlay);
+    const auto prepared = KytyShim::Present::PrepareGuestFrames(renderer, presenter, KytyShim::Present::DescribeGuestImage(&buffer), overlayImage, window.pumpEvents);
+    KytyShim::Present::PresentLayers(presenter, *prepared->main, prepared->overlay, true);
 #if !defined(ANYPS5_KYTY_DLL)
     if (auto* recorder = AgcDriver::FrameRecorder::Active()) recorder->PresentBuffer(buffer);
 #endif
@@ -812,18 +891,19 @@ extern "C" void AgcDriverPresentClear_nid_postfix(const AgcDriver::PresentationW
     if (gpuReady == nullptr || context == nullptr) throw std::runtime_error("kyty presentation: missing GPU completion callback");
     if (window.width == 0 || window.height == 0) throw std::runtime_error("kyty presentation: invalid output extent");
     auto& host = KytyShim::Present::AttachedWindow(window);
-    KytyShim::Present::UpdateDrawableSize(host, window);
+    KytyShim::Present::UpdateDrawableSize(host, window.context, window.getDrawableSize);
     auto& presenter = *host.presenter;
     const auto overlayImage = KytyShim::Present::DescribeGuestImage(plane);
     if (const auto flip = KytyShim::Present::TakeReadyFlip(context, presenter); flip.has_value() && flip->frame != nullptr) presenter.Discard(*flip->frame);
     auto& blank = presenter.PrepareBlankFrame(window.width, window.height, opaque);
-    const auto overlay = overlayImage.has_value() ? KytyShim::Present::PrepareGuestFrames(*host.render_context, presenter, std::nullopt, overlayImage) : nullptr;
-    KytyShim::Present::PresentLayers(presenter, blank, overlay != nullptr ? overlay->overlay : nullptr);
+    const auto overlay = overlayImage.has_value() ? KytyShim::Present::PrepareGuestFrames(*host.render_context, presenter, std::nullopt, overlayImage, window.pumpEvents) : nullptr;
+    KytyShim::Present::PresentLayers(presenter, blank, overlay != nullptr ? overlay->overlay : nullptr, false);
     gpuReady(context);
 }
 
 extern "C" void AgcDriverReleaseWindow_nid_postfix(void* window) {
     auto& state = KytyShim::Present::State();
+    std::lock_guard repeat(state.repeat);
     std::lock_guard lock(state.mutex);
     if (window != nullptr && state.windowHandle == window) state.windowHandle = nullptr;
 }

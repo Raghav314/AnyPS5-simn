@@ -6,6 +6,8 @@
 #include <array>
 #include <charconv>
 #include <cstdint>
+#include <filesystem>
+#include <iosfwd>
 #include <span>
 #include <string>
 #include <string_view>
@@ -43,6 +45,8 @@ struct ManifestModule {
 	uint64_t back_hash        = 0;
 	uint32_t user_data_count  = 0;
 	uint32_t push_data_cursor = 0;
+	bool runtime_buffers      = false;
+	bool runtime_samplers     = false;
 	std::variant<ShaderVertexInputInfo, ShaderPixelInputInfo, ShaderComputeInputInfo> input;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	bool from_assets = false;
@@ -66,6 +70,10 @@ struct PipelineManifest {
 	std::vector<std::pair<uint64_t, ShaderTessellationInputInfo>> tessellation_layouts;
 };
 
+bool WriteShaderInventory(const std::filesystem::path& root, std::span<const std::filesystem::path> images,
+                          std::ostream& code_store,
+                          std::ostream& creation_records, std::ostream& shipped_recipes, std::ostream& report);
+
 void NormalizeManifestInput(ManifestModule& module);
 
 [[nodiscard]] std::vector<uint8_t> SaveManifest(const PipelineManifest& manifest);
@@ -77,6 +85,18 @@ bool LoadManifest(std::span<const uint8_t> bytes, PipelineManifest& manifest,
 [[nodiscard]] uint64_t ManifestPipelineIdentity(const ManifestPipeline& pipeline);
 [[nodiscard]] ManifestFloatModes ReadManifestFloatModes(const HW::Shader&             shaders,
                                                         const std::array<uint64_t, 4>& stage_ids);
+
+struct ComputeRecipeVariant {
+	ShaderComputeInputInfo                       input {};
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+};
+
+[[nodiscard]] std::vector<ComputeRecipeVariant> SynthesizeComputeVariants(
+    const ShaderComputeInputInfo&             base_input,
+    bool                                      queue_dependent,
+    const ShaderRecompiler::IR::Program&      program,
+    const ShaderRecompiler::IR::ResourcePlan& plan,
+    std::span<const ManifestModule>           signatures);
 
 }
 

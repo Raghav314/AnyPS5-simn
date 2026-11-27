@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "libs/errno.h"
@@ -44,6 +45,7 @@ struct ShaderMapData: ShaderMappedData {
 	ShaderVertexMetadata vertex;
 	const char*          vertex_error = nullptr;
 	uint32_t binary_size_bytes = 0;
+	bool compute_queue_dependent = true;
 };
 
 struct ShaderMapEntry {
@@ -87,7 +89,11 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	ShaderMapData mapped {data};
 	mapped.code_size_bytes   = ShaderProgramSize(binary, data.code_size_bytes);
 	mapped.binary_size_bytes = data.code_size_bytes;
-	const auto hash        = XXH3_64bits(binary, mapped.code_size_bytes);
+	if (data.type == Prospero::ShaderBinaryType::kCs) {
+		mapped.compute_queue_dependent = ShaderRecompiler::Decoder::ComputeShaderDependsOnQueue(
+		    std::span(binary, mapped.code_size_bytes / sizeof(uint32_t)));
+	}
+	const auto hash = XXH3_64bits(binary, mapped.code_size_bytes);
 	mapped.vertex_error =
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
 	{
@@ -840,6 +846,7 @@ ShaderParams PrepareProgram(
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
 	ShaderGetStaticInputInfoCS(regs, data, info);
+	info.async_compute = info.async_compute && data.compute_queue_dependent;
 	return GetShaderParams(
 	    regs.cs_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);

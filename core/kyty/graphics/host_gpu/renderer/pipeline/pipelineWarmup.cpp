@@ -1,4 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLinkedStore.h"
+#include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
@@ -9,6 +12,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fmt/format.h>
+#include <fstream>
 #include <ranges>
 #include <string_view>
 
@@ -64,6 +68,14 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 	if (header.empty()) {
 		return;
 	}
+#if defined(ANYPS5_KYTY)
+	auto linked_path = path;
+	std::ifstream linked(linked_path.replace_extension(".linked"), std::ios::binary);
+	if (linked) {
+		auto store = std::make_unique<LinkedComputeStore>();
+		if (store->Read(linked, header)) m_linked_store = std::move(store);
+	}
+#endif
 	const auto           start = std::chrono::steady_clock::now();
 	std::vector<uint8_t> bytes;
 	bool read_store = false;
@@ -86,8 +98,36 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 		Log::WriteToConsoleAndLog(fmt::format("Shader cache: replacing {}: {}\n", Common::PathToString(path), reason));
 	}
 	m_store.Open(path, header, kept);
+	WarmUpNativePipelines();
 	const auto modules = MapModules();
 #if defined(ANYPS5_KYTY)
+	if (Config::PipelineManifestEnabled() && !PipelineCacheTitleId().empty()) {
+		for (const auto& key: m_graphics_pipelines | std::views::keys) {
+			AsyncPipelineJob job {.key = key};
+			bool found = true;
+			for (size_t i = 0; i < job.stages.size(); i++) {
+				const auto stage = modules.find(key.stage_ids[i]);
+				if (stage == modules.end()) {
+					found = false;
+					break;
+				}
+				job.stages[i] = stage->second;
+			}
+			if (found && SampledDescriptorBudgetFits(job.stages)) m_restore_jobs.push_back(job);
+		}
+		m_graphics_pipelines.clear();
+		if (m_compile_compute_pipelines) {
+			for (const auto* module: modules | std::views::values) {
+				if (module != nullptr && module->info.stage == ShaderType::Compute &&
+				    SampledDescriptorBudgetFits(std::span(&module, 1))) {
+					m_restore_jobs.push_back({.compute = true, .module = module});
+				}
+			}
+		}
+		Log::WriteToConsoleAndLog(fmt::format("Shader cache: restored {} modules, {} pipeline handles to resolve\n",
+		                                     modules.size() - 1, m_restore_jobs.size()));
+		return;
+	}
 	const bool shared = WarmUpSharedCache(m_graphics);
 	const bool lookup = driver_cache_restored && !shared && m_graphics.pipeline_cache_lookup_enabled;
 	std::vector<std::function<void(vk::PipelineCache)>> jobs;
@@ -102,7 +142,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 				}
 				stages[i] = found->second;
 			}
-			CreatePipelineInternal(m_graphics, node.second, node.first, stages, cache);
+			if (SampledDescriptorBudgetFits(stages)) CreatePipelineInternal(m_graphics, node.second, node.first, stages, cache);
 		});
 	}
 	for (const auto* module: modules | std::views::values) {
@@ -193,6 +233,52 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
 	                                                          start)
 	        .count()));
+}
+
+void PipelineCache::WarmUpNativePipelines() {
+	if (m_native_graphics_pipelines.empty()) return;
+	if (TableXprMode() == 0) {
+		m_native_graphics_pipelines.clear();
+		return;
+	}
+	ModuleMap modules {{0, nullptr}};
+	for (const auto& variants: m_table_programs | std::views::values) {
+		for (const auto& variant: variants) {
+			if (!variant.module) continue;
+			modules.try_emplace(variant.module->id, &*variant.module);
+			if (variant.module->plain) modules.try_emplace(variant.module->plain->id, variant.module->plain.get());
+		}
+	}
+	const auto count = m_native_graphics_pipelines.size();
+	const GuestClockHold clock_hold;
+	for (auto& [key, cached]: m_native_graphics_pipelines) {
+		std::array<const ShaderModule*, 4> stages {};
+		for (size_t i = 0; i < stages.size(); ++i) {
+			const auto found = modules.find(key.stage_ids[i]);
+			if (found != modules.end()) stages[i] = found->second;
+		}
+		if (!ValidNativeGraphicsStages(key, stages) || !SampledDescriptorBudgetFits(stages)) continue;
+		Pipeline pipeline;
+		pipeline.native_bindings = true;
+		const auto started = std::chrono::steady_clock::now();
+#if defined(ANYPS5_KYTY)
+		CreateGraphicsPipelineLayout(m_graphics, pipeline, key, stages);
+		const auto result = CreateGraphicsPipelineWhole(m_graphics, pipeline, key, stages, m_driver_cache, {}, pipeline.pipeline);
+		if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr || pipeline.pipeline_layout == nullptr) {
+			m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+			m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+			m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+			continue;
+		}
+#else
+		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
+#endif
+		cached = pipeline;
+		NoteCreatedPipeline(started);
+	}
+	std::erase_if(m_native_graphics_pipelines, [](const auto& entry) { return entry.second.pipeline == nullptr; });
+	Log::WriteToConsoleAndLog(fmt::format("Shader cache: restored {} of {} native graphics pipelines\n",
+	                                     m_native_graphics_pipelines.size(), count));
 }
 
 PipelineCache::ModuleMap PipelineCache::MapModules() const {

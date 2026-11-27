@@ -584,8 +584,8 @@ const char* CheckWriteBackRefreshesBufferCopy(GraphicContext& graphics, uint64_t
 	return nullptr;
 }
 
-const char* CheckPartialBufferCopy(GraphicContext& graphics, uint64_t address,
-                                   Prospero::TileMode mode) {
+const char* CheckPartialBufferWrite(GraphicContext& graphics, uint64_t address,
+                                    Prospero::TileMode mode, bool fill) {
 	RenderContext renderer(graphics);
 	CommandProcessor producer(renderer, 0);
 	producer.Reset();
@@ -624,10 +624,15 @@ const char* CheckPartialBufferCopy(GraphicContext& graphics, uint64_t address,
 	const auto& block = info.tiling.block;
 	const uint64_t offset = info.IsTiled() ? block.block_size - 2 * TexelBytes
 	                                      : (Width + 5) * TexelBytes;
-	const auto source = address + GuestBytes / 4;
-	const auto [source_buffer, source_offset] = buffers.ObtainBuffer(source, CopyBytes, true, false);
-	source_buffer->Fill(source_offset, CopyBytes, CopyValue);
-	buffers.CopyBuffer(address + offset, source, CopyBytes, false, false);
+	if (fill) {
+		(void)buffers.ObtainBuffer(address + offset, CopyBytes, true, false);
+		buffers.FillBuffer(address + offset, CopyBytes, CopyValue, false);
+	} else {
+		const auto source = address + GuestBytes / 4;
+		const auto [source_buffer, source_offset] = buffers.ObtainBuffer(source, CopyBytes, true, false);
+		source_buffer->Fill(source_offset, CopyBytes, CopyValue);
+		buffers.CopyBuffer(address + offset, source, CopyBytes, false, false);
+	}
 
 	TextureCache::ImageDesc desc {.info = info};
 	desc.view_info.format = info.pixel_format;
@@ -643,7 +648,7 @@ const char* CheckPartialBufferCopy(GraphicContext& graphics, uint64_t address,
 	std::memcpy(actual.data(), readback.Mapped().data(), sizeof(actual));
 	BufferCacheTestAccess::DiscardGpuWrites(buffers, address, GuestBytes / 2);
 	(void)buffers.DropFreedRange(address, GuestBytes / 2, nullptr, nullptr);
-	if (!view) return "could not rebind the resident image after the partial copy";
+	if (!view) return "could not rebind the resident image after the partial buffer write";
 
 	uint32_t covered = 0;
 	bool stale = false;
@@ -666,12 +671,12 @@ const char* CheckPartialBufferCopy(GraphicContext& graphics, uint64_t address,
 				covered++;
 				stale |= actual[index] != CopyValue;
 			} else if (actual[index] != pixels[index]) {
-				return "the partial copy changed texels outside its guest range";
+				return "the partial buffer write changed texels outside its guest range";
 			}
 		}
 	}
-	if (covered != WriteWords) return "the reference did not cover the copied words";
-	return stale ? "the resident image still held stale texels after the partial copy" : nullptr;
+	if (covered != WriteWords) return "the reference did not cover the written words";
+	return stale ? "the resident image still held stale texels after the partial buffer write" : nullptr;
 }
 
 const char* CheckRangePicksLatestWrite(GraphicContext& graphics, uint64_t address) {
@@ -951,12 +956,12 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 	if (failure == nullptr) {
 		failure = CheckWriteBackRefreshesBufferCopy(graphics, address + GuestBytes / 4);
 	}
-	if (failure == nullptr) {
-		const auto* linear = CheckPartialBufferCopy(graphics, address + GuestBytes / 2,
-		                                           Prospero::TileMode::kLinear);
-		const auto* tiled = CheckPartialBufferCopy(graphics, address + GuestBytes / 2,
-		                                          Prospero::TileMode::kStandard4KB);
-		failure = linear != nullptr ? linear : tiled;
+	for (const auto mode: {Prospero::TileMode::kLinear, Prospero::TileMode::kStandard4KB}) {
+		for (const bool fill: {false, true}) {
+			if (failure == nullptr) {
+				failure = CheckPartialBufferWrite(graphics, address + GuestBytes / 2, mode, fill);
+			}
+		}
 	}
 	constexpr LayerFormat Words {vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt};
 	constexpr LayerFormat Bytes {vk::Format::eR8G8B8A8Unorm, Prospero::BufferFormat::k8_8_8_8UNorm};

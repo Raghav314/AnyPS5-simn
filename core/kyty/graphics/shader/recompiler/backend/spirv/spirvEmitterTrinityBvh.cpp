@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/recompiler/ir/RayQuery.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -488,6 +489,19 @@ uint32_t EmitBvh8Intersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ray == nullptr || ray->NumArgs() < 11 || s.bvh8_intersect_function == 0)
 		ctx.Fail(inst, "BVH8 intersection requires the complete ray and shared function");
 	Bvh8Emitter e {s};
+	if ((inst.Flags<uint32_t>() & IR::BvhIntersectEmpty) != 0) {
+		const auto leaf = Binary(s, spv::OpULessThan, e.b, e.And(ctx.Arg(*ray, 10), e.C(7)), e.C(2));
+		std::array<uint32_t, 10> invalid;
+		invalid.fill(e.C(~0u));
+		for (uint32_t slot = 0; slot < 2; ++slot) {
+			invalid[slot * 4]     = e.Choose(leaf, e.C(0x7f800000), e.C(~0u));
+			invalid[slot * 4 + 1] = e.Choose(leaf, e.C(0x3f800000), e.C(~0u));
+			invalid[slot * 4 + 3] = e.Choose(leaf, e.C(0), e.C(~0u));
+		}
+		const Vec3 org {e.Float(ctx.Arg(*ray, 4)), e.Float(ctx.Arg(*ray, 5)), e.Float(ctx.Arg(*ray, 6))};
+		const Vec3 dir {e.Float(ctx.Arg(*ray, 7)), e.Float(ctx.Arg(*ray, 8)), e.Float(ctx.Arg(*ray, 9))};
+		return e.Result(invalid, org, dir, e.C(0));
+	}
 	const auto vector = [&](uint32_t first) {
 		return e.Make(e.v3, Vec3{e.Float(ctx.Arg(*ray, first)), e.Float(ctx.Arg(*ray, first + 1)),
 		    e.Float(ctx.Arg(*ray, first + 2))});

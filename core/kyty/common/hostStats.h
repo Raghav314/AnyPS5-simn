@@ -58,6 +58,13 @@ struct HostStats {
 	std::optional<uint64_t> gpu_recoveries;
 };
 
+struct SystemMemory {
+	uint64_t total;
+	uint64_t available;
+};
+
+[[nodiscard]] std::optional<SystemMemory> ReadSystemMemory();
+
 class HostStatsSampler final {
 public:
 	HostStatsSampler();

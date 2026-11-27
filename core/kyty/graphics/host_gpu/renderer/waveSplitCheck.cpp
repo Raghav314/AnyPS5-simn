@@ -35,9 +35,10 @@ std::string Hash(uint64_t hash) {
 
 }
 
-WaveSplitCheck::WaveSplitCheck(RenderContext& context): m_context(context) {}
+WaveSplitCheck::WaveSplitCheck(RenderContext& context, bool generic): m_context(context), m_generic(generic) {}
 
 WaveSplitCheck::~WaveSplitCheck() {
+	m_context.GetGraphics().device.destroyQueryPool(m_timestamps, nullptr);
 	DestroyCheckComparePipeline(m_context.GetGraphics().device, m_compare);
 }
 
@@ -57,8 +58,22 @@ bool WaveSplitCheck::Prepare() {
 	m_results = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
 	                                     uint64_t {ResultBytes} * m_pending.size());
 
-	CreateCheckComparePipeline(graphics.device, "wave split check", "Wave Split Check Compare", m_compare);
+	CreateCheckComparePipeline(graphics.device, m_generic ? "generic compute check" : "wave split check",
+	                           m_generic ? "Generic Compute Compare" : "Wave Split Check Compare", m_compare);
 	m_ready = true;
+	if (m_generic) {
+		uint32_t count = 0;
+		graphics.physical_device.getQueueFamilyProperties(&count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(count);
+		graphics.physical_device.getQueueFamilyProperties(&count, families.data());
+		if (graphics.queue_family < count) m_timestamp_bits = families[graphics.queue_family].timestampValidBits;
+		vk::QueryPoolCreateInfo info {.queryType = vk::QueryType::eTimestamp,
+		                              .queryCount = static_cast<uint32_t>(4 * m_pending.size())};
+		if (m_timestamp_bits != 0 && graphics.device.createQueryPool(&info, nullptr, &m_timestamps) != vk::Result::eSuccess) {
+			m_timestamps = nullptr;
+		}
+		return true;
+	}
 	Note(fmt::format("[kyty-split-check] on: one dispatch in {} of every split wave64 compute program (one in {} once "
 	                 "verified) also runs in lane pairs on the same inputs, and the outputs of both are compared; every "
 	                 "other check runs the lane pair module twice instead, as a witness of what the program does not fix "
@@ -104,13 +119,13 @@ void WaveSplitCheck::Refuse(uint64_t hash, const std::string& reason) {
 		return;
 	}
 	program.refused = reason;
-	Note(fmt::format("[kyty-split-check] {}: not checked ({})", Hash(hash), reason));
+	Note(fmt::format("[kyty-{}-check] {}: skipped ({})", m_generic ? "generic" : "split", Hash(hash), reason));
 }
 
 bool WaveSplitCheck::Sample(const ShaderModule& module, const ShaderComputeInputInfo& input_info,
                             const CommandBuffer& buffer) {
-	const auto period = Config::WaveSplitCheckPeriod();
-	if (period == 0 || m_active || !Candidate(input_info)) {
+	const auto period = m_generic ? 1u : Config::WaveSplitCheckPeriod();
+	if (period == 0 || m_active || (!m_generic && !Candidate(input_info))) {
 		return false;
 	}
 	if (&buffer != &m_context.GetCommandScheduler().Current()) {
@@ -155,7 +170,13 @@ bool WaveSplitCheck::Begin(const ShaderModule& split, const ShaderModule& pairs)
 	program.waiting         = false;
 	program.deferred        = 0;
 	program.queued          = 0;
-	if (split.spirv_words == pairs.spirv_words) {
+	if (m_generic) {
+		if (m_generic_pairs.contains({split.id, pairs.id})) return false;
+		if (const char* reason = RayTracingCheckUnreplayable(split.info)) {
+			Refuse(hash, reason);
+			return false;
+		}
+	} else if (split.spirv_words == pairs.spirv_words) {
 		Refuse(hash, fmt::format("kept in lane pairs: both variants are {} SPIR-V words", split.spirv_words));
 		return false;
 	}
@@ -164,7 +185,9 @@ bool WaveSplitCheck::Begin(const ShaderModule& split, const ShaderModule& pairs)
 		program.waiting = true;
 		return false;
 	}
-	m_witness       = program.started++ % 2u == 1u;
+	if (m_generic) m_generic_pairs.emplace(split.id, pairs.id);
+	m_witness = program.started++ % 2u == 1u && !m_generic;
+	if (m_timestamps) m_context.GetGraphics().device.resetQueryPool(m_timestamps, 4 * slot, 4);
 	m_pending[slot] = {.busy = true, .hash = hash, .dwords = 0, .index = program.dispatches - 1, .witness = m_witness};
 	m_slot          = slot;
 	m_hash          = hash;
@@ -209,6 +232,10 @@ void WaveSplitCheck::AfterSplit(const PreparedBindings&) {
 	CheckBarrier(scheduler.Current().Handle());
 }
 
+void WaveSplitCheck::Timestamp(const CommandRecorder& command, uint32_t index) {
+	if (m_active && m_timestamps) command.writeTimestamp(m_timestamps, 4 * m_slot + index);
+}
+
 void WaveSplitCheck::AfterPairs(const PreparedBindings& bindings) {
 	if (!m_active) {
 		return;
@@ -217,6 +244,13 @@ void WaveSplitCheck::AfterPairs(const PreparedBindings& bindings) {
 	std::vector<CheckOutput> pairs;
 	std::string              reason;
 	bool                     same = CollectCheckOutputs(m_context, bindings, pairs, reason);
+	if (m_generic && same && !std::ranges::equal(m_outputs, pairs, [](const auto& a, const auto& b) {
+		    return CheckOutputPlace(a) == CheckOutputPlace(b) && a.size == b.size && a.buffer == b.buffer &&
+		           a.offset == b.offset && a.image == b.image;
+	    })) {
+		reason = "the generic and exact variants bind different output ranges";
+		same = false;
+	}
 	std::vector<CheckOutput> matched;
 	for (const auto& output: m_outputs) {
 		const auto found = std::find_if(pairs.begin(), pairs.end(), [&](const CheckOutput& candidate) {
@@ -319,6 +353,21 @@ void WaveSplitCheck::Finish(uint32_t slot) {
 				break;
 			}
 		}
+	}
+	if (m_generic) {
+		std::string times;
+		std::array<uint64_t, 4> ticks {};
+		auto& graphics = m_context.GetGraphics();
+		if (m_timestamps && graphics.device.getQueryPoolResults(m_timestamps, 4 * slot, 4, sizeof(ticks), ticks.data(),
+		                                                        sizeof(uint64_t), vk::QueryResultFlagBits::e64) == vk::Result::eSuccess) {
+			const uint64_t mask = UINT64_MAX >> (64u - m_timestamp_bits);
+			const double period = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod / 1000.0;
+			times = fmt::format(" generic_us={:.3f} exact_us={:.3f}", ((ticks[1] - ticks[0]) & mask) * period,
+			                    ((ticks[3] - ticks[2]) & mask) * period);
+		}
+		Note(fmt::format("[kyty-generic-check] {} words={} different={} outputs={} first={}{} generic={:08x} exact={:08x}{}",
+		                 Hash(pending.hash), pending.dwords, differ, pending.outputs.size(), first, where, split, pairs, times));
+		return;
 	}
 	if (pending.witness && (differ != 0 || program.witnessed == 1)) {
 		Note(fmt::format("[kyty-split-check] {}: witness dispatch {}: {} of {} output dwords differ between two lane pair "

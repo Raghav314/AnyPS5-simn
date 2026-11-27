@@ -16,6 +16,8 @@ using ShaderCodeReader = std::function<bool(uint64_t, std::span<uint32_t>)>;
 
 constexpr uint32_t ShaderCallMissTrapCode = 0x7fu;
 
+bool ComputeShaderDependsOnQueue(std::span<const uint32_t> code);
+
 bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
                            std::span<const uint32_t> user_data, const ShaderCodeReader& read,
                            std::vector<uint32_t>& expanded, std::vector<LongBranch>& long_branches,

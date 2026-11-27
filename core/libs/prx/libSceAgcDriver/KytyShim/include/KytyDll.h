@@ -55,6 +55,8 @@ typedef struct KytyDllDisplayBuffer {
     uint32_t dcc_control;
 } KytyDllDisplayBuffer;
 
+typedef void (*KytyDllPresentationIdle)(bool (*flip_ready)(void*), void* context);
+
 typedef struct KytyDllWindow {
     void* context;
     const char* const* extensions;
@@ -63,6 +65,9 @@ typedef struct KytyDllWindow {
     void (*get_drawable_size)(void* context, uint32_t* width, uint32_t* height);
     uint32_t width;
     uint32_t height;
+    KytyDllPresentationIdle* idle;
+    void (*pump_events)(void);
+    bool (*recent_flip)(void);
 } KytyDllWindow;
 
 typedef struct KytyDllAwaitedWait {
@@ -193,6 +198,8 @@ typedef struct KytyDllApi {
     KytyDllStatus (*submit_graphics)(uint32_t* commands, uint32_t dwords);
     KytyDllStatus (*suspend_point)(void);
     KytyDllStatus (*wait_idle)(void);
+    KytyDllStatus (*has_startup_pipeline_data)(bool* available);
+    KytyDllStatus (*wait_for_startup_manifest)(uint32_t* done, uint32_t* total, bool* memory_paused, bool* ready);
     KytyDllStatus (*prestart_gpu)(void);
     KytyDllStatus (*shutdown)(void);
     KytyDllStatus (*check_guest_memory)(const void* pointer, size_t bytes, size_t alignment, bool writable);

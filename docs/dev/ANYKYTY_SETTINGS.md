@@ -61,6 +61,7 @@ for each arm's img/s, draws per image and `[kyty-*]` counters.
 | `KYTY_RT_CHECK_PPM` | parts per million | Fraction of output dwords that may differ before a check counts as failed (default 1000) |
 | `KYTY_RT_CHECK_STRIKES` | count | Failed checks in a row after which a program walks the emulated BVH for the rest of the session (default 3) |
 | `KYTY_RT_ARENA_MB` | MiB | Limit of the memory the native ray tracing structures take |
+| `KYTY_RT_EMULATION` | `1` (default), `0` | `0`: no BVH walk runs emulated. A walk is either replaced by a native ray query or served empty (its rays miss): the host-query answers inside the guest walk loop, the emulated box intersections, the BVH8 intersections and the pixel walks kept on the guest traversal are all off, an empty intersection returns a miss from its node type without reading the node, and the loop around each empty intersection stops after 4096 iterations (65536 when it also does native work). `KYTY_RT_CHECK` is off with it. Without native ray tracing every walk is served empty |
 | `KYTY_RT_RESULTS` | `0` (default), `1` | `1`: with `KYTY_RT_ORACLE=1`, a BVH walk whose results the shader compiler derives is traced by one host ray query, without running the guest walk code |
 
 ## Reporting a problem

@@ -293,6 +293,7 @@ bool IsPredicatedPerLane(const Inst& inst) {
 
 struct Demand {
 	bool                     reached = false;
+	bool                     changed = false;
 	std::vector<const Inst*> conditions;
 };
 
@@ -328,22 +329,24 @@ uint32_t EliminateMaskedSelects(const BlockList& blocks) {
 		}
 		auto& demand = demands[inst];
 		if (!demand.reached) {
-			demand = {true, conditions};
+			demand = {true, true, conditions};
 			return true;
 		}
 		const auto before = demand.conditions.size();
 		std::erase_if(demand.conditions, [&](const Inst* condition) {
 			return !std::ranges::binary_search(conditions, condition);
 		});
-		return demand.conditions.size() != before;
+		const bool changed = demand.conditions.size() != before;
+		demand.changed |= changed;
+		return changed;
 	};
 	const std::vector<const Inst*> every_lane;
 	uint32_t                       replaced = 0;
-	for (bool changed = true; changed;) {
+	for (bool changed = true, first = true; changed; first = false) {
 		changed = false;
 		for (auto block = blocks.rbegin(); block != blocks.rend(); ++block) {
 			for (const auto& value: {(*block)->condition, (*block)->indirect_target}) {
-				if (!value.IsEmpty()) changed |= meet(value, every_lane);
+				if (first && !value.IsEmpty()) changed |= meet(value, every_lane);
 			}
 			auto& instructions = (*block)->Instructions();
 			for (auto inst = instructions.rbegin(); inst != instructions.rend(); ++inst) {
@@ -353,9 +356,10 @@ uint32_t EliminateMaskedSelects(const BlockList& blocks) {
 				});
 				if (IsLaneLocal(op) && !external) {
 					const auto found = demands.find(&*inst);
-					if (found == demands.end() || !found->second.reached) {
+					if (found == demands.end() || !found->second.changed) {
 						continue;
 					}
+					found->second.changed = false;
 					const auto conditions = found->second.conditions;
 					const bool select = op == ValueOpcode::SelectU1 || op == ValueOpcode::SelectU32 ||
 					                    op == ValueOpcode::SelectF32 || op == ValueOpcode::SelectF64;
@@ -368,6 +372,8 @@ uint32_t EliminateMaskedSelects(const BlockList& blocks) {
 							changed |= meet(inst->Arg(arg), conditions);
 						}
 					}
+				} else if (!first) {
+					continue;
 				} else if (IsPredicatedPerLane(*inst) && !external) {
 					const auto predicate = inst->Arg(inst->NumArgs() - 1);
 					std::vector<const Inst*> active;

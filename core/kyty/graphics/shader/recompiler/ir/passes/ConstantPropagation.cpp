@@ -470,12 +470,16 @@ void FoldZeroComparison(Block& block, Block::iterator instruction, FoldWorklist&
 }
 
 void FoldInstruction(Block& block, Block::iterator instruction,
-	                      FoldWorklist& worklist) {
+	                      FoldWorklist& worklist, bool* operands_changed = nullptr) {
 	auto& inst = *instruction;
+	const auto set_arg = [&](size_t index, Value value) {
+		if (operands_changed != nullptr && inst.Arg(index) != value) *operands_changed = true;
+		inst.SetArg(index, value);
+	};
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::StoreBufferU32: {
 			const auto data = ResolveActiveU32(Arg(inst, 4), Arg(inst, 5));
-			if (!data.IsEmpty() && data != inst.Arg(4)) inst.SetArg(4, data);
+			if (!data.IsEmpty() && data != inst.Arg(4)) set_arg(4, data);
 			return;
 		}
 		case ValueOpcode::Phi: FoldPhi(inst); return;
@@ -556,8 +560,8 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 						const auto input = worklist.Prepend(
 						    block, instruction, ValueOpcode::GetBuiltin,
 						    {Value(static_cast<uint32_t>(field.kind)), Value(0u)});
-						inst.SetArg(0, Value(&*input));
-						inst.SetArg(1, Value(offset.U32() - field.start));
+						set_arg(0, Value(&*input));
+						set_arg(1, Value(offset.U32() - field.start));
 						worklist.lowered_ancillary.insert(source);
 						return;
 					}
@@ -938,7 +942,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 					const auto* test = expression.TryInstruction();
 					if (test == nullptr) return false;
 					const auto replace = [&](Value value) {
-						inst.SetArg(assumption == lhs ? 1u : 0u, value);
+						set_arg(assumption == lhs ? 1u : 0u, value);
 						return true;
 					};
 					const auto negate = [&](Value value) {
@@ -1186,7 +1190,6 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	for (auto* block: blocks)
 		for (auto inst = block->begin(); inst != block->end(); ++inst) worklist.Register(inst);
 	std::vector<Use> users;
-	std::vector<Value> operands;
 	const auto drain = [&] {
 		do {
 			for (size_t i = 0; i < worklist.pending.size(); ++i) {
@@ -1196,14 +1199,10 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 				const auto opcode = inst->GetOpcode();
 				if (opcode == ValueOpcode::Identity || opcode == ValueOpcode::Void) continue;
 				users.assign(inst->Uses().begin(), inst->Uses().end());
-				operands.clear();
-				for (size_t arg = 0; arg < inst->NumArgs(); ++arg) operands.push_back(inst->Arg(arg));
+				bool operands_changed = false;
 				mask_projection.Fold(*inst, wave_size);
-				FoldInstruction(*inst->Parent(), location.instruction, worklist);
-				bool changed = opcode != inst->GetOpcode() || operands.size() != inst->NumArgs();
-				for (size_t arg = 0; !changed && arg < operands.size(); ++arg)
-					changed = operands[arg] != inst->Arg(arg);
-				if (changed) {
+				FoldInstruction(*inst->Parent(), location.instruction, worklist, &operands_changed);
+				if (opcode != inst->GetOpcode() || operands_changed) {
 					worklist.QueueUsers(users);
 					worklist.Queue(location);
 				}

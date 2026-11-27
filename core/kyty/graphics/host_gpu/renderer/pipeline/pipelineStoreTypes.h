@@ -9,11 +9,14 @@
 
 namespace Libs::Graphics {
 
+inline constexpr uint32_t TableShaderKeyMarker = 0x54424c45u;
+
 struct ShaderProgramKey {
 	ShaderType            stage           = ShaderType::Unknown;
 	uint64_t              hash            = 0;
 	uint32_t              user_data_count = 0;
 	std::vector<uint32_t> static_state;
+	bool guest_traversal = false;
 
 	bool operator==(const ShaderProgramKey&) const = default;
 };
@@ -30,10 +33,13 @@ struct ShaderModule {
 	uint32_t                                     spirv_words = 0;
 	std::shared_ptr<const ShaderModule>          plain;
 	bool                                         guest_traversal = false;
+	ShaderBvh                                    bvh = ShaderBvh::None;
+	uint32_t                                     rt_mode = 0;
 	const ShaderRecompiler::IR::ResourcePlan*    plan = nullptr;
 #if defined(ANYPS5_KYTY)
 	mutable bool                                 pipeline_requested = false;
 	bool                                         shared_variant     = false;
+	bool                                         linked_prepared    = false;
 #endif
 };
 

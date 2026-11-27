@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h>
@@ -269,6 +270,26 @@ void SampleThreads(HostStats& stats, Counters& now) {
 	vm_deallocate(task, reinterpret_cast<vm_address_t>(threads), count * sizeof(thread_act_t));
 }
 
+void SampleSystemMemory(mach_port_t host, HostStats& stats) {
+	stats.system_memory_total   = SysctlValue<uint64_t>("hw.memsize");
+	vm_size_t              page = 0;
+	vm_statistics64_data_t vm {};
+	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+	if (host_page_size(host, &page) == KERN_SUCCESS &&
+	    host_statistics64(host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm),
+	                      &count) == KERN_SUCCESS) {
+		const uint64_t app       = vm.internal_page_count > vm.purgeable_count
+		                               ? vm.internal_page_count - vm.purgeable_count
+		                               : 0;
+		stats.system_memory_used = (app + vm.wire_count + vm.compressor_page_count) * page;
+		stats.system_wired       = static_cast<uint64_t>(vm.wire_count) * page;
+		stats.system_compressed  = static_cast<uint64_t>(vm.compressor_page_count) * page;
+		stats.system_cached =
+		    (static_cast<uint64_t>(vm.external_page_count) + vm.purgeable_count) * page;
+		stats.system_free = static_cast<uint64_t>(vm.free_count) * page;
+	}
+}
+
 void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 	SampleRusage(now);
 
@@ -298,23 +319,7 @@ void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 		now.disk_write = usage.ri_diskio_byteswritten;
 	}
 
-	stats.system_memory_total   = SysctlValue<uint64_t>("hw.memsize");
-	vm_size_t              page = 0;
-	vm_statistics64_data_t vm {};
-	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-	if (host_page_size(state.host, &page) == KERN_SUCCESS &&
-	    host_statistics64(state.host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm),
-	                      &count) == KERN_SUCCESS) {
-		const uint64_t app       = vm.internal_page_count > vm.purgeable_count
-		                               ? vm.internal_page_count - vm.purgeable_count
-		                               : 0;
-		stats.system_memory_used = (app + vm.wire_count + vm.compressor_page_count) * page;
-		stats.system_wired       = static_cast<uint64_t>(vm.wire_count) * page;
-		stats.system_compressed  = static_cast<uint64_t>(vm.compressor_page_count) * page;
-		stats.system_cached =
-		    (static_cast<uint64_t>(vm.external_page_count) + vm.purgeable_count) * page;
-		stats.system_free = static_cast<uint64_t>(vm.free_count) * page;
-	}
+	SampleSystemMemory(state.host, stats);
 
 	if (const auto swap = SysctlValue<xsw_usage>("vm.swapusage")) {
 		stats.swap_used  = swap->xsu_used;
@@ -371,6 +376,61 @@ ProcValues ReadProcValues(const char* path) {
 std::optional<uint64_t> Find(const ProcValues& values, const char* key) {
 	const auto it = values.find(key);
 	return it != values.end() ? std::optional(it->second) : std::nullopt;
+}
+
+struct MemoryControlGroup {
+	std::filesystem::path directory;
+	bool unified;
+};
+
+std::vector<MemoryControlGroup> MemoryControlGroups() {
+	std::vector<MemoryControlGroup> groups;
+	std::ifstream membership("/proc/self/cgroup");
+	std::string line;
+	while (std::getline(membership, line)) {
+		const auto first = line.find(':');
+		if (first == std::string::npos) continue;
+		const auto second = line.find(':', first + 1);
+		if (second == std::string::npos) continue;
+		const bool unified = second == first + 1;
+		const auto controllers = "," + line.substr(first + 1, second - first - 1) + ",";
+		if (!unified && controllers.find(",memory,") == std::string::npos) continue;
+		const std::filesystem::path root = unified ? "/sys/fs/cgroup" : "/sys/fs/cgroup/memory";
+		const auto member = std::filesystem::path(line.substr(second + 1)).relative_path();
+		auto directory = (root / member).lexically_normal();
+		const auto limit = unified ? "memory.max" : "memory.limit_in_bytes";
+		std::error_code error;
+		if (!std::filesystem::is_regular_file(directory / limit, error)) directory = root;
+		for (; !directory.empty(); directory = directory.parent_path()) {
+			groups.push_back({directory, unified});
+			if (directory == root || directory == directory.root_path()) break;
+		}
+	}
+	return groups;
+}
+
+SystemMemory LimitToMemoryControlGroup(SystemMemory memory) {
+	static const auto groups = MemoryControlGroups();
+	for (const auto& group: groups) {
+		std::ifstream limit_file(group.directory / (group.unified ? "memory.max" : "memory.limit_in_bytes"));
+		std::ifstream usage_file(group.directory / (group.unified ? "memory.current" : "memory.usage_in_bytes"));
+		uint64_t limit = 0;
+		uint64_t usage = 0;
+		if (!(limit_file >> limit) || !(usage_file >> usage)) continue;
+
+		std::ifstream stats(group.directory / "memory.stat");
+		const std::string_view field = group.unified ? "inactive_file" : "total_inactive_file";
+		std::string key;
+		uint64_t bytes = 0;
+		while (stats >> key >> bytes) {
+			if (key != field) continue;
+			usage -= std::min(usage, bytes);
+			break;
+		}
+		memory.total = std::min(memory.total, limit);
+		memory.available = std::min(memory.available, limit - std::min(limit, usage));
+	}
+	return memory;
 }
 
 struct PlatformState {};
@@ -484,6 +544,30 @@ void SamplePlatform(PlatformState& , HostStats& stats, Counters& now) {
 
 constexpr size_t BUSIEST_THREADS = 6;
 
+}
+
+std::optional<SystemMemory> ReadSystemMemory() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORYSTATUSEX memory {};
+	memory.dwLength = sizeof(memory);
+	if (GlobalMemoryStatusEx(&memory)) return SystemMemory {memory.ullTotalPhys, memory.ullAvailPhys};
+#elif defined(__APPLE__)
+	PlatformState state;
+	HostStats stats;
+	SampleSystemMemory(state.host, stats);
+	if (stats.system_memory_total && stats.system_memory_used) {
+		const auto total = *stats.system_memory_total;
+		return SystemMemory {total, total - std::min(total, *stats.system_memory_used)};
+	}
+#else
+	const auto memory = ReadProcValues("/proc/meminfo");
+	const auto total = Find(memory, "MemTotal");
+	const auto available = Find(memory, "MemAvailable");
+	if (total && available && *available <= *total) {
+		return LimitToMemoryControlGroup({*total, *available});
+	}
+#endif
+	return std::nullopt;
 }
 
 struct HostStatsSampler::Impl {

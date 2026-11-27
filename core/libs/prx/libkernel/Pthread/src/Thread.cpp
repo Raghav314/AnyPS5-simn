@@ -16,6 +16,7 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestStacks.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include <algorithm>
 #include <cstddef>
@@ -299,6 +300,7 @@ extern "C" [[noreturn]] void APS5_VABI EnterGuestMainStack_nid_no_patch(void* ar
         self->stackAddress = reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(mapping) + GUEST_STACK_GUARD);
         self->stackSize = bytes - GUEST_STACK_GUARD;
     }
+    GuestStacks::PrepareGuestEntry_nid_no_patch();
     Aps5CallOnGuestMainStack_nid_no_patch(top, arguments, entry);
 }
 

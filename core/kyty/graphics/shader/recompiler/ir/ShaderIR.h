@@ -114,6 +114,11 @@ struct MemoryInfo {
 		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
 		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
 	}
+	[[nodiscard]] bool SupportsIndirectFormattedStore(ValueOpcode opcode) const {
+		return formatted && !typed && data_bits == 32u &&
+		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
+		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
+	}
 	[[nodiscard]] bool SupportsIndirectBufferAtomic(ValueOpcode opcode) const {
 		if (formatted || typed || data_bits != 32u) return false;
 		switch (opcode) {
@@ -135,7 +140,8 @@ struct MemoryInfo {
 		return SupportsIndirectBufferStore(opcode) || SupportsIndirectBufferAtomic(opcode);
 	}
 	[[nodiscard]] bool SupportsIndirectBufferAccess(ValueOpcode opcode) const {
-		return SupportsIndirectBufferLoad(opcode) || SupportsIndirectBufferWrite(opcode);
+		return SupportsIndirectBufferLoad(opcode) || SupportsIndirectBufferWrite(opcode) ||
+		       SupportsIndirectFormattedStore(opcode);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -224,6 +230,7 @@ struct ImageResource {
 	bool                          sample_access_only     = true;
 	bool                          depth_compare     = false;
 	bool                          skip_degamma      = false;
+	uint32_t                      paired_view       = NoIndirectImage;
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          heap              = false;
@@ -259,6 +266,19 @@ RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format
 
 struct SamplerResource {
 	static constexpr uint32_t NoIndirectSampler = UINT32_MAX;
+	static constexpr uint32_t RuntimeAddressClasses = 4u;
+	static constexpr uint32_t RuntimeFilterClasses  = 5u;
+	static constexpr uint32_t RuntimeMipClasses     = 3u;
+	static constexpr uint32_t RuntimePlainKeys =
+	    RuntimeAddressClasses * RuntimeAddressClasses * RuntimeFilterClasses * RuntimeMipClasses;
+	static constexpr uint32_t RuntimeCompareKeys =
+	    8u * 2u * RuntimeAddressClasses * RuntimeAddressClasses * RuntimeMipClasses;
+	static constexpr uint32_t RuntimeIntegerKeys = RuntimeAddressClasses * RuntimeAddressClasses * 2u;
+	static constexpr uint32_t RuntimeClampEdgeXY = 2u * RuntimeAddressClasses + 2u;
+	static constexpr uint32_t RuntimeKeyCount(bool compare, bool integer) {
+		return compare ? RuntimeCompareKeys : integer ? RuntimeIntegerKeys : RuntimePlainKeys;
+	}
+	static constexpr uint32_t RuntimeAddressClassTable = 0x7764u;
 
 	uint32_t source                = 0;
 	uint32_t first_use_pc          = 0;
@@ -271,6 +291,8 @@ struct SamplerResource {
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
 	bool     gather_lod            = false;
+	bool     runtime_descriptor    = false;
+	uint32_t runtime_key           = 0;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -456,13 +478,20 @@ struct PushData {
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
-	static constexpr uint32_t UserClipPlaneDword = MeshDrawDwordCount;
+	static constexpr uint32_t VertexWindow = DwordCount + 1;
+	static constexpr uint32_t PixelStart = MeshDrawDwordCount + (DwordCount - MeshDrawDwordCount) / 2;
 
-	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id,
-	                                                           uint32_t user_clip_planes = 0) {
-		if (user_clip_planes != 0) {
-			return UserClipPlaneDword + 4u * std::bit_width(user_clip_planes);
+	[[nodiscard]] static constexpr uint32_t GraphicsStageCursor(ShaderType stage) {
+		switch (stage) {
+			case ShaderType::Vertex:
+			case ShaderType::Mesh:
+			case ShaderType::Local: return VertexWindow;
+			case ShaderType::Pixel: return PixelStart;
+			default: return NoStart;
 		}
+	}
+
+	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id) {
 		return mesh ? MeshDrawDwordCount : static_cast<uint32_t>(object_id);
 	}
 
@@ -470,6 +499,9 @@ struct PushData {
 		return size != 0 && start <= DwordCount && size <= DwordCount - start;
 	}
 	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size) {
+		if (cursor == VertexWindow) {
+			return size != 0 && size <= PixelStart - MeshDrawDwordCount ? MeshDrawDwordCount : NoStart;
+		}
 		return CanFit(cursor, size) ? cursor : NoStart;
 	}
 };
@@ -585,7 +617,7 @@ DescriptorBindingForImage(const ImageResource& image) {
 		}
 		const auto kind = *DescriptorBindingForImage(image);
 		for (size_t j = 0; j < i && bases[i] == UINT32_MAX; j++) {
-			if (bases[j] != UINT32_MAX && images[j].table == image.table &&
+			if (bases[j] != UINT32_MAX && images[j].table == image.table && images[j].skip_degamma == image.skip_degamma &&
 			    DescriptorBindingForImage(images[j]) == kind) {
 				if (images[j].table_capacity != image.table_capacity) {
 					EXIT("shader binding layout failed: image table %u has two capacities",
@@ -611,6 +643,7 @@ struct Bindings {
 	uint32_t ray_query_dword       = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
 	uint32_t table_block_dwords  = 0;
+	uint32_t clip_plane_dwords   = 0;
 	uint32_t mip_stats_count = 0;
 	uint32_t stride_count = 0;
 	bool     flattened_srt_uniform = false;
@@ -626,7 +659,8 @@ struct Bindings {
 	}
 	[[nodiscard]] uint32_t StrideDword() const { return MipStatsDword() + mip_stats_count; }
 	[[nodiscard]] uint32_t TableBlockDword() const { return StrideDword() + stride_count; }
-	[[nodiscard]] uint32_t ShaderDataDwords() const { return TableBlockDword() + table_block_dwords; }
+	[[nodiscard]] uint32_t ClipPlaneDword() const { return TableBlockDword() + table_block_dwords; }
+	[[nodiscard]] uint32_t ShaderDataDwords() const { return ClipPlaneDword() + clip_plane_dwords; }
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
 	}
@@ -637,6 +671,16 @@ struct Bindings {
 	}
 
 	bool operator==(const Bindings& other) const = default;
+};
+
+struct RayQueryExtraSource {
+	uint32_t                user_sgpr     = 0;
+	uint32_t                header_offset = 0;
+	uint32_t                header_vsharp = 0xffffffffu;
+	uint32_t                root          = 0;
+	std::array<uint32_t, 4> layout {};
+
+	bool operator==(const RayQueryExtraSource& other) const = default;
 };
 
 struct ShaderInfo {
@@ -738,6 +782,7 @@ struct ShaderInfo {
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
 	bool                            float16                       = false;
+	std::vector<RayQueryExtraSource> ray_query_extra_sources;
 
 	struct IndexedBufferRead {
 		uint32_t offsets;
@@ -992,11 +1037,13 @@ struct Program: ResourcePlan {
 	uint32_t                      scratch_dwords = 0;
 	uint32_t                      relative_vgpr_dwords = 0;
 	bool                          dispatcher_fallback = false;
+	uint32_t                      loop_guards = 0;
 	std::vector<uint32_t>         inlined_call_entries;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };
 	std::vector<ScalarWrite>      scalar_writes;
 	std::vector<ExportInfo>       export_info;
 	bool                          has_address_writes = false;
+	bool                          scalar_cache_invalidates = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;
 	bool                          table_mode = false;

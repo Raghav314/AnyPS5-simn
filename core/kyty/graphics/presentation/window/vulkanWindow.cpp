@@ -411,7 +411,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 }
 
 static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
-                                     std::vector<const char*> device_extensions) {
+                                     std::vector<const char*> device_extensions,
+                                     const std::vector<const char*>& instance_extensions) {
 	const auto physical_device = graphics.physical_device;
 	const auto queue_family    = graphics.queue_family;
 	EXIT_IF(physical_device == nullptr);
@@ -767,6 +768,23 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 			break;
 		}
 	}
+	vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR presentation {};
+	const char* maintenance = nullptr;
+	if (HasExtension(instance_extensions, VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME) &&
+	    HasExtension(available_extensions, VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
+		maintenance = VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+	} else if (HasExtension(instance_extensions, VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME) &&
+	           HasExtension(available_extensions, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
+		maintenance = VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+	}
+	if (maintenance != nullptr) {
+		vk::PhysicalDeviceFeatures2 features {.pNext = &presentation};
+		physical_device.getFeatures2(&features);
+		if (presentation.swapchainMaintenance1) {
+			device_extensions.push_back(maintenance);
+			graphics.present_fences_enabled = true;
+		}
+	}
 	const auto                 extension_count = static_cast<uint32_t>(device_extensions.size());
 	const vk::DeviceCreateInfo create_info {.queueCreateInfoCount    = queue_create_count,
 	                                        .pQueueCreateInfos       = queue_create_infos.data(),
@@ -847,6 +865,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		device_info.pNext       = &interlock_enabled;
 	}
 #endif
+	if (graphics.present_fences_enabled) {
+		auto& device_info = create.get<vk::DeviceCreateInfo>();
+		presentation.pNext = const_cast<void*>(device_info.pNext);
+		device_info.pNext = &presentation;
+	}
 	vk::Device device = nullptr;
 	RequireVulkanSuccess(physical_device.createDevice(&create.get(), nullptr, &device),
 	                     "vkCreateDevice");
@@ -872,6 +895,14 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 		        return vk::enumerateInstanceExtensionProperties(nullptr, count, values);
 	        });
 
+	if (HasExtension(r.available_extensions, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+		for (const char* name: {VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME, VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME}) {
+			if (!HasExtension(r.available_extensions, name)) continue;
+			if (!HasExtension(r.required_extensions, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME))
+				r.required_extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+			if (!HasExtension(r.required_extensions, name)) r.required_extensions.push_back(name);
+		}
+	}
 	r.enable_validation_layers = Config::VulkanValidationEnabled();
 	if (Config::HdrEnabled() &&
 	    HasExtension(r.available_extensions, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) &&
@@ -1165,7 +1196,7 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.supports_block_texel_view = block_texel_view_props.result == vk::Result::eSuccess;
 	LOGF("Block Texel View support: %s\n", graphic_ctx.supports_block_texel_view ? "Yes" : "No");
 
-	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, std::move(device_extensions));
+	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, std::move(device_extensions), r.required_extensions);
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
@@ -1278,7 +1309,7 @@ bool CreateHeadlessVulkan(GraphicContext& graphics, const VulkanDeviceIdentity* 
 		}
 	}
 	graphics.physical_device.getMemoryProperties(&graphics.physical_device_memory_properties);
-	graphics.device = VulkanCreateDevice(graphics, RequiredDeviceExtensions());
+	graphics.device = VulkanCreateDevice(graphics, RequiredDeviceExtensions(), extensions);
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphics.device);
 	return true;
 #else

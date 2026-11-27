@@ -8,6 +8,7 @@ namespace Libs::Graphics {
 
 struct ShaderVertexInputInfo;
 
+[[nodiscard]] uint32_t TableXprMode();
 [[nodiscard]] std::pair<int32_t, uint32_t>
 ResolveDrawOffsets(uint32_t index_offset, const ShaderVertexInputInfo& vs_input_info);
 

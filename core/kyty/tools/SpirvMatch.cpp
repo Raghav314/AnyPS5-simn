@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineStoreFormat.h"
 
+#include <array>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -21,10 +22,16 @@ constexpr std::array Stages{"unknown", "vertex", "pixel", "compute", "mesh", "lo
 
 struct ShaderInfoLayout {
 	bool relative_vgprs;
+	bool ray_query_extra_sources;
 	bool indexed_buffer_reads;
+	bool extended_resources;
 };
 
-constexpr std::array<ShaderInfoLayout, 3> ShaderInfoLayouts {{{true, true}, {true, false}, {false, false}}};
+constexpr std::array<ShaderInfoLayout, 7> ShaderInfoLayouts {{
+    {true, true, true, true}, {true, true, false, true}, {true, false, true, false},
+    {true, false, false, true}, {true, false, false, false},
+    {false, false, false, true}, {false, false, false, false},
+}};
 
 struct Dump {
 	std::vector<uint32_t> words;
@@ -51,7 +58,8 @@ bool ReadDump(const std::filesystem::path& path, Dump& dump) {
 template <size_t Flags>
 using EarlierProfile = std::tuple<bool, bool, uint32_t, std::array<bool, Flags>>;
 
-using PreviousProfile = std::tuple<bool, bool, uint32_t, std::array<bool, 12>, uint32_t>;
+template <size_t Flags>
+using SubgroupProfile = std::tuple<bool, bool, uint32_t, std::array<bool, Flags>, uint32_t>;
 
 bool ReadStoreHeader(std::istream& input) {
 	input.seekg(0, std::ios::end);
@@ -76,18 +84,20 @@ bool ReadStoreHeader(std::istream& input) {
 		input.seekg(size);
 		return bool(input);
 	};
-	return try_profile(ShaderRecompiler::Spirv::Profile{}) || try_profile(PreviousProfile{}) ||
+	return try_profile(ShaderRecompiler::Spirv::Profile{}) || try_profile(SubgroupProfile<14>{}) ||
+	       try_profile(SubgroupProfile<12>{}) ||
 	       try_profile(EarlierProfile<9>{}) ||
 	       try_profile(EarlierProfile<8>{}) || try_profile(EarlierProfile<7>{}) || try_profile(EarlierProfile<6>{});
 }
 
 bool MatchShaderDump(std::span<const uint8_t> raw, std::span<Dump> dumps,
-                     std::optional<ShaderInfoLayout>& shader_info_layout) {
+                     std::vector<ShaderInfoLayout>& layouts) {
 	Reader reader{raw};
 	Record type{};
 	IoAll(reader, type);
 	if (!reader.ok) return false;
 	switch (type) {
+		case Record::NativeGraphicsPipeline:
 		case Record::GraphicsPipeline:
 			return reader.bytes.size() == sizeof(GraphicsPipelineKey);
 		case Record::TessellationLayout: {
@@ -97,20 +107,28 @@ bool MatchShaderDump(std::span<const uint8_t> raw, std::span<Dump> dumps,
 			IoAll(reader, key, layout);
 			return reader.ok && reader.bytes.empty();
 		}
+		case Record::TableModule:
 		case Record::Module: break;
 		default: return false;
 	}
 
-	const auto decode = [&](ShaderInfoLayout layout) {
+	const auto decode = [&](const ShaderInfoLayout& layout) {
 		Reader module_reader{.bytes = reader.bytes, .allocation_budget = MaxRecordBytes,
 		                     .shader_info_has_relative_vgprs = layout.relative_vgprs,
-		                     .shader_info_has_indexed_buffer_reads = layout.indexed_buffer_reads};
+		                     .shader_info_has_ray_query_extra_sources = layout.ray_query_extra_sources,
+		                     .shader_info_has_indexed_buffer_reads = layout.indexed_buffer_reads,
+		                     .shader_info_has_extended_resources = layout.extended_resources};
 		ShaderStoreFormat::Key key;
 		ShaderModule module;
-		std::vector<uint8_t> resource_plan;
 		std::vector<uint32_t> spirv;
 		std::vector<uint32_t> plain_spirv;
-		IoStoreModule(module_reader, key, module, resource_plan, spirv, plain_spirv);
+		if (type == Record::TableModule) {
+			uint32_t cursor = 0;
+			IoStoreTableModule(module_reader, key, cursor, module, spirv, plain_spirv);
+		} else {
+			std::vector<uint8_t> resource_plan;
+			IoStoreModule(module_reader, key, module, resource_plan, spirv, plain_spirv);
+		}
 		if (!module_reader.ok || !module_reader.bytes.empty() || key.stage == ShaderType::Unknown ||
 		    static_cast<size_t>(key.stage) >= Stages.size() || !IsSpirv(spirv) ||
 		    (!plain_spirv.empty() && !IsSpirv(plain_spirv))) {
@@ -122,14 +140,8 @@ bool MatchShaderDump(std::span<const uint8_t> raw, std::span<Dump> dumps,
 		}
 		return true;
 	};
-	if (shader_info_layout.has_value()) return decode(*shader_info_layout);
-	for (const auto layout: ShaderInfoLayouts) {
-		if (decode(layout)) {
-			shader_info_layout = layout;
-			return true;
-		}
-	}
-	return false;
+	std::erase_if(layouts, [&](const auto& layout) { return !decode(layout); });
+	return !layouts.empty();
 }
 
 bool ReadStore(const std::filesystem::path& path, std::span<Dump> dumps) {
@@ -140,14 +152,14 @@ bool ReadStore(const std::filesystem::path& path, std::span<Dump> dumps) {
 	}
 	std::vector<uint8_t> compressed;
 	std::vector<uint8_t> raw;
-	std::optional<ShaderInfoLayout> shader_info_layout;
+	std::vector<ShaderInfoLayout> layouts(ShaderInfoLayouts.begin(), ShaderInfoLayouts.end());
 	for (size_t index = 1; input.peek() != std::char_traits<char>::eof(); ++index) {
 		Frame frame;
 		if (Read(input, std::span(&frame, 1)) && frame.raw_size <= MaxRecordBytes &&
 		    frame.compressed_size <= ZSTD_compressBound(MaxRecordBytes)) {
 			compressed.resize(frame.compressed_size);
 			if (Read(input, std::span(compressed)) && DecodeShaderStoreFrame(frame, compressed, raw) &&
-			    MatchShaderDump(raw, dumps, shader_info_layout)) {
+			    MatchShaderDump(raw, dumps, layouts)) {
 				continue;
 			}
 		}

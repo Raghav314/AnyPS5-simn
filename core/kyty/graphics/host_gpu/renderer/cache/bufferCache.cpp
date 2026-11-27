@@ -25,6 +25,7 @@
 #include <bit>
 #include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -376,9 +377,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
 	m_scheduler.BeginCommand();
-	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
-		buffer->Fill(0, buffer->Size(), 0);
-	}
+	m_bda_pagetable_buffer.Fill(0, m_bda_pagetable_buffer.Size(), 0);
+	m_fault_manager.PrepareFaultBuffer();
 	m_bda_pagetable_buffer.Commit(NATIVE_RT_CONTEXT_PAGE * sizeof(vk::DeviceAddress), sizeof(vk::DeviceAddress));
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
@@ -2084,6 +2084,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	m_in_place_write       = InPlaceMemory::WriteKind::Binding;
 	m_texture_cache.ProtectPendingImageWriteBacks(vaddr, size);
 	dst->Fill(dst_offset, size, value);
+	m_texture_cache.ApplyPartialBufferCopy(vaddr, size, *dst, dst_offset);
 	if (!meta) {
 		m_texture_cache.NoteMetaFill(vaddr, size, value, false);
 	}
@@ -2508,9 +2509,25 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 		return false;
 	}
 	NoteReadbackWait(readback_begin, readback_end, device_address, false);
+#if defined(ANYPS5_KYTY)
+	const auto submit_from = std::chrono::steady_clock::now();
+	bool       submit_reported = false;
+	for (uint32_t spins = 0; m_scheduler.SubmittedTick() < needed; ++spins) {
+		if (!submit_reported && (spins & 1023u) == 1023u &&
+		    std::chrono::steady_clock::now() - submit_from >= std::chrono::seconds(10)) {
+			submit_reported = true;
+			std::fprintf(stderr,
+			             "[kyty] a readback of 0x%" PRIx64 "-0x%" PRIx64 " has waited 10 s for tick %" PRIu64
+			             " to be submitted (submitted %" PRIu64 ")\n",
+			             readback_begin, readback_end, needed, m_scheduler.SubmittedTick());
+		}
+		Common::SpinPause();
+	}
+#else
 	while (m_scheduler.SubmittedTick() < needed) {
 		Common::SpinPause();
 	}
+#endif
 	auto& device = m_graphics.device;
 	if (!m_readback.pool) {
 		vk::CommandPoolCreateInfo pool_info {};
@@ -2568,6 +2585,49 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 	if (m_graphics.readback_queue.submit(1, &submit, m_readback.fence) != vk::Result::eSuccess) {
 		EXIT("BufferCache: readback queue submission failed\n");
 	}
+#if defined(ANYPS5_KYTY)
+	constexpr auto     SpinLimit = std::chrono::seconds(10);
+	constexpr uint64_t StallNs   = 10'000'000'000ull;
+	const auto         spin_from = std::chrono::steady_clock::now();
+	for (uint32_t spins = 0;; ++spins) {
+		const auto status = device.getFenceStatus(m_readback.fence);
+		if (status == vk::Result::eSuccess) {
+			break;
+		}
+		if (status != vk::Result::eNotReady) {
+			EXIT("BufferCache: readback queue wait failed: %s\n", vk::to_string(status).c_str());
+		}
+		if ((spins & 1023u) == 1023u && std::chrono::steady_clock::now() - spin_from >= SpinLimit) {
+			const auto report = [&] {
+				auto& master = m_scheduler.GetMasterSemaphore();
+				master.Refresh();
+				if (needed != 0 && !master.IsFree(needed)) {
+					master.ReportStall(needed);
+					return;
+				}
+				static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+				if (!reported.test_and_set()) {
+					std::fprintf(stderr,
+					             "[kyty] a readback copy of 0x%" PRIx64 "-0x%" PRIx64 " on the readback queue has not "
+					             "finished in 10 s although the GPU reached its tick %" PRIu64 " (GPU at %" PRIu64
+					             "): the readback queue is stuck\n",
+					             readback_begin, readback_end, needed, master.KnownGpuTick());
+				}
+			};
+			report();
+			auto result = device.waitForFences(1, &m_readback.fence, VK_TRUE, StallNs);
+			while (result == vk::Result::eTimeout) {
+				report();
+				result = device.waitForFences(1, &m_readback.fence, VK_TRUE, StallNs);
+			}
+			if (result != vk::Result::eSuccess) {
+				EXIT("BufferCache: readback queue wait failed: %s\n", vk::to_string(result).c_str());
+			}
+			break;
+		}
+		Common::SpinPause();
+	}
+#else
 	for (;;) {
 		const auto status = device.getFenceStatus(m_readback.fence);
 		if (status == vk::Result::eSuccess) {
@@ -2578,6 +2638,7 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 		}
 		Common::SpinPause();
 	}
+#endif
 	(void)device.resetFences(1, &m_readback.fence);
 	m_scheduler.WaitPriorityOperations(needed);
 	staging.Invalidate(0, total_size);

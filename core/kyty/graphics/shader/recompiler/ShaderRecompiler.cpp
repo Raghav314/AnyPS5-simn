@@ -15,7 +15,9 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/LoopGuard.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
+#include "graphics/shader/recompiler/ir/passes/RayQueryResults.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryTraversal.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/RelativeVgprLowering.h"
@@ -26,7 +28,12 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <string_view>
 #include <fmt/format.h>
 #include <map>
 #include <mutex>
@@ -37,6 +44,10 @@
 namespace Libs::Graphics::ShaderRecompiler {
 
 namespace {
+
+constexpr uint32_t EmptyWalkIterations       = 4096;
+constexpr uint32_t EmptyWalkNativeIterations = 65536;
+constexpr uint32_t ComputeLoopIterations     = 1u << 20u;
 
 std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
 	std::string dump = "CFG:\n";
@@ -548,8 +559,37 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	return TranslateProgram(source.decoded, options);
 }
 
+static bool ListedInSkipShaders(uint64_t hash) {
+	static const std::vector<uint64_t> listed = [] {
+		std::vector<uint64_t> hashes;
+		const char* value = std::getenv("KYTY_SKIP_SHADERS");
+		std::string_view text = value != nullptr ? value : "";
+		while (!text.empty()) {
+			const auto comma = text.find(',');
+			auto item = text.substr(0, comma);
+			text = comma == std::string_view::npos ? std::string_view {} : text.substr(comma + 1);
+			if (item.starts_with("0x") || item.starts_with("0X")) {
+				item.remove_prefix(2);
+			}
+			uint64_t hash = 0;
+			const auto [end, error] = std::from_chars(item.data(), item.data() + item.size(), hash, 16);
+			if (item.empty() || error != std::errc() || end != item.data() + item.size()) {
+				std::fprintf(stderr, "KYTY_SKIP_SHADERS: '%.*s' is not a hexadecimal shader hash; ignored\n",
+				             static_cast<int>(item.size()), item.data());
+				continue;
+			}
+			hashes.push_back(hash);
+		}
+		return hashes;
+	}();
+	return std::find(listed.begin(), listed.end(), hash) != listed.end();
+}
+
 TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options) {
 	EXIT_IF(decoded.instructions.empty());
+	if (ListedInSkipShaders(options.shader_hash)) {
+		EXIT("shader 0x%016" PRIx64 " is listed in KYTY_SKIP_SHADERS\n", options.shader_hash);
+	}
 	if (decoded.has_swap_pc) {
 		for (const auto& inst: decoded.instructions) {
 			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 && inst.branch_target == UINT32_MAX)
@@ -682,8 +722,15 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	const bool bvh = std::ranges::any_of(decoded.instructions, [](const auto& inst) {
 		return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
 	});
+	const bool bvh8 = std::ranges::any_of(decoded.instructions, [](const auto& inst) {
+		return inst.opcode == Decoder::Opcode::IMAGE_BVH8_INTERSECT_RAY;
+	});
 	constexpr uint32_t pixel_oracle = IR::OracleRemaining | IR::OraclePixel;
-	if (options.stage == ShaderType::Pixel && options.native_ray_tracing && bvh &&
+	const uint32_t     rt_oracle    = !options.native_ray_tracing ? 0u
+	                                  : options.rt_emulation || (options.rt_oracle & IR::OracleRemaining) == 0
+	                                      ? options.rt_oracle
+	                                      : options.rt_oracle | IR::OracleResults;
+	if (options.stage == ShaderType::Pixel && options.native_ray_tracing && options.rt_emulation && bvh &&
 	    (options.rt_oracle & pixel_oracle) != pixel_oracle &&
 	    NoteRayTracingProgram(RayTracingProgramKind::PixelGuest, options.shader_hash)) {
 		::Log::WriteToConsoleAndLog(fmt::format("[RT] ps 0x{:016x}: pixel walk kept on the guest traversal: pixel oracle "
@@ -691,11 +738,12 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		                                        options.shader_hash));
 	}
 	if (options.stage == ShaderType::Compute ||
-	    (options.stage == ShaderType::Pixel && options.native_ray_tracing && options.rt_oracle != 0)) {
+	    (options.stage == ShaderType::Pixel && options.native_ray_tracing && rt_oracle != 0)) {
 		const auto traced = IR::TraceNativeTraversals(
 		    ir, {.wave_size = options.wave_size,
 		         .rewrite   = options.native_ray_tracing,
-		         .oracle    = options.native_ray_tracing ? options.rt_oracle : 0u,
+		         .oracle    = rt_oracle,
+		         .emulation = options.rt_emulation,
 		         .decoded   = &decoded});
 		oracle_sources      = traced.oracle_sources;
 		oracle_improvements = traced.oracle_improvements;
@@ -705,6 +753,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			ir.info.ray_query_header_vsharp  = traced.header_vsharp;
 			ir.info.ray_query_root           = traced.root;
 			ir.info.ray_query_layout         = traced.layout;
+			ir.info.ray_query_extra_sources  = traced.extra_sources;
 			traced_source                    = decoded;
 			traced_source.ray_tracing_source = {.user_sgpr     = traced.user_sgpr,
 			                                    .header_offset = traced.header_offset,
@@ -731,23 +780,39 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			     options.shader_hash, traced.sites);
 			NoteRayTracingProgram(RayTracingProgramKind::Native, options.shader_hash);
 		}
+	}
+	if (bvh || (bvh8 && !options.rt_emulation)) {
+		if (!options.rt_emulation) IR::MarkWalksEmpty(ir);
 		size_t intersections = 0, empty = 0;
 		for (const auto* block: ir.blocks) {
 			for (const auto& inst: *block) {
+				if (inst.GetOpcode() == IR::ValueOpcode::Bvh8Intersect && !options.rt_emulation) {
+					++intersections;
+					++empty;
+					continue;
+				}
 				if (inst.GetOpcode() != IR::ValueOpcode::BvhIntersect) continue;
 				++intersections;
-				empty += (inst.Flags<uint32_t>() & IR::BvhIntersectEmpty) != 0 ? 1u : 0u;
+				const auto flags = inst.Flags<uint32_t>();
+				empty += (flags & IR::BvhIntersectEmpty) != 0 && (flags & IR::BvhIntersectNative) == 0 ? 1u : 0u;
 			}
 		}
 		if (empty != 0 && NoteRayTracingProgram(RayTracingProgramKind::Empty, options.shader_hash)) {
-			::Log::WriteToConsoleAndLog(fmt::format("[RT] {} 0x{:016x}: {} of {} BVH intersections run empty: no form "
-			                                        "and no host query serves them, their rays miss\n",
-			                                        options.stage == ShaderType::Compute ? "cs" : "ps",
-			                                        options.shader_hash, empty, intersections));
+			::Log::WriteToConsoleAndLog(
+			    !options.rt_emulation ? fmt::format("[RT] {} 0x{:016x}: {} of {} BVH intersections run empty: no form serves them "
+			                              "and ray tracing emulation is off (KYTY_RT_EMULATION=0), their rays miss\n",
+			                              options.stage == ShaderType::Compute ? "cs" : "ps", options.shader_hash, empty,
+			                              intersections)
+			                : fmt::format("[RT] {} 0x{:016x}: {} of {} BVH intersections run empty: no form "
+			                              "and no host query serves them, their rays miss\n",
+			                              options.stage == ShaderType::Compute ? "cs" : "ps",
+			                              options.shader_hash, empty, intersections));
 		}
 	}
-	IR::TrackResources(ir, *tracked, native_cfg, options.input_info);
+	IR::TrackResources(ir, *tracked, native_cfg, options.input_info, options.runtime_buffer_descriptors,
+	                   options.runtime_sampler_descriptors);
 	TranslateResult result;
+	result.bvh = bvh ? ShaderBvh::Bvh4 : bvh8 ? ShaderBvh::Bvh8Only : ShaderBvh::None;
 	result.program        = std::move(ir);
 	result.oracle_sources      = std::move(oracle_sources);
 	result.oracle_improvements = std::move(oracle_improvements);
@@ -764,7 +829,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	const auto* stage = StageName(ir.stage);
-	IR::ApplyResourceSpecialization(ir, specialization);
+	const auto sampler_count = IR::ApplyResourceSpecialization(ir, specialization, options.sampler_limit);
+	if (sampler_count > options.sampler_limit) return {.required_samplers = sampler_count};
 	if (options.table_mode) {
 		CompileResult refused;
 		if (!IR::EnterTableMode(ir, refused.table_refusal)) {
@@ -797,6 +863,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				                 ir.info.images[resource].table_capacity != 0u) ? 1u : 0u;
 			} else if (op == IR::ValueOpcode::GetSamplerResource) {
 				const auto resource = inst.Flags<uint32_t>();
+				if (resource < ir.info.samplers.size() && ir.info.samplers[resource].runtime_descriptor) continue;
 				first = resource < ir.info.samplers.size() &&
 				                !ir.info.samplers[resource].indirect_resources.empty() ? 1u : 0u;
 			} else {
@@ -826,6 +893,36 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		IR::EliminateDeadCode(ir.blocks);
 	}
 
+	std::vector<IR::Block*> bounded_walks;
+	if (!options.rt_emulation) {
+		auto bounds = IR::BoundEmptyWalks(ir, EmptyWalkIterations, EmptyWalkNativeIterations);
+		if (bounds.empty + bounds.native + bounds.refused != 0) {
+			LOGF("ShaderRecompiler %s empty BVH walks bounded: hash=0x%016" PRIx64 " loops=%zu after %u iterations, %zu with "
+			     "native work after %u, %zu left unbounded\n",
+			     stage, ir.shader_hash, bounds.empty, EmptyWalkIterations, bounds.native, EmptyWalkNativeIterations,
+			     bounds.refused);
+		}
+		bounded_walks = std::move(bounds.headers);
+	}
+	if (ir.stage == ShaderType::Compute) {
+		const auto* group   = options.input_info.compute;
+		const auto  threads = group == nullptr ? 0u
+		                                       : std::max(group->threads_num[0], 1u) * std::max(group->threads_num[1], 1u) *
+		                                            std::max(group->threads_num[2], 1u);
+		const auto guards = IR::GuardComputeLoops(ir, ComputeLoopIterations, group == nullptr || threads > ir.wave_size,
+		                                          bounded_walks);
+		ir.loop_guards    = guards.guarded;
+		if (guards.unguarded != 0) {
+			LOGF("ShaderRecompiler %s loop guard: hash=0x%016" PRIx64 " %u loops guarded after %u iterations, %u left "
+			     "unguarded%s\n",
+			     stage, ir.shader_hash, guards.guarded, ComputeLoopIterations, guards.unguarded,
+			     ir.dispatcher_fallback ? " (unstructured dispatcher)" : "");
+			for (const auto& [block, reason]: guards.refusals) {
+				LOGF("ShaderRecompiler %s loop guard: hash=0x%016" PRIx64 " loop at block %u left unguarded: %s\n", stage,
+				     ir.shader_hash, block, reason);
+			}
+		}
+	}
 	IR::CollectShaderInfo(ir, options.input_info);
 	std::string ir_dump;
 	if (options.dump_ir) {
@@ -845,7 +942,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		wide_input.compute      = &wide;
 		Spirv::SplitHints hints;
 		spirv = Spirv::EmitProgram(ir, wide_input, push_data_start_dword, *options.profile, options.emit_debug_info,
-		                           true, options.ray_stats, &hints);
+		                           true, &hints);
 		std::string refusal;
 		if (!Spirv::SplitWaveAcrossSubgroups(spirv, refusal, &hints)) {
 			LOGF("ShaderRecompiler %s wave64 kept in lane pairs: hash=0x%016" PRIx64 " reason=%s\n", stage,
@@ -860,7 +957,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	}
 	if (spirv.empty()) {
 		spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
-		                           options.emit_debug_info, true, options.ray_stats);
+		                           options.emit_debug_info, true);
 	}
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " wave_size=%u elapsed_ms=%" PRIu64 "\n",
@@ -872,7 +969,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	if (options.plain_mip_stats_variant && Spirv::UsesMipStats(ir)) {
 		result.spirv_plain =
 		    Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
-		                       options.emit_debug_info, false, options.ray_stats);
+		                       options.emit_debug_info, false);
 	}
 	result.spirv          = std::move(spirv);
 	result.program        = std::move(ir);

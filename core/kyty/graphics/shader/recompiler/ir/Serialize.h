@@ -46,7 +46,9 @@ struct Reader {
 	bool                     ok = true;
 	size_t                   allocation_budget = std::numeric_limits<size_t>::max();
 	bool                     shader_info_has_relative_vgprs = true;
+	bool                     shader_info_has_ray_query_extra_sources = true;
 	bool                     shader_info_has_indexed_buffer_reads = true;
+	bool                     shader_info_has_extended_resources = true;
 
 	void Raw(void* data, size_t size) {
 		ok = ok && size <= bytes.size();
@@ -172,9 +174,27 @@ KYTY_IO_FIELDS(MemoryInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r,
                y, z)
 KYTY_IO_FIELDS(BufferWriteSpan, a, b)
 KYTY_IO_FIELDS(BufferResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v)
-KYTY_IO_FIELDS(ImageResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w,
-               x, y, z, A, B, C, D, E)
-KYTY_IO_FIELDS(SamplerResource, a, b, c, d, e, f, g, h, i, j, k)
+template <class Stream, class... Fields>
+void IoExtendedResources(Stream& io, Fields&... fields) {
+	if constexpr (requires { io.shader_info_has_extended_resources; }) {
+		if (!io.shader_info_has_extended_resources) return;
+	}
+	IoAll(io, fields...);
+}
+template <class Stream, Is<ImageResource> Object>
+void Io(Stream& io, Object& object) {
+	auto& [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, paired_view, u, v,
+	       w, x, y, z, A, B, C, D, E, F] = object;
+	IoAll(io, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s);
+	IoExtendedResources(io, paired_view);
+	IoAll(io, u, v, w, x, y, z, A, B, C, D, E, F);
+}
+template <class Stream, Is<SamplerResource> Object>
+void Io(Stream& io, Object& object) {
+	auto& [a, b, c, d, e, f, g, h, i, j, k, runtime_descriptor, runtime_key] = object;
+	IoAll(io, a, b, c, d, e, f, g, h, i, j, k);
+	IoExtendedResources(io, runtime_descriptor, runtime_key);
+}
 KYTY_IO_FIELDS(SampledResourcePair, a, b, c)
 KYTY_IO_FIELDS(StageInput, a, b, c, d, e)
 KYTY_IO_FIELDS(StageOutput, a, b, c, d)
@@ -183,11 +203,12 @@ KYTY_IO_FIELDS(ShaderInfo::DmaDescriptorTable, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo::DmaRecordTable, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo::IndexedBufferRead, a, b, c, d)
 KYTY_IO_FIELDS(ShaderInfo::SelfSizedBuffer, a, b, c)
+KYTY_IO_FIELDS(RayQueryExtraSource, a, b, c, d, e)
 template <class Stream, Is<ShaderInfo> Object>
 void Io(Stream& io, Object& object) {
 	auto& [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
 	       relative_vgprs, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X,
-	       Y, Z, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, indexed_buffer_reads] = object;
+	       Y, Z, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, extra_sources, indexed_buffer_reads] = object;
 	IoAll(io, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z);
 	if constexpr (requires { io.shader_info_has_relative_vgprs; }) {
 		if (io.shader_info_has_relative_vgprs) IoAll(io, relative_vgprs);
@@ -196,6 +217,15 @@ void Io(Stream& io, Object& object) {
 	}
 	IoAll(io, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, a0,
 	      a1, a2, a3, a4, a5, a6, a7, a8, a9);
+	if constexpr (requires { io.shader_info_has_ray_query_extra_sources; }) {
+		if (io.shader_info_has_ray_query_extra_sources) {
+			IoAll(io, extra_sources);
+		} else if constexpr (Reading<Stream>) {
+			extra_sources.clear();
+		}
+	} else {
+		IoAll(io, extra_sources);
+	}
 	if constexpr (requires { io.shader_info_has_indexed_buffer_reads; }) {
 		if (io.shader_info_has_indexed_buffer_reads) IoAll(io, indexed_buffer_reads);
 		else if constexpr (Reading<Stream>) indexed_buffer_reads.clear();
@@ -219,7 +249,13 @@ KYTY_IO_FIELDS(ResourceSpecialization::Buffer, a, b, c, d, e, f, g, h)
 KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
 KYTY_IO_FIELDS(ResourceSpecialization::Sampler, a, b, c)
 KYTY_IO_FIELDS(ResourceSpecialization, a, b, c)
-KYTY_IO_FIELDS(Bindings, a, b, c, d, e, f, g, h, i, j, k)
+template <class Stream, Is<Bindings> Object>
+void Io(Stream& io, Object& object) {
+	auto& [a, b, c, d, e, f, g, clip_plane_dwords, i, j, k, l] = object;
+	IoAll(io, a, b, c, d, e, f, g);
+	IoExtendedResources(io, clip_plane_dwords);
+	IoAll(io, i, j, k, l);
+}
 KYTY_IO_FIELDS(TablePlan::Operand, a, b)
 KYTY_IO_FIELDS(TablePlan::Slot, a, b, c, d, e, f)
 KYTY_IO_FIELDS(TablePlan::Descriptor, a, b)

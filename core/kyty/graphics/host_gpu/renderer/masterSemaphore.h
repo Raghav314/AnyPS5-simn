@@ -34,6 +34,7 @@ public:
 	void Refresh();
 	void Wait(uint64_t tick);
 #if defined(ANYPS5_KYTY)
+	void ReportStall(uint64_t tick);
 	void NoteWork(uint64_t tick, uint64_t shader) noexcept {
 		const auto next = m_work_next.load(std::memory_order_relaxed);
 		const auto at   = next % m_work.size();
@@ -55,7 +56,6 @@ private:
 	};
 	std::array<Work, 512> m_work {};
 	std::atomic<uint32_t> m_work_next {0};
-	void ReportStall(uint64_t tick);
 #endif
 };
 

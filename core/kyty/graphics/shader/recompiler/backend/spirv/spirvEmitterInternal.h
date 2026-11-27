@@ -7,6 +7,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvWaveSplit.h"
+#include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -88,10 +89,25 @@ struct OracleLaneVariables {
 	uint32_t proposed      = 0;
 	uint32_t proposed_blas = 0;
 	uint32_t proposed_root = 0;
+	uint32_t first         = 0;
+	uint32_t top_root      = 0;
+	uint32_t nodes         = 0;
+	uint32_t slots         = 0;
+};
+
+struct OracleSourceVariables {
+	uint32_t valid = 0;
+	uint32_t first = 0;
+	uint32_t root  = 0;
+	uint32_t tlas  = 0;
+	uint32_t nodes = 0;
+	uint32_t slots = 0;
 };
 
 struct OracleVariables {
 	std::array<OracleLaneVariables, 2> lanes {};
+	std::vector<OracleSourceVariables> extra;
+	bool                               multi = false;
 	std::array<uint32_t, 2>            results {};
 	uint32_t                           valid    = 0;
 	uint32_t                           context  = 0;
@@ -170,37 +186,36 @@ struct EmitterState {
 	uint32_t                                         bvh8_intersect_function = 0;
 	uint32_t                                         bvh_stack_function      = 0;
 	std::array<uint32_t, 2>                          ray_query_mirror_variables {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_variables {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_states {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_nodes {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_slots {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_lists {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_counts {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_currents {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_bases {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_inline_records {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_t {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_word {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_instance {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_u {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_v {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_node {};
-	std::array<uint32_t, 4>                          ray_query_selected_instance {};
-	std::array<uint32_t, 4>                          ray_query_selected_leaf {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha_cache {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha_distance {};
-	std::array<bool, 4>                              ray_query_alpha_sites {};
-	std::array<bool, 4>                              ray_query_alpha_lane {};
-	std::array<bool, 4>                              ray_query_alpha_factor {};
-	std::array<bool, 4>                              ray_query_geometry_opacity {};
-	std::array<uint32_t, 4>                          ray_query_alpha_format {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_variables {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_states {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_nodes {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_slots {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_lists {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_counts {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_currents {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_bases {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_inline_records {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_result_t {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_result_word {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_result_instance {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_result_u {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_result_v {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_result_node {};
+	std::array<uint32_t, IR::MaxRayQuerySites>                          ray_query_selected_instance {};
+	std::array<uint32_t, IR::MaxRayQuerySites>                          ray_query_selected_leaf {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_alpha {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_alpha_cache {};
+	std::array<std::array<uint32_t, 2>, IR::MaxRayQuerySites>           ray_query_alpha_distance {};
+	std::array<bool, IR::MaxRayQuerySites>                              ray_query_alpha_sites {};
+	std::array<bool, IR::MaxRayQuerySites>                              ray_query_alpha_lane {};
+	std::array<bool, IR::MaxRayQuerySites>                              ray_query_alpha_factor {};
+	std::array<bool, IR::MaxRayQuerySites>                              ray_query_geometry_opacity {};
+	std::array<uint32_t, IR::MaxRayQuerySites>                          ray_query_alpha_format {};
 	const IR::Inst*                                  ray_query_alpha_sample = nullptr;
-	std::array<bool, 4>                              ray_query_alpha_entry {};
+	std::array<bool, IR::MaxRayQuerySites>                              ray_query_alpha_entry {};
 	std::array<const IR::Inst*, 2>                   ray_query_entry_samples {};
 	OracleVariables                                  oracle;
-	bool                                             ray_stats              = false;
-	std::array<uint32_t, 4>                          ray_stats_first_half {};
+	std::array<uint32_t, IR::MaxRayQuerySites>                          ray_stats_first_half {};
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -656,6 +671,7 @@ void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
 void DefineBdaLoads(EmitterState& state);
+uint32_t RayStatsEnabled(EmitterState& state);
 void EmitGuestRayCount(EmitterState& state, uint32_t count);
 void EmitRayMarkCount(EmitterState& state, uint32_t dword, uint32_t count);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);

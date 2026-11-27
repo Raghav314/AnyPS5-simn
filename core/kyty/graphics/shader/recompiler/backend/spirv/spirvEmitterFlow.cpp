@@ -397,11 +397,11 @@ uint32_t DistancePointer(EmitterState& state, IR::StageOutputKind kind, uint32_t
 void EmitUserClipDistances(EmitterState& state, uint32_t position) {
 	uint32_t index = 0;
 	for (auto mask = state.user_clip_planes; mask != 0; mask &= mask - 1u) {
-		const auto dword = IR::PushData::UserClipPlaneDword + 4u * std::countr_zero(mask);
+		const auto dword = state.program.bindings.ClipPlaneDword() + 4u * std::countr_zero(mask);
 		uint32_t   components[4] {};
 		for (uint32_t i = 0; i < 4; i++) {
 			components[i] = Unary(state, spv::OpBitcast, TypeF32(state),
-			                      EmitPushDataLoad(state, ConstantU32(state, dword + i)));
+			                      EmitShaderDataDwordLoad(state, dword + i));
 		}
 		const auto plane = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), plane,

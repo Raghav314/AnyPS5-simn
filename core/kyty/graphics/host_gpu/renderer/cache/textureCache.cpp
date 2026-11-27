@@ -247,7 +247,11 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	return InsertImage(info, false);
+}
+
+ImageId TextureCache::InsertImage(const ImageInfo& info, bool bindless) {
+	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info, bindless);
 	AttachImageVersion(id);
 	RegisterImage(id);
 	return id;
@@ -710,14 +714,14 @@ bool TextureCache::WasDiscardedTarget(const Image& image) const {
 	});
 }
 
-void TextureCache::PinImage(ImageId id) {
-	if (auto* image = m_slot_images.try_get(id); image != nullptr) {
+void TextureCache::PinImage(TableImageRef ref) {
+	if (auto* image = ref.Get(m_slot_images); image != nullptr) {
 		image->table_pins++;
 	}
 }
 
-void TextureCache::UnpinImage(ImageId id) {
-	if (auto* image = m_slot_images.try_get(id); image != nullptr && image->table_pins != 0) {
+void TextureCache::UnpinImage(TableImageRef ref) {
+	if (auto* image = ref.Get(m_slot_images); image != nullptr && image->table_pins != 0) {
 		image->table_pins--;
 	}
 }
@@ -1341,19 +1345,16 @@ bool TextureCache::DepthOverlapNeedsRecreate(const ImageInfo& requested, Binding
 	}
 	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
 	const bool bpp_match     = requested.bytes_per_block == cached.info.bytes_per_block;
-	const bool retain_cached_layout = RetainsCachedDepthLayout(requested, cached);
-	const bool raw_depth_texture =
-	    cached.info.IsDepth() && !requested.IsDepth() && !cached.info.HasStencil() &&
-	    !requested.HasMetadata() && cached.backing.samples == 1 && requested.samples == 1 &&
-	    requested.pitch == cached.info.pitch &&
-	    (requested.resources == cached.info.resources || retain_cached_layout) &&
-	    !IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
+	const bool color_view_of_depth =
+	    cached.info.IsDepth() && !requested.IsDepth() &&
+	    !IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format) &&
+	    !(cached.info.HasStencil() && ImageViewOps::IsStencilViewFormat(requested.pixel_format));
 	bool recreate = cached.info.resources < requested.resources ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
-			recreate |= raw_depth_texture;
+			recreate |= color_view_of_depth;
 			break;
 		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
 		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
@@ -2660,7 +2661,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 			exact.valid        = true;
 		}
 		if (!result) {
-			result         = InsertImage(desc.info);
+			result         = InsertImage(desc.info, desc.heap);
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
@@ -2742,14 +2743,15 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	return selected;
 }
 
-vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc,
+                                       std::source_location caller) {
 	if (desc.type == BindingType::Storage) {
 		CollectHotPagesOf(id);
 	}
 	Common::ScopedLock lock {m_lock};
 	if (m_slot_images[id].is_depth_copy && desc.type == BindingType::Texture) {
 		RefreshDepthCopy(id);
-		return m_slot_images[id].FindView(desc.view_info);
+		return m_slot_images[id].FindView(desc.view_info, caller);
 	}
 	if (m_slot_images[id].is_stencil_copy &&
 	    (desc.type == BindingType::Texture || desc.type == BindingType::Storage)) {
@@ -2761,7 +2763,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			}
 		}
 		RefreshStencilCopy(id);
-		return m_slot_images[id].FindView(desc.view_info);
+		return m_slot_images[id].FindView(desc.view_info, caller);
 	}
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -2784,7 +2786,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
-	return image.FindView(desc.view_info);
+	return image.FindView(desc.view_info, caller);
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {

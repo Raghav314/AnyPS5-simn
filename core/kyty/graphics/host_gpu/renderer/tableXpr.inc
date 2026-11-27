@@ -2195,11 +2195,13 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		const auto vertex_portable = portable(*vertex_specialization, pair->portable[0]);
 		const auto pixel_portable  = state.ps_active ? portable(*pixel_specialization, pair->portable[1])
 		                                             : ShaderRecompiler::IR::ResourceSpecialization {};
-		uint32_t cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(false, false, 0);
+		using ShaderRecompiler::IR::PushData;
+		auto pixel_cursor = PushData::GraphicsStageCursor(ShaderType::Pixel);
+		auto vertex_cursor = PushData::GraphicsStageCursor(ShaderType::Vertex);
 		PipelineCache::TableProgram pixel {};
 		if (state.ps_active)
-			pixel = pipelines.GetPixelProgramTable(pixel_params, state.ps_input_info, pixel_portable, cursor);
-		const auto vertex = pipelines.GetVertexProgramTable(vertex_params, state.vertex_info[0], vertex_portable, cursor);
+			pixel = pipelines.GetPixelProgramTable(pixel_params, state.ps_input_info, pixel_portable, pixel_cursor);
+		const auto vertex = pipelines.GetVertexProgramTable(vertex_params, state.vertex_info[0], vertex_portable, vertex_cursor);
 		using Status = PipelineCache::TableStatus;
 		if (vertex.status == Status::Refused || (state.ps_active && pixel.status == Status::Refused)) {
 			const auto* why  = vertex.status == Status::Refused ? vertex.refusal : pixel.refusal;
@@ -2277,10 +2279,11 @@ void TableLoadSwitches() {
 	}();
 	(void)loaded;
 }
+}
+
 uint32_t TableXprMode() {
 	TableLoadSwitches();
 	return kyty_local_table_xpr_mode.load(std::memory_order_relaxed);
-}
 }
 
 namespace {

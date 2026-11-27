@@ -233,6 +233,14 @@ public:
 		m_stream->Record([](vk::CommandBuffer c) { c.endRendering(); });
 	}
 
+	void writeTimestamp(vk::QueryPool pool, uint32_t query) const {
+		if (m_stream == nullptr) {
+			m_direct.writeTimestamp(vk::PipelineStageFlagBits::eComputeShader, pool, query);
+			return;
+		}
+		m_stream->Record([=](vk::CommandBuffer c) { c.writeTimestamp(vk::PipelineStageFlagBits::eComputeShader, pool, query); });
+	}
+
 	void beginQuery(vk::QueryPool pool, uint32_t query, vk::QueryControlFlags flags) const {
 		if (m_stream == nullptr) {
 			m_direct.beginQuery(pool, query, flags);

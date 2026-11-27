@@ -31,6 +31,7 @@
 #if defined(ANYPS5_KYTY)
 #include <cstdlib>
 #include <optional>
+#include <string_view>
 #endif
 #include <fmt/format.h>
 #include <span>
@@ -89,6 +90,47 @@ public:
 private:
 	int m_slot = -1;
 };
+
+#if defined(ANYPS5_KYTY)
+vk::Result CreateAuditedPipeline(const GraphicContext& graphics, const char* kind, uint64_t variant,
+                                 vk::PipelineCreateFlags flags, vk::Pipeline& out, auto&& create) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_COMPILE_AUDIT");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	if (!enabled) {
+		return create(flags);
+	}
+
+	constexpr auto no_compile = vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+	const bool     lookup     = static_cast<bool>(flags & no_compile);
+	const auto     log        = [&](const char* event, vk::Result result) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "[kyty-driver-pipeline] kind={} variant={:016x} mode={} event={} result={} monotonic_ns={}\n",
+		    kind, variant, lookup ? "lookup" : "create", event, vk::to_string(result), SteadyNs()));
+	};
+	if (!graphics.pipeline_cache_lookup_enabled) {
+		log("unverified", vk::Result::eErrorFeatureNotPresent);
+		return create(flags);
+	}
+
+	const auto probe = create(flags | no_compile);
+	if (probe == vk::Result::eSuccess && out) {
+		log("no_compile", probe);
+		return probe;
+	}
+	const bool compile_required = probe == vk::Result::ePipelineCompileRequired;
+	log(compile_required ? "compile_required" : "unverified", probe);
+	if (lookup) {
+		return probe;
+	}
+	if (out) {
+		graphics.device.destroyPipeline(out, nullptr);
+		out = nullptr;
+	}
+	return create(flags);
+}
+#endif
 
 }
 
@@ -286,11 +328,33 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 #if defined(ANYPS5_KYTY)
 namespace {
 
+struct GraphicsLayoutBindings {
+	std::vector<vk::DescriptorSetLayoutBinding> descriptors;
+	vk::ShaderStageFlags push_stages = vk::ShaderStageFlagBits::eFragment;
+	bool image_heap = false;
+
+	GraphicsLayoutBindings(const PipelineLibraries::Stages& stages, bool native) {
+		if (stages[0]->mesh_task) push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
+		for (const auto* stage: stages) {
+			if (stage == nullptr) continue;
+			const auto flag = NativeShaderStage(stage->info.stage);
+			AddLayoutBindings(descriptors, stage->info, flag, native);
+			push_stages |= flag;
+			image_heap |= stage->info.info.uses_image_heap;
+		}
+	}
+
+	void Apply(GraphicContext& graphics, PipelineCache::Pipeline& pipeline) const {
+		pipeline.push_stages = push_stages;
+		pipeline.uses_image_heap |= image_heap;
+		CreateLayouts(graphics, pipeline, descriptors);
+	}
+};
+
 class GraphicsPipelineState {
 public:
 	GraphicsPipelineState(GraphicContext& graphics, const GraphicsPipelineKey& key,
-	                      const std::array<const ShaderModule*, 4>& stages, bool native_bindings,
-	                      bool generated_shaders)
+	                      const std::array<const ShaderModule*, 4>& stages, bool generated_shaders)
 	    : m_graphics(graphics), m_key(key), m_stages(stages) {
 		const auto& rendering     = key.rendering;
 		const auto& vertex_input  = key.vertex_input;
@@ -306,7 +370,6 @@ public:
 		if (vertex.mesh_task) {
 			task_module = generated_shaders ? CompileSPV(GPU_MESH_INDIRECT_SPV, graphics.device)
 			                                : vk::ShaderModule {};
-			has_task = true;
 		}
 		if (rect_list && generated_shaders) {
 			std::span<const RectListParameter> parameters;
@@ -412,19 +475,6 @@ public:
 		color_blending.attachmentCount = rendering.color_count;
 		color_blending.pAttachments    = color_blend_attachment;
 
-		push_stages = vk::ShaderStageFlagBits::eFragment;
-		if (has_task) {
-			push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
-		}
-		for (const auto* stage: stages) {
-			if (stage != nullptr) {
-				const auto native_stage = NativeShaderStage(stage->info.stage);
-				AddLayoutBindings(descriptor_bindings, stage->info, native_stage, native_bindings);
-				uses_image_heap |= stage->info.info.uses_image_heap;
-				push_stages |= native_stage;
-			}
-		}
-
 		dynamic_states = {
 		    vk::DynamicState::eViewportWithCount,
 		    vk::DynamicState::eScissorWithCount,
@@ -481,19 +531,21 @@ public:
 	KYTY_CLASS_NO_COPY(GraphicsPipelineState);
 
 	void ApplyLayout(PipelineCache::Pipeline& pipeline) {
-		pipeline.push_stages = push_stages;
-		pipeline.uses_image_heap |= uses_image_heap;
-		CreateLayouts(m_graphics, pipeline, descriptor_bindings);
+		GraphicsLayoutBindings(m_stages, pipeline.native_bindings).Apply(m_graphics, pipeline);
 	}
 
 	vk::Result Create(vk::PipelineCache cache, vk::PipelineLayout layout, vk::PipelineCreateFlags flags,
 	                  vk::Pipeline& out) {
 		pipeline_info.layout = layout;
-		pipeline_info.flags  = flags;
 		const ScopedDriverCreation creation(
 		    {Name(0, mesh ? "ms" : "vs"), Name(1, "hs"), Name(2, "ds"), Name(3, "ps")},
 		    {Hash(0), Hash(1), Hash(2), Hash(3)});
-		return m_graphics.device.createGraphicsPipelines(cache, 1, &pipeline_info, nullptr, &out);
+		const auto create = [&](vk::PipelineCreateFlags create_flags) {
+			pipeline_info.flags = create_flags;
+			return m_graphics.device.createGraphicsPipelines(cache, 1, &pipeline_info, nullptr, &out);
+		};
+		return CreateAuditedPipeline(m_graphics, "graphics", PipelineCache::GraphicsPipelineKeyHash {}(m_key),
+		                             flags, out, create);
 	}
 
 	vk::Pipeline CreateLibrary(vk::PipelineLayout layout, PipelineLibraryPart part) {
@@ -551,7 +603,12 @@ public:
 			const ScopedDriverCreation creation(
 			    {Name(0, "vs-lib"), Name(1, "hs-lib"), Name(2, "ds-lib"), Name(3, "ps-lib")},
 			    {Hash(0), Hash(1), Hash(2), Hash(3)});
-			result = m_graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &handle);
+			const auto build = [&](vk::PipelineCreateFlags flags) {
+				create.flags = flags;
+				return m_graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &handle);
+			};
+			result = CreateAuditedPipeline(m_graphics, "graphics_library", PipelineCache::GraphicsPipelineKeyHash {}(m_key),
+			                               create.flags, handle, build);
 		}
 		return result == vk::Result::eSuccess ? handle : vk::Pipeline {};
 	}
@@ -568,7 +625,6 @@ public:
 	const std::array<const ShaderModule*, 4>& m_stages;
 	bool                                       mesh       = false;
 	bool                                       with_depth = false;
-	bool                                       has_task   = false;
 	vk::ShaderModule                           tess_control_shader_module = nullptr;
 	vk::ShaderModule                           tess_eval_shader_module    = nullptr;
 	vk::ShaderModule                           task_module                = nullptr;
@@ -586,9 +642,6 @@ public:
 	vk::PipelineMultisampleStateCreateInfo                     multisampling {};
 	vk::PipelineColorBlendAttachmentState color_blend_attachment[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	vk::PipelineColorBlendStateCreateInfo       color_blending {};
-	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
-	vk::ShaderStageFlags                        push_stages;
-	bool                                        uses_image_heap = false;
 	vk::PipelineDepthStencilStateCreateInfo     depth_stencil_info {};
 	std::vector<vk::DynamicState>               dynamic_states;
 	vk::PipelineDynamicStateCreateInfo          dynamic_state {};
@@ -603,7 +656,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const GraphicsPipelineKey&                 key,
                             const std::array<const ShaderModule*, 4>& stages,
                             vk::PipelineCache                          driver_cache) {
-	GraphicsPipelineState state(graphics, key, stages, pipeline.native_bindings, true);
+	GraphicsPipelineState state(graphics, key, stages, true);
 	state.ApplyLayout(pipeline);
 	const auto result = state.Create(driver_cache, pipeline.pipeline_layout, {}, pipeline.pipeline);
 	if (result != vk::Result::eSuccess) {
@@ -614,11 +667,26 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 }
 
+std::string GraphicsLayoutKey(const PipelineLibraries::Stages& stages, bool native) {
+	const GraphicsLayoutBindings layout(stages, native);
+	std::string key;
+	const auto append = [&](uint32_t word) { key.append(reinterpret_cast<const char*>(&word), sizeof(word)); };
+	append(native);
+	append(layout.image_heap);
+	append(static_cast<uint32_t>(layout.push_stages));
+	for (const auto& binding: layout.descriptors) {
+		append(binding.binding);
+		append(static_cast<uint32_t>(binding.descriptorType));
+		append(binding.descriptorCount);
+		append(static_cast<uint32_t>(binding.stageFlags));
+	}
+	return key;
+}
+
 void CreateGraphicsPipelineLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                                  const GraphicsPipelineKey&                 key,
+                                  const GraphicsPipelineKey&,
                                   const std::array<const ShaderModule*, 4>& stages) {
-	GraphicsPipelineState state(graphics, key, stages, pipeline.native_bindings, false);
-	state.ApplyLayout(pipeline);
+	GraphicsLayoutBindings(stages, pipeline.native_bindings).Apply(graphics, pipeline);
 }
 
 vk::Result CreateGraphicsPipelineWhole(GraphicContext& graphics, const PipelineCache::Pipeline& layout,
@@ -626,21 +694,21 @@ vk::Result CreateGraphicsPipelineWhole(GraphicContext& graphics, const PipelineC
                                        const std::array<const ShaderModule*, 4>& stages,
                                        vk::PipelineCache cache, vk::PipelineCreateFlags flags,
                                        vk::Pipeline& out) {
-	GraphicsPipelineState state(graphics, key, stages, layout.native_bindings, true);
+	GraphicsPipelineState state(graphics, key, stages, true);
 	return state.Create(cache, layout.pipeline_layout, flags, out);
 }
 
 vk::Pipeline CreateGraphicsPipelineLibrary(GraphicContext& graphics, vk::PipelineLayout layout,
-                                           bool native_bindings, const GraphicsPipelineKey& key,
+                                           bool, const GraphicsPipelineKey& key,
                                            const std::array<const ShaderModule*, 4>& stages,
                                            PipelineLibraryPart                         part) {
-	GraphicsPipelineState state(graphics, key, stages, native_bindings,
+	GraphicsPipelineState state(graphics, key, stages,
 	                            part == PipelineLibraryPart::PreRasterization);
 	return state.CreateLibrary(layout, part);
 }
 
 vk::Pipeline LinkGraphicsPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
-                                  std::span<const vk::Pipeline> libraries) {
+                                  const GraphicsPipelineKey& key, std::span<const vk::Pipeline> libraries) {
 	vk::PipelineLibraryCreateInfoKHR linked {};
 	linked.libraryCount = static_cast<uint32_t>(libraries.size());
 	linked.pLibraries   = libraries.data();
@@ -648,7 +716,13 @@ vk::Pipeline LinkGraphicsPipeline(GraphicContext& graphics, vk::PipelineLayout l
 	create.pNext        = &linked;
 	create.layout       = layout;
 	vk::Pipeline handle = nullptr;
-	if (graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &handle) != vk::Result::eSuccess) {
+	const auto link = [&](vk::PipelineCreateFlags flags) {
+		create.flags = flags;
+		return graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &handle);
+	};
+	const auto result = CreateAuditedPipeline(graphics, "graphics_link", PipelineCache::GraphicsPipelineKeyHash {}(key),
+	                                         {}, handle, link);
+	if (result != vk::Result::eSuccess) {
 		return {};
 	}
 	return handle;
@@ -943,7 +1017,15 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 		const ScopedDriverCreation creation({"cs", nullptr, nullptr, nullptr},
 		                                    {module.info.shader_hash, 0, 0, 0});
 		const auto started = timing ? Clock::now() : Clock::time_point {};
+#if defined(ANYPS5_KYTY)
+		const auto create = [&](vk::PipelineCreateFlags flags) {
+			info.flags = flags;
+			return graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+		};
+		result = CreateAuditedPipeline(graphics, "compute", module.id, info.flags, pipeline.pipeline, create);
+#else
 		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+#endif
 		if (timing) {
 			finished = Clock::now();
 			elapsed  = finished - started;

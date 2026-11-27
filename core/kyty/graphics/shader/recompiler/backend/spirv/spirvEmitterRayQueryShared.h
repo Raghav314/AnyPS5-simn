@@ -24,6 +24,7 @@ constexpr uint32_t ContextInstanceNodes = 16;
 constexpr uint32_t ContextSlots         = 24;
 constexpr uint32_t ContextValid         = 36;
 constexpr uint32_t ContextInstanceBase  = 40;
+constexpr uint32_t ContextStride        = 128;
 constexpr uint32_t SlotStride           = 64;
 constexpr uint32_t SlotEntryTable       = 8;
 constexpr uint32_t SlotCapacity0        = 16;
@@ -193,6 +194,24 @@ inline uint32_t LoadAddressU64(EmitterState& s, uint32_t address) {
 
 inline uint32_t AddressPlus(EmitterState& s, uint32_t address, uint32_t offset) {
 	return Binary(s, spv::OpIAdd, TypeU64(s), address, ConstantU64(s, offset));
+}
+
+inline uint32_t PickContext(EmitterState& s, uint32_t has_context, uint32_t context, uint32_t header, uint32_t sources) {
+	const auto wide    = TypeU64(s);
+	const auto matches = [&](uint32_t entry_address) {
+		const auto valid = Binary(s, spv::OpINotEqual, TypeBool(s), LoadAddressU32(s, AddressPlus(s, entry_address, ContextValid)),
+		                          U32(s, 0));
+		const auto same = Equal(s, LoadAddressU64(s, AddressPlus(s, entry_address, ContextHeader)), header);
+		return LogicalAnd(s, valid, same);
+	};
+	return EmitValueOrDefaultIfCondition(s, has_context, wide, ConstantU64(s, 0), [&] {
+		auto pick = ConstantU64(s, 0);
+		for (uint32_t index = sources; index-- > 0;) {
+			const auto entry_address = index == 0 ? context : AddressPlus(s, context, index * ContextStride);
+			pick                     = Select(s, wide, matches(entry_address), entry_address, pick);
+		}
+		return pick;
+	});
 }
 
 inline uint32_t ScaledAddress(EmitterState& s, uint32_t base, uint32_t index, uint32_t scale) {

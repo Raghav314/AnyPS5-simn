@@ -36,6 +36,7 @@ constexpr std::uint64_t DumpPiece = 0x1000;
 constexpr std::uint32_t Fill = 0xdeadbeefu;
 constexpr std::uint32_t Format32UInt = 20;
 constexpr std::uint32_t Wave64Dispatch = 0x41;
+constexpr std::uint32_t Wave32Dispatch = 0x8041;
 
 using Words = std::span<const std::uint32_t>;
 using Check = std::function<std::string(Words)>;
@@ -47,6 +48,7 @@ struct Case {
     std::uint32_t ldsBytes;
     std::uint32_t stride;
     Check check;
+    std::uint32_t dispatch = Wave64Dispatch;
 };
 
 using Sharp = std::array<std::uint32_t, 4>;
@@ -78,7 +80,7 @@ std::vector<std::uint32_t> dispatchWords(const Case& test) {
     append(words, 0x76, {0x213, (8u << 1u) | (1u << 7u) | lds});
     append(words, 0x76, {0x207, test.threads, 1u, 1u});
     append(words, 0x76, {0x240, 0u, 0u, 0u, 0u, target[0], target[1], target[2], target[3]});
-    append(words, 0x15, {1u, 1u, 1u, Wave64Dispatch});
+    append(words, 0x15, {1u, 1u, 1u, test.dispatch});
     return words;
 }
 
@@ -220,6 +222,18 @@ std::string compare(Words output, std::uint32_t thread, std::uint32_t stride, st
     const auto got = output[thread * stride + slot];
     if (got == expected) return {};
     return "thread " + std::to_string(thread) + " " + what + ": " + hex(got) + " instead of " + hex(expected);
+}
+
+std::string checkFirstLane32(Words output) {
+    for (std::uint32_t thread = 0; thread < 64; ++thread) {
+        const auto base = thread & ~31u;
+        const std::array expected {laneValue(base), laneValue(base + 16), laneValue(base)};
+        for (std::uint32_t slot = 0; slot < expected.size(); ++slot) {
+            if (auto failure = compare(output, thread, 32, slot, expected[slot], "wave32 V_READFIRSTLANE_B32");
+                !failure.empty()) return failure;
+        }
+    }
+    return {};
 }
 
 std::string checkLanes(Words output) {
@@ -437,6 +451,7 @@ std::string checkSameAddress256(Words output) {
 }
 
 const std::array Cases{
+    Case{"first-lane-wave32", FirstLane32Code, 64, 0, 32, checkFirstLane32, Wave32Dispatch},
     Case{"lanes", LanesCode, 64, 0, 32, checkLanes},
     Case{"reduce", ReduceCode, 1024, 0, 16, checkReduce},
     Case{"vote", VoteCode, 1024, 4096, 16, checkVote},

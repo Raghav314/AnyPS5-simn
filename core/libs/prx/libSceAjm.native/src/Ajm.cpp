@@ -211,6 +211,7 @@ enum class JobKind : std::uint32_t {
     Control = 6,
     SetResampleParameters = 7,
     GetResampleInfo = 8,
+    Decode = 9,
 };
 
 struct JobHeader {
@@ -1402,7 +1403,7 @@ void RunOpus(Instance& instance, const JobHeader& job, const AjmBuffer* inputs, 
             result |= AJM_RESULT_INVALID_DATA;
             break;
         }
-        if ((job.flags & RUN_MULTIPLE_FRAMES) == 0) break;
+        if ((job.flags & RUN_MULTIPLE_FRAMES) == 0 && (job.kind != JobKind::Decode || Resampling(instance))) break;
     }
     if (consumed == input.size() && frames == 0 && pcmOutputs.produced == 0 && result == 0) result |= AJM_RESULT_PARTIAL_INPUT;
 
@@ -1724,6 +1725,7 @@ void Execute(const JobHeader& job, const AjmBuffer* inputs, const AjmBuffer* out
         if (job.sideband && job.sidebandSize >= sizeof(SidebandResult) + sizeof(resample)) std::memcpy(static_cast<std::uint8_t*>(job.sideband) + sizeof(SidebandResult), &resample, sizeof(resample));
         break;
     }
+    case JobKind::Decode:
     case JobKind::Run:
         if (!instance->initialized) {
             AJM_TRACE("[ajm] instance %u run before initialize\n", job.instance);
@@ -2143,9 +2145,9 @@ int APS5_VABI sceAjmBatchJobControl(AjmBatchInfo* info, uint32_t instance, uint6
     return CheckedAppend(info, header, &input, nullptr);
 }
 
-int AppendRun(AjmBatchInfo* info, std::uint32_t instance, std::uint64_t flags, const AjmBuffer* input_buffers, std::size_t input_buffers_num, const AjmBuffer* output_buffers, std::size_t output_buffers_num, void* sideband_output, std::size_t sideband_output_size) {
+int AppendRun(AjmBatchInfo* info, std::uint32_t instance, std::uint64_t flags, const AjmBuffer* input_buffers, std::size_t input_buffers_num, const AjmBuffer* output_buffers, std::size_t output_buffers_num, void* sideband_output, std::size_t sideband_output_size, JobKind kind = JobKind::Run) {
     if (input_buffers_num > 0xffu || output_buffers_num > 0xffu) return SCE_AJM_ERROR_INVALID_PARAMETER;
-    auto header = MakeHeader(JobKind::Run, instance, sideband_output, sideband_output_size);
+    auto header = MakeHeader(kind, instance, sideband_output, sideband_output_size);
     header.flags = flags;
     header.inputCount = static_cast<std::uint32_t>(input_buffers_num);
     header.outputCount = static_cast<std::uint32_t>(output_buffers_num);
@@ -2200,11 +2202,13 @@ int APS5_VABI sceAjmBatchJobGetResampleInfo(AjmBatchInfo* info, uint32_t instanc
 }
 
 int APS5_VABI sceAjmBatchJobDecode(AjmBatchInfo* info, uint32_t instance, const void* bitstream_input, size_t bitstream_input_size, void* pcm_output, size_t pcm_output_size, void* result) {
-    return sceAjmBatchJobRun(info, instance, SIDEBAND_STREAM, bitstream_input, bitstream_input_size, pcm_output, pcm_output_size, result, sizeof(SidebandResult) + sizeof(SidebandStream));
+    const AjmBuffer input{const_cast<void*>(bitstream_input), bitstream_input_size};
+    const AjmBuffer output{pcm_output, pcm_output_size};
+    return AppendRun(info, instance, SIDEBAND_STREAM, &input, 1, &output, 1, result, sizeof(SidebandResult) + sizeof(SidebandStream), JobKind::Decode);
 }
 
 int APS5_VABI sceAjmBatchJobDecodeSplit(AjmBatchInfo* info, uint32_t instance, const AjmBuffer* input_buffers, size_t input_buffers_num, const AjmBuffer* output_buffers, size_t output_buffers_num, void* result) {
-    return AppendRun(info, instance, SIDEBAND_STREAM, input_buffers, input_buffers_num, output_buffers, output_buffers_num, result, sizeof(SidebandResult) + sizeof(SidebandStream));
+    return AppendRun(info, instance, SIDEBAND_STREAM, input_buffers, input_buffers_num, output_buffers, output_buffers_num, result, sizeof(SidebandResult) + sizeof(SidebandStream), JobKind::Decode);
 }
 
 int APS5_VABI sceAjmBatchJobDecodeSingle(AjmBatchInfo* info, uint32_t instance, const void* bitstream_input, size_t bitstream_input_size, void* pcm_output, size_t pcm_output_size, void* result) {

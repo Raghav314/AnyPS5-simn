@@ -14,7 +14,16 @@ struct NoIndexedReadsWriter: Writer {
 	static constexpr bool shader_info_has_indexed_buffer_reads = false;
 };
 
-struct LegacyWriter: NoIndexedReadsWriter {
+struct NoExtraSourcesWriter: Writer {
+	static constexpr bool shader_info_has_ray_query_extra_sources = false;
+	static constexpr bool shader_info_has_extended_resources = false;
+};
+
+struct CommonWriter: NoExtraSourcesWriter {
+	static constexpr bool shader_info_has_indexed_buffer_reads = false;
+};
+
+struct LegacyWriter: CommonWriter {
 	static constexpr bool shader_info_has_relative_vgprs = false;
 };
 
@@ -38,16 +47,25 @@ void WriteFrame(std::ostream& output, const Writer& record) {
 
 template <class ModuleWriter = Writer>
 void WriteModule(std::ostream& output, uint64_t hash, uint64_t id, ShaderType stage,
-                 const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain) {
+                 const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain, Record type = Record::Module) {
 	ModuleWriter record;
 	Key key{.stage = stage, .hash = hash};
 	ShaderModule module;
 	module.id = id;
 	module.info.stage = stage;
+	module.info.info.images.emplace_back().paired_view = 3;
+	module.info.info.samplers.emplace_back().runtime_key = 5;
+	module.info.bindings.clip_plane_dwords = 8;
+	module.info.info.ray_query_extra_sources.push_back({1, 4, 8, 12, {1, 2, 3, 4}});
 	module.info.info.indexed_buffer_reads.push_back({2, 3, 12, {4, 16, 0}});
-	const std::vector<uint8_t> plan;
-	IoAll(record, Record::Module);
-	IoStoreModule(record, key, module, plan, spirv, plain);
+	IoAll(record, type);
+	if (type == Record::TableModule) {
+		const uint32_t cursor = 0;
+		IoStoreTableModule(record, key, cursor, module, spirv, plain);
+	} else {
+		const std::vector<uint8_t> plan;
+		IoStoreModule(record, key, module, plan, spirv, plain);
+	}
 	WriteFrame(output, record);
 }
 
@@ -67,12 +85,16 @@ int main() {
 	WriteModule(store, 0x102, 0x201, ShaderType::Vertex, vertex, {});
 	WriteModule(store, 0x101, 0x201, ShaderType::Vertex, vertex, {});
 	WriteModule(store, 0x101, 0x201, ShaderType::Vertex, vertex, {});
-	WriteModule(store, 0x103, 0x300, ShaderType::Pixel, pixel, plain);
+	WriteModule(store, 0x103, 0x300, ShaderType::Pixel, pixel, plain, Record::TableModule);
 	Writer pipeline;
 	IoAll(pipeline, Record::GraphicsPipeline);
 	const GraphicsPipelineKey key{};
 	pipeline.Raw(&key, sizeof(key));
 	WriteFrame(store, pipeline);
+	Writer native;
+	IoAll(native, Record::NativeGraphicsPipeline);
+	native.Raw(&key, sizeof(key));
+	WriteFrame(store, native);
 	store.close();
 	std::ofstream legacy("legacy.shaders", std::ios::binary);
 	Writer old_header;
@@ -89,11 +111,19 @@ int main() {
 	IoAll(previous_header, stamp, off, off, clock_period, off, off, off, off, off,
 	      on, on, on, on, on, on, on, all_stages, shared_memory);
 	Write(previous, previous_header.bytes);
-	WriteModule(previous, 0x102, 0x201, ShaderType::Vertex, vertex, {});
-	WriteModule(previous, 0x101, 0x201, ShaderType::Vertex, vertex, {});
+	WriteModule<CommonWriter>(previous, 0x102, 0x201, ShaderType::Vertex, vertex, {});
+	WriteModule<CommonWriter>(previous, 0x101, 0x201, ShaderType::Vertex, vertex, {});
+	std::ofstream no_extra("no-extra-sources.shaders", std::ios::binary);
+	Write(no_extra, header.bytes);
+	WriteModule<NoExtraSourcesWriter>(no_extra, 0x102, 0x201, ShaderType::Vertex, vertex, {});
+	WriteModule<NoExtraSourcesWriter>(no_extra, 0x101, 0x201, ShaderType::Vertex, vertex, {});
+	no_extra.close();
 
 	std::ofstream no_indexed("no-indexed-reads.shaders", std::ios::binary);
-	Write(no_indexed, header.bytes);
+	Writer subgroup_header;
+	std::array<bool, 14> subgroup_flags {};
+	IoAll(subgroup_header, stamp, off, off, clock_period, subgroup_flags, all_stages, shared_memory);
+	Write(no_indexed, subgroup_header.bytes);
 	WriteModule<NoIndexedReadsWriter>(no_indexed, 0x102, 0x201, ShaderType::Vertex, vertex, {});
 	WriteModule<NoIndexedReadsWriter>(no_indexed, 0x101, 0x201, ShaderType::Vertex, vertex, {});
 
@@ -111,5 +141,5 @@ int main() {
 	WriteDump("plain.spv", plain);
 	WriteDump("missing.spv", missing);
 	WriteDump("invalid.spv", {0, 0, 0, 0, 0});
-	return !store || !legacy || !previous || !no_indexed || !malformed || !bad_header;
+	return !store || !legacy || !previous || !no_extra || !no_indexed || !malformed || !bad_header;
 }

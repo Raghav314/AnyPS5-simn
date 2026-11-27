@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineManifest.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
 
@@ -8,9 +9,11 @@
 #include <fmt/ranges.h>
 #include <locale>
 #include <magic_enum.hpp>
+#include <optional>
 #include <ranges>
 #include <sstream>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <xxhash.h>
 
@@ -726,13 +729,18 @@ template <class Element>
 void ReadElements(TextReader& r, std::string_view key, std::vector<Element>& elements) {
 	const auto text = r.Find(key);
 	if (!text) return;
-	const auto parts = Split(*text, ',');
 #if defined(ANYPS5_KYTY)
-	r.ok             = r.ok && parts.size() <= 16384;
+	constexpr size_t limit = std::is_same_v<Element, ResourceSpecialization::Image>
+	                             ? DescriptorHeap::MaxSampledImages : 16384;
 #else
-	r.ok             = r.ok && parts.size() <= 4096;
+	constexpr size_t limit = 4096;
 #endif
-	elements.assign(r.ok ? parts.size() : 0, Element {});
+	if (!r.ok || std::ranges::count(*text, ',') >= static_cast<ptrdiff_t>(limit)) {
+		r.ok = false;
+		return;
+	}
+	const auto parts = Split(*text, ',');
+	elements.assign(parts.size(), Element {});
 	for (size_t i = 0; r.ok && i < parts.size(); i++) {
 		ElementReader reader(parts[i]);
 		VisitElement(reader, elements[i]);
@@ -761,6 +769,8 @@ std::string ModuleText(ManifestModule& module) {
 	if (module.back_hash != 0) w.Value("back", fmt::format("{:016x}", module.back_hash));
 	w.Dec("ud", module.user_data_count, 0u);
 	w.Dec("cur", module.push_data_cursor, 0u);
+	w.Flag("rb", module.runtime_buffers);
+	w.Flag("rs", module.runtime_samplers);
 	if (auto* vertex = std::get_if<ShaderVertexInputInfo>(&module.input)) {
 		VisitVertexInput(w, *vertex, std::get<ShaderVertexInputInfo>(base.input));
 	} else if (auto* pixel = std::get_if<ShaderPixelInputInfo>(&module.input)) {
@@ -789,7 +799,11 @@ bool ReadModule(std::span<const std::string_view> tokens, ManifestModule& module
 	r.ok            = code && ParseNumber(*code, module.code_hash, 16) && module.code_hash != 0;
 	if (const auto back = r.Find("back")) r.ok = r.ok && ParseNumber(*back, module.back_hash, 16);
 	r.Dec("ud", module.user_data_count, 0u);
-	r.Dec("cur", module.push_data_cursor, 0u);
+	uint32_t cursor = 0;
+	r.Dec("cur", cursor, 0u);
+	if (stage == ShaderType::Compute) module.push_data_cursor = cursor;
+	r.Flag("rb", module.runtime_buffers);
+	r.Flag("rs", module.runtime_samplers);
 	if (auto* vertex = std::get_if<ShaderVertexInputInfo>(&module.input)) {
 		VisitVertexInput(r, *vertex, *vertex);
 	} else if (auto* pixel = std::get_if<ShaderPixelInputInfo>(&module.input)) {
@@ -1160,6 +1174,9 @@ bool ReadLayout(std::span<const std::string_view>                 tokens,
 }
 
 void NormalizeManifestInput(ManifestModule& module) {
+	if (module.stage != ShaderType::Compute) {
+		module.push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsStageCursor(module.stage);
+	}
 	if (auto* vertex = std::get_if<ShaderVertexInputInfo>(&module.input)) {
 		for (int i = 0; i < vertex->resources_num; i++) {
 			vertex->resources[i].UpdateAddress48(0);
@@ -1191,6 +1208,8 @@ uint64_t ManifestModuleIdentity(const ManifestModule&     module,
 	auto   stage = static_cast<uint8_t>(module.stage);
 	IoAll(writer, stage, module.code_hash, module.back_hash, module.user_data_count,
 	      module.push_data_cursor, module.specialization);
+	auto modes = static_cast<uint8_t>(uint32_t(module.runtime_samplers) | (uint32_t(module.runtime_buffers) << 1u));
+	if (modes != 0) Io(writer, modes);
 	writer.Raw(static_state.data(), static_state.size_bytes());
 	return XXH3_64bits(writer.bytes.data(), writer.bytes.size());
 }
@@ -1365,6 +1384,127 @@ bool LoadManifest(std::span<const uint8_t> bytes, PipelineManifest& manifest, ui
 	}
 	set_skipped();
 	return true;
+}
+
+std::vector<ComputeRecipeVariant> SynthesizeComputeVariants(const ShaderComputeInputInfo&             base_input,
+                                                            bool                                      queue_dependent,
+                                                            const ShaderRecompiler::IR::Program&      program,
+                                                            const ShaderRecompiler::IR::ResourcePlan& plan,
+                                                            std::span<const ManifestModule>           signatures) {
+	std::vector<ComputeRecipeVariant> variants;
+	const auto add_variant = [&](const ShaderComputeInputInfo& input,
+	                             ShaderRecompiler::IR::ResourceSpecialization shape) {
+		const bool duplicate = std::ranges::any_of(variants, [&](const ComputeRecipeVariant& existing) {
+			return existing.input.async_compute == input.async_compute &&
+			       existing.input.dispatch_thread_dimensions == input.dispatch_thread_dimensions &&
+			       existing.input.dispatch_indirect_threads == input.dispatch_indirect_threads &&
+			       existing.specialization == shape;
+		});
+		if (!duplicate) {
+			variants.push_back({.input = input, .specialization = std::move(shape)});
+		}
+	};
+	const auto roots_fit = [&](const auto& slots, const auto& resources, uint32_t none) {
+		for (size_t i = 0; i < resources.size(); ++i) {
+			if (slots[i].indirect_root == none) continue;
+			const auto source = resources[i].source;
+			if (slots[i].indirect_root != i || source >= plan.descriptor_sources.size() ||
+			    !plan.descriptor_sources[source].indirect_descriptor) {
+				return false;
+			}
+		}
+		return true;
+	};
+	for (const auto& sample: signatures) {
+		const auto* sample_input = std::get_if<ShaderComputeInputInfo>(&sample.input);
+		if (sample.stage != ShaderType::Compute || sample_input == nullptr ||
+		    !ShaderRecompiler::IR::ResourceSpecializationFits(program, sample.specialization)) {
+			continue;
+		}
+		auto shape = sample.specialization;
+		if (!roots_fit(shape.images, plan.info.images, ShaderRecompiler::IR::ImageResource::NoIndirectImage) ||
+		    !roots_fit(shape.samplers, plan.info.samplers, ShaderRecompiler::IR::SamplerResource::NoIndirectSampler) ||
+		    !roots_fit(shape.buffers, plan.info.buffers, ShaderRecompiler::IR::BufferResource::NoIndirectBuffer)) {
+			continue;
+		}
+		ShaderRecompiler::IR::ReadStridesAtRunTime(plan, shape);
+		auto input                       = base_input;
+		input.dispatch_thread_dimensions = sample_input->dispatch_thread_dimensions;
+		input.dispatch_indirect_threads  = sample_input->dispatch_indirect_threads;
+		input.async_compute              = queue_dependent && sample_input->async_compute;
+		add_variant(input, std::move(shape));
+	}
+	if (!variants.empty()) {
+		return variants;
+	}
+	ShaderRecompiler::IR::ResourceSpecialization base;
+	base.buffers.resize(plan.info.buffers.size());
+	const bool has_formatted = std::ranges::any_of(plan.info.buffers, [](const auto& buffer) { return buffer.formatted; });
+	ShaderRecompiler::IR::ReadStridesAtRunTime(plan, base);
+	base.samplers.resize(plan.info.samplers.size());
+	base.images.resize(plan.info.images.size());
+	using Format    = Prospero::BufferFormat;
+	using Numeric   = Prospero::TextureNumericClass;
+	using Dimension = ShaderRecompiler::Decoder::ImageDimension;
+	const auto mixed_output = [&]() -> std::optional<uint32_t> {
+		std::vector<uint32_t> outputs;
+		for (const auto& image: plan.info.images) {
+			if (image.source >= plan.descriptor_sources.size()) return std::nullopt;
+			const auto& source = plan.descriptor_sources[image.source];
+			if (source.indirect_descriptor) return std::nullopt;
+			if (image.resource_class != ShaderRecompiler::IR::ImageResourceClass::Storage) continue;
+			if (!image.written || image.read || image.atomic || source.dword_count <= 1u ||
+			    source.dwords[1].Resolve().IsImmediate()) return std::nullopt;
+			if (std::ranges::find(outputs, image.source) == outputs.end()) outputs.push_back(image.source);
+			if (outputs.size() > 2) return std::nullopt;
+		}
+		if (outputs.size() != 2 || std::ranges::any_of(plan.info.images, [&](const auto& image) {
+			    return image.resource_class != ShaderRecompiler::IR::ImageResourceClass::Storage &&
+			           std::ranges::find(outputs, image.source) != outputs.end();
+		    })) return std::nullopt;
+		return outputs.front();
+	}();
+	const auto add_image_variant = [&](Numeric storage, Numeric sampled, bool mixed = false) {
+		for (size_t i = 0; i < base.images.size(); ++i) {
+			const auto& resource = plan.info.images[i];
+			auto&       view     = base.images[i];
+			view.dimension = resource.dimension == Dimension::Unknown ? Dimension::Dim2D : resource.dimension;
+			const bool storage_view = resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+			const auto storage_class = mixed && mixed_output == resource.source
+			                               ? (storage == Numeric::Float ? Numeric::Uint : Numeric::Float) : storage;
+			view.numeric_class = resource.atomic ? Numeric::Uint : storage_view ? storage_class : sampled;
+			view.cube = resource.cube;
+		}
+		auto input          = base_input;
+		input.async_compute = false;
+		add_variant(input, base);
+		if (queue_dependent) {
+			input.async_compute = true;
+			add_variant(input, base);
+		}
+	};
+	const std::array<Format, 2> formatted_formats {Format::k32Float, Format::k32UInt};
+	const std::span<const Format> formats = has_formatted ? std::span<const Format>(formatted_formats)
+	                                                      : std::span<const Format>(formatted_formats).first(1);
+	for (const auto format: formats) {
+		if (has_formatted) {
+			for (size_t i = 0; i < base.buffers.size(); ++i) {
+				if (plan.info.buffers[i].formatted) base.buffers[i].descriptor_format = format;
+			}
+		}
+		for (const auto storage: {Numeric::Float, Numeric::Uint, Numeric::Sint}) {
+			for (const auto sampled: {Numeric::Float, Numeric::Uint, Numeric::Sint}) {
+				add_image_variant(storage, sampled);
+			}
+		}
+		if (mixed_output) {
+			for (const auto sampled: {Numeric::Float, Numeric::Uint, Numeric::Sint}) {
+				add_image_variant(Numeric::Float, sampled, true);
+				add_image_variant(Numeric::Uint, sampled, true);
+			}
+		}
+	}
+	return variants;
 }
 
 }

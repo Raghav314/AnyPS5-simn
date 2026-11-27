@@ -22,6 +22,8 @@ struct ComputeShaderInfo;
 struct ShaderRegisters;
 }
 
+enum class ShaderBvh : uint8_t { None, Bvh4, Bvh8Only };
+
 enum class ShaderType {
 	Unknown,
 	Vertex,

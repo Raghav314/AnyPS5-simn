@@ -90,6 +90,21 @@ void OlderManifest() {
 	}
 }
 
+void OlderGraphicsCursors() {
+	const auto canonical = Text(SaveManifest(DrawManifest()));
+	auto older = Replace(canonical, " cur=33", " cur=11");
+	older = Replace(older, " cur=19", "");
+	Check(older != canonical, "the older draw uses different graphics cursors");
+	PipelineManifest loaded;
+	uint32_t skipped = 0;
+	Check(LoadManifest(Bytes(older), loaded, &skipped) && skipped == 0, "the older draw loads");
+	for (const auto& module: loaded.modules) {
+		Check(module.push_data_cursor == ShaderRecompiler::IR::PushData::GraphicsStageCursor(module.stage),
+		      "an older cursor selects the current stage window");
+	}
+	Check(Text(SaveManifest(loaded)) == canonical, "the older pipeline keeps its canonical stage references");
+}
+
 void BadFloatModes() {
 	const auto text = Text(SaveManifest(DrawManifest()));
 	for (const auto& [from, to]: {std::pair {" fp=f0.1.0", " fp=f0.1.0 fh=c0.0.0"},
@@ -100,6 +115,25 @@ void BadFloatModes() {
 		uint32_t         skipped = 0;
 		Check(LoadManifest(Bytes(Replace(text, from, to)), loaded, &skipped), "the manifest loads");
 		Check(skipped == 1 && loaded.pipelines.empty(), "a pipeline with a bad float mode is left out");
+	}
+}
+
+void LargeImageSpecialization() {
+	PipelineManifest manifest;
+	ManifestModule module {.stage = ShaderType::Compute, .code_hash = 0x1212121212121212ull};
+	module.input.emplace<ShaderComputeInputInfo>();
+	module.specialization.images.resize(65537);
+	module.specialization.images.back().heap = true;
+	module.specialization.images.back().indirect_mapping_offset = 262238;
+	manifest.modules.push_back(std::move(module));
+
+	const auto bytes = SaveManifest(manifest);
+	PipelineManifest loaded;
+	uint32_t skipped = 0;
+	Check(LoadManifest(bytes, loaded, &skipped), "a long image specialization manifest loads");
+	Check(skipped == 0 && loaded.modules.size() == 1, "the long image specialization is accepted");
+	if (loaded.modules.size() == 1) {
+		Check(SaveManifest(loaded) == bytes, "image specialization order and fields round-trip");
 	}
 }
 
@@ -125,7 +159,9 @@ void StageRegisters() {
 int main() {
 	RoundTrip();
 	OlderManifest();
+	OlderGraphicsCursors();
 	BadFloatModes();
+	LargeImageSpecialization();
 	StageRegisters();
 	if (g_failures != 0) {
 		std::printf("kyty_shim_manifest_float_modes: %d check(s) FAILED\n", g_failures);

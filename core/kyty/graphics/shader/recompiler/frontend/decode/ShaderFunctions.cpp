@@ -1189,6 +1189,13 @@ void MergeReads(Reads& reads) {
 
 }
 
+bool ComputeShaderDependsOnQueue(std::span<const uint32_t> code) {
+	return std::ranges::any_of(code, [](uint32_t word) {
+		const uint32_t getreg = word & 0xff80ffffu;
+		return getreg == 0xb9001818u || getreg == 0xb9000a18u || IsCall(word);
+	});
+}
+
 bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
                            std::span<const uint32_t> user_data, const ShaderCodeReader& read,
                            std::vector<uint32_t>& expanded, std::vector<LongBranch>& long_branches,

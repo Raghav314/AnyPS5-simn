@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -24,7 +25,7 @@ struct ShaderModule;
 
 class WaveSplitCheck: public std::enable_shared_from_this<WaveSplitCheck> {
 public:
-	explicit WaveSplitCheck(RenderContext& context);
+	explicit WaveSplitCheck(RenderContext& context, bool generic = false);
 	~WaveSplitCheck();
 	WaveSplitCheck(const WaveSplitCheck&)            = delete;
 	WaveSplitCheck& operator=(const WaveSplitCheck&) = delete;
@@ -38,6 +39,7 @@ public:
 	[[nodiscard]] bool        Witness() const noexcept { return m_witness; }
 	void                      Before(const PreparedBindings& bindings);
 	void                      AfterSplit(const PreparedBindings& bindings);
+	void                      Timestamp(const CommandRecorder& command, uint32_t index);
 	void                      AfterPairs(const PreparedBindings& bindings);
 
 private:
@@ -72,6 +74,10 @@ private:
 	uint32_t TakeSlot();
 
 	RenderContext&                        m_context;
+	bool                                  m_generic;
+	vk::QueryPool                         m_timestamps = nullptr;
+	uint32_t                              m_timestamp_bits = 0;
+	std::set<std::pair<uint64_t, uint64_t>> m_generic_pairs;
 	std::mutex                            m_mutex;
 	std::unordered_map<uint64_t, Program> m_programs;
 	std::shared_ptr<Buffer>               m_scratch;

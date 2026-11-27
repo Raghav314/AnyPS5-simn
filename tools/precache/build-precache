@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+tool=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$tool/../.." && pwd)
+build=$(realpath "${1:-$root/build-kyty}")
+out="$build/precache-tool"
+shim="$root/core/libs/prx/libSceAgcDriver/KytyShim"
+mkdir -p "$out"
+defs=(-DANYPS5_KYTY=1 -DAPS5_ENABLE_TIMING_LOG=0 -DTRACY_DELAYED_INIT -DTRACY_ENABLE -DTRACY_MANUAL_LIFETIME -DTRACY_NO_CRASH_HANDLER -DTRACY_ON_DEMAND -DXBYAK_NO_EXCEPTION)
+inc=("-I$root/core/libs" "-I$root/3rdparty/zstd/lib" "-I$build/core/libs/prx/libSceAgcDriver/generated" "-I$root/core/kyty" "-I$shim/include" "-I$build/core/kyty/generated")
+for dir in SPIRV-Tools/include Vulkan-Headers/include VulkanMemoryAllocator/include SPIRV-Headers/include fmt/include xxHash xbyak magic_enum/include/magic_enum tracy/public; do
+    inc+=(-isystem "$root/3rdparty/$dir")
+done
+objects=()
+for source in "$tool/Precache.cpp" "$tool/ComputeRecipe.cpp" "$shim/src/Config.cpp" "$shim/src/NativeRt.cpp" "$shim/src/Log.cpp"; do
+    object="$out/$(basename "$source" .cpp).o"
+    "${CXX:-g++-14}" "${defs[@]}" "${inc[@]}" -O2 -DNDEBUG -std=c++20 -fPIE -c "$source" -o "$object"
+    objects+=("$object")
+done
+cp "$build/core/libs/libs/unpatched/libc.prx" "$out/libc.prx"
+"${CXX:-g++-14}" -O2 -Wl,--gc-sections -Wl,--no-as-needed -fPIE -pie "${objects[@]}" '-Wl,-rpath,$ORIGIN' -L"$out" -l:libc.prx "$build/core/kyty/libkyty_gpu.a" -ldl -lpthread -o "$out/kyty_precache.new"
+mv "$out/kyty_precache.new" "$out/kyty_precache"

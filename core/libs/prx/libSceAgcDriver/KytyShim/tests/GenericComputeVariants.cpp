@@ -1,3 +1,4 @@
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -8,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -48,6 +50,30 @@ void Check(bool condition, const std::string& what) {
 	if (condition) return;
 	std::fprintf(stderr, "FAILED: %s\n", what.c_str());
 	g_failures++;
+}
+
+void CheckComputeQueueKeys() {
+	ShaderInit();
+	std::array<uint32_t, 2> code {0u, 0xbf810000u};
+	HW::ComputeShaderInfo regs {};
+	regs.cs_regs.data_addr = reinterpret_cast<uintptr_t>(code.data());
+	const auto key = [&](bool async, bool indirect) {
+		ShaderComputeInputInfo input {};
+		input.async_compute = async;
+		input.dispatch_indirect_threads = indirect;
+		PrepareProgram(regs, input);
+		std::vector<uint32_t> words;
+		BuildStageStaticKey(input, words);
+		return words;
+	};
+	for (const auto instruction: {0xbf800000u, 0xb9031818u, 0xb9070a18u, 0xbe802102u}) {
+		code[0] = instruction;
+		ShaderMapUserData(regs.cs_regs.data_addr, {.type = Prospero::ShaderBinaryType::kCs,
+		                                          .code_size_bytes = sizeof(code)});
+		const bool shared = instruction == 0xbf800000u;
+		Check((key(false, false) == key(true, false)) == shared, "compute queue dependence of the program key");
+		Check(key(false, false) != key(false, true), "indirect dispatch keeps its own program key");
+	}
 }
 
 using Texture = std::array<uint32_t, 8>;
@@ -160,6 +186,236 @@ bool SameTexture(const IR::DescriptorValue& value, const Texture& texture) {
 	return std::equal(texture.begin(), texture.end(), value.dwords.begin());
 }
 
+struct TestImageHeap final: IR::ImageHeapSource {
+	std::array<IR::DescriptorValue, 1> kinds;
+	std::vector<uint32_t> rebound_mapping;
+	bool allow_direct = false;
+	bool allow_rebind = true;
+
+	bool Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) override {
+		if (!allow_direct || !request.table || request.count != 3u) return false;
+		result = {.slots = TableAddress, .slot_count = 17, .kinds = kinds};
+		return true;
+	}
+
+	bool AcquireList(const IR::ImageHeapList& request, IR::ImageHeapView& result) override {
+		if (!allow_rebind || request.table == nullptr) return false;
+		rebound_mapping = request.table->mapping;
+		result = {.slots = TableAddress, .slot_count = 17, .kinds = kinds};
+		return true;
+	}
+};
+
+void CheckImageTableLifetime(IR::ResourcePlan& plan, IR::SrtRuntime runtime) {
+	std::vector<size_t> reads;
+	runtime.userdata = &reads;
+	runtime.read_specialization_memory = [](void* userdata, uint64_t address, std::span<uint32_t> words) {
+		if (address == TableAddress) static_cast<std::vector<size_t>*>(userdata)->push_back(words.size());
+		return ReadMemory(nullptr, address, words);
+	};
+
+	IR::ResourceSpecialization specialization;
+	IR::ResourceSnapshot snapshot;
+	const auto capture = [&] {
+		reads.clear();
+		const bool ok = IR::MaterializeResources(plan, runtime, snapshot, specialization);
+		Check(ok && snapshot.image_tables.size() == 1, "capture materializes one image table");
+		Check(reads == std::vector<size_t>{24}, "capture reads all three descriptors including their upper words");
+		return ok && snapshot.image_tables.size() == 1;
+	};
+
+	plan.info.images[0].r128 = true;
+	if (!capture()) return;
+	auto retained = snapshot;
+	const std::weak_ptr<const IR::ImageTableSnapshot> observed = retained.image_tables.front();
+	const auto& first = *retained.image_tables.front();
+	const auto initial_id = first.slots_id;
+	const auto original = first.raw[7];
+	const auto old_mapping = first.mapping;
+	const auto old_slots = first.slots;
+	if (!capture()) return;
+	Check(snapshot.image_tables.front() == retained.image_tables.front(), "unchanged table reuses the previous snapshot");
+	snapshot = {};
+	if (!capture()) return;
+	Check(snapshot.image_tables.front() == retained.image_tables.front(), "cache hit shares the retained image table");
+	{
+		auto unavailable = runtime;
+		unavailable.read_specialization_memory = [](void*, uint64_t address, std::span<uint32_t> words) {
+			return address != TableAddress && ReadMemory(nullptr, address, words);
+		};
+		auto previous = snapshot;
+		IR::ResourceSpecialization unused;
+		Check(!IR::MaterializeResources(plan, unavailable, previous, unused),
+		      "a cached table cannot hide a rejected guest read");
+	}
+	for (uint32_t change = 1; change <= 8; ++change) {
+		Poke(TableAddress + 7u * 4u, original ^ change);
+		if (!capture()) return;
+		const auto& current = *snapshot.image_tables.front();
+		Check(current.slots_id != initial_id && current.raw[7] == (original ^ change),
+		      "a mutation of an unused R128 word produces a fresh capture");
+		Check(current.mapping == old_mapping && current.slots == old_slots,
+		      "an unused R128 word preserves slots and entry order");
+	}
+	Check(first.raw[7] == original && first.mapping == old_mapping && first.slots == old_slots,
+	      "the retained snapshot survives mutation and cache eviction");
+	retained = {};
+	Check(observed.expired(), "evicted table is released with its last snapshot");
+	Poke(TableAddress + 7u * 4u, original);
+}
+
+void CheckImageTableWidths(IR::ResourcePlan& plan, const IR::SrtRuntime& runtime, TestImageHeap& heap, bool on) {
+	const auto original = plan.info.images.front();
+	const auto base = MakeTexture(TextureA, Format8888);
+	auto short_only = base;
+	short_only[4] = 0xe0000000u;
+	auto both = base;
+	both[7] = 0x1234u;
+	auto long_only = MakeTexture(TextureB, Format8888);
+	long_only[3] = (long_only[3] & 0x0fffffffu) | (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
+	const std::array entries {short_only, both, long_only};
+	for (size_t i = 0; i < entries.size(); ++i)
+		for (size_t j = 0; j < entries[i].size(); ++j)
+			Poke(TableAddress + i * 32u + j * 4u, entries[i][j]);
+
+	const auto check = [&](const Materialized& output, uint32_t root, bool short_view) {
+		if (!output.ok || root >= output.specialization.images.size()) return false;
+		const auto& image = output.specialization.images[root];
+		if (image.table >= output.snapshot.image_tables.size()) return false;
+		const auto& table = *output.snapshot.image_tables[image.table];
+		const std::vector<uint32_t> expected = short_view ? std::vector<uint32_t>{3,1,1,0} : std::vector<uint32_t>{3,0,1,2};
+		return table.mapping == expected && table.slots.size() == (short_view ? 2u : 3u) &&
+		       SameTexture(table.slots[1], short_view ? base : both) &&
+		       (short_view || SameTexture(table.slots[2], long_only)) &&
+		       table.raw.size() == 24 && table.raw[4] == short_only[4] && table.raw[15] == both[7] &&
+		       image.table_mapping_offset + expected.size() <= output.snapshot.flattened_srt.size() &&
+		       std::equal(expected.begin(), expected.end(), output.snapshot.flattened_srt.begin() + image.table_mapping_offset);
+	};
+	heap.allow_direct = false;
+	heap.allow_rebind = true;
+	for (const bool first_short : {true,false}) {
+		Materialized first;
+		auto& root = plan.info.images[0];
+		root.r128 = first_short;
+		first.ok = IR::MaterializeResources(plan, runtime, first.snapshot, first.specialization);
+		Check(check(first, 0, first_short), "first width selects the proper image slots and words");
+		root.r128 = !first_short;
+		Materialized other;
+		other.ok = IR::MaterializeResources(plan, runtime, other.snapshot, other.specialization);
+		Check(check(other, 0, !first_short), "cross-call cache keeps the two widths distinct");
+		heap.allow_direct = true;
+		Materialized target;
+		target.ok = IR::MaterializeResources(plan, runtime, target.snapshot, target.specialization);
+		heap.allow_direct = false;
+		IR::ResourceSnapshot aligned;
+		heap.rebound_mapping.clear();
+		if (on && first.ok && other.ok && target.ok) {
+			Check(IR::RebindComputeImages(plan, runtime, other.snapshot, other.specialization, target.specialization, aligned) &&
+			      !heap.rebound_mapping.empty(), "matching captured image table can bind to the heap");
+			heap.rebound_mapping.clear();
+			IR::RebindComputeImages(plan, runtime, first.snapshot, first.specialization, target.specialization, aligned);
+			Check(heap.rebound_mapping.empty(), "captured image table with another width never reaches the heap");
+		}
+		first.ok = IR::MaterializeResources(plan, runtime, first.snapshot, first.specialization);
+		Check(check(first, 0, !first_short), "previous snapshot cannot provide slots of another width");
+	}
+
+	CheckImageTableLifetime(plan, runtime);
+
+	plan.info.images.push_back(original);
+	for (const bool first_short : {true,false}) {
+		plan.info.images[0].r128 = first_short;
+		plan.info.images[1].r128 = !first_short;
+		plan.info.images[1].skip_degamma = true;
+		plan.info.images[1].paired_view = 0u;
+		IR::CompileSrtWalker(plan);
+		Materialized mixed;
+		mixed.ok = IR::MaterializeResources(plan, runtime, mixed.snapshot, mixed.specialization);
+		Check(check(mixed, 0, first_short) && check(mixed, 1, !first_short) && mixed.snapshot.image_tables.size() == 2,
+		      "coexisting widths get distinct table mappings in either order");
+	}
+}
+
+void RebindTableAndHeap(bool on) {
+	auto fixture = Translate();
+	auto& plan = fixture.plan;
+	Check(plan.info.images.size() == 1 && !plan.info.buffers.empty(), "fixture has a source image and buffer");
+	if (plan.info.images.size() != 1 || plan.info.buffers.empty()) return;
+	auto& indirect = plan.descriptor_sources[plan.info.images.front().source].indirect_descriptor;
+	Check(indirect.has_value(), "fixture has an indirect image source");
+	if (!indirect) return;
+	indirect->table_source = plan.info.buffers.front().source;
+	indirect->table_array = true;
+	indirect->table_mask = 0x7fu;
+	indirect->table_offset = 0;
+
+	const auto a = MakeTexture(TextureA, Format8888);
+	const auto b = MakeTexture(TextureB, Format8888);
+	std::fill_n(g_guest, GuestBytes / 4u, 0u);
+	for (uint32_t i = 0; i < a.size(); ++i) {
+		Poke(TableAddress + i * 4u, a[i]);
+		Poke(TableAddress + 32u + i * 4u, b[i]);
+	}
+	std::array<uint32_t, 16> user {};
+	user[0] = user[4] = static_cast<uint32_t>(TableAddress);
+	user[1] = user[5] = static_cast<uint32_t>(TableAddress >> 32u);
+	user[2] = 3;
+	user[6] = 96;
+	user[7] = 0xfacu | (Format32UInt << 12u) | (1u << 24u) | (3u << 28u);
+	TestImageHeap heap;
+	heap.kinds[0].dword_count = 8;
+	std::copy(a.begin(), a.end(), heap.kinds[0].dwords.begin());
+	const IR::SrtRuntime runtime {.user_data = user, .read_specialization_memory = ReadMemory, .image_heap = &heap};
+	Materialized table;
+	Materialized native_heap;
+	table.ok = IR::MaterializeResources(plan, runtime, table.snapshot, table.specialization);
+	heap.allow_direct = true;
+	native_heap.ok = IR::MaterializeResources(plan, runtime, native_heap.snapshot, native_heap.specialization);
+	Check(table.ok && native_heap.ok, "the fixture materializes both table and heap addressing");
+	if (!table.ok || !native_heap.ok) return;
+	Check(table.snapshot.image_tables.size() == 1 && native_heap.snapshot.image_tables.empty(),
+	      "table and heap use distinct address representations");
+	if (table.snapshot.image_tables.size() != 1 || !native_heap.snapshot.image_tables.empty()) return;
+	Check(IR::CanRebindComputeImages(plan, table.specialization, native_heap.specialization) == on,
+	      "ready heap shape can represent the same typed table");
+	IR::ResourceSnapshot rebound;
+	const bool to_heap = IR::RebindComputeImages(plan, runtime, table.snapshot, table.specialization,
+	                                            native_heap.specialization, rebound);
+	Check(to_heap == on, "table dispatch can rematerialize compatible heap bindings");
+	if (to_heap) {
+		Check(heap.rebound_mapping == std::vector<uint32_t> {3, 1, 2, 0},
+		      "heap bridge preserves entry ordinals and the null slot");
+		Check(rebound.flattened_srt == native_heap.snapshot.flattened_srt && rebound.images == native_heap.snapshot.images,
+		      "heap bridge produces the same resource shape as normal heap materialization");
+	}
+	const bool to_table = IR::RebindComputeImages(plan, runtime, native_heap.snapshot, native_heap.specialization,
+	                                             table.specialization, rebound);
+	Check(to_table == on, "heap dispatch can rematerialize compatible table bindings");
+	if (to_table) {
+		Check(rebound.image_tables.size() == 1 && rebound.image_tables[0]->mapping == table.snapshot.image_tables[0]->mapping &&
+		          rebound.flattened_srt == table.snapshot.flattened_srt,
+		      "table bridge preserves original descriptor lookup");
+	}
+	auto invalid = native_heap.specialization;
+	invalid.images.back().numeric_class = Prospero::TextureNumericClass::Uint;
+	Check(!IR::CanRebindComputeImages(plan, table.specialization, invalid), "heap bridge rejects different child types");
+	invalid = table.specialization;
+	invalid.images[0].table_entry_mask ^= 1u;
+	Check(!IR::CanRebindComputeImages(plan, native_heap.specialization, invalid), "table bridge rejects different masks");
+	heap.allow_rebind = false;
+	Check(!IR::RebindComputeImages(plan, runtime, table.snapshot, table.specialization, native_heap.specialization, rebound),
+	      "heap allocation rejection never installs an incompatible snapshot");
+
+	auto widened = table.specialization;
+	widened.images[0].table_capacity *= 2;
+	Check(IR::AlignResources(plan, table.snapshot, table.specialization, widened, nullptr) == on,
+	      "an otherwise identical wider table accepts the existing slots");
+	widened.images[0].table_capacity = 1;
+	Check(!IR::AlignResources(plan, table.snapshot, table.specialization, widened, nullptr),
+	      "an undersized table rejects the existing slots");
+	CheckImageTableWidths(plan, runtime, heap, on);
+}
+
 void Generic(bool on) {
 	const auto program = Translate();
 	const auto& plan   = program.plan;
@@ -265,7 +521,9 @@ int main() {
 		std::fprintf(stderr, "FAILED: the guest region could not be mapped\n");
 		return 1;
 	}
+	CheckComputeQueueKeys();
 	Generic(on);
+	RebindTableAndHeap(on);
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d failure(s)\n", g_failures);
 		return 1;

@@ -14,6 +14,7 @@
 #include <vector>
 
 VK_DEFINE_HANDLE(VmaAllocation)
+VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace Libs::Graphics {
 
@@ -103,6 +104,7 @@ private:
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
+	VmaAllocator                  m_allocator  = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	bool                          m_in_place = false;

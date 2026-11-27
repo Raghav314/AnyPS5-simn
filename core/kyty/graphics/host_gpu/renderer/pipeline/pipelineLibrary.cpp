@@ -42,15 +42,8 @@ void Append(std::string& key, const T& value) {
 	key.append(reinterpret_cast<const char*>(&value), sizeof(value));
 }
 
-std::string LayoutKey(const GraphicsPipelineKey& key, bool native) {
-	std::string result;
-	Append(result, key.stage_ids);
-	Append(result, native);
-	return result;
-}
-
 std::string PartKey(PipelineLibraryPart part, const GraphicsPipelineKey& key,
-                    const PipelineLibraries::Stages& stages, bool native) {
+                    const PipelineLibraries::Stages& stages, vk::PipelineLayout layout) {
 	const auto& params = key.static_params;
 	std::string result;
 	switch (part) {
@@ -63,7 +56,15 @@ std::string PartKey(PipelineLibraryPart part, const GraphicsPipelineKey& key,
 			}
 			break;
 		case PipelineLibraryPart::PreRasterization:
-			result = LayoutKey(key, native);
+			Append(result, static_cast<VkPipelineLayout>(layout));
+			for (size_t i = 0; i < 3; ++i) Append(result, key.stage_ids[i]);
+			if (params.patch_control_points != 0 && stages[1] == nullptr) {
+				for (const auto& parameter: stages[3]->rect_parameters) {
+					Append(result, parameter.input_location);
+					Append(result, parameter.output_location);
+					Append(result, parameter.flat);
+				}
+			}
 			Append(result, params.negative_one_to_one);
 			Append(result, params.depth_clip_enable);
 			Append(result, params.patch_control_points);
@@ -72,16 +73,34 @@ std::string PartKey(PipelineLibraryPart part, const GraphicsPipelineKey& key,
 			Append(result, params.polygon_mode);
 			break;
 		case PipelineLibraryPart::FragmentShader:
-			result = LayoutKey(key, native);
+			Append(result, static_cast<VkPipelineLayout>(layout));
+			Append(result, key.stage_ids[3]);
 			Append(result, params.samples);
 			Append(result, params.sample_shading_enable);
 			Append(result, params.alpha_to_coverage_enable);
 			break;
 		case PipelineLibraryPart::FragmentOutput:
 			Append(result, key.rendering);
-			Append(result, params);
+			Append(result, params.samples);
+			Append(result, params.sample_shading_enable);
+			Append(result, params.alpha_to_coverage_enable);
+			Append(result, params.color_mask);
+			Append(result, params.blend_enable);
+			Append(result, params.color_srcblend);
+			Append(result, params.color_destblend);
+			Append(result, params.color_comb_fcn);
+			Append(result, params.separate_alpha_blend);
+			Append(result, params.alpha_srcblend);
+			Append(result, params.alpha_destblend);
+			Append(result, params.alpha_comb_fcn);
 			break;
 	}
+	return result;
+}
+
+std::string LibraryShaderStateKey(const GraphicsPipelineKey& key, const PipelineLibraries::Stages& stages) {
+	auto result = PartKey(PipelineLibraryPart::PreRasterization, key, stages, {});
+	result += PartKey(PipelineLibraryPart::FragmentShader, key, stages, {});
 	return result;
 }
 
@@ -191,6 +210,22 @@ void PipelineLibraries::Stop() {
 
 bool PipelineLibraries::Eligible(const Stages& stages) {
 	return stages[0] != nullptr && stages[3] != nullptr;
+}
+
+void PipelineLibraries::NotePreparedPipeline(const GraphicsPipelineKey& key, const Stages& stages) {
+	if (!Eligible(stages)) return;
+	auto state = LibraryShaderStateKey(key, stages);
+	std::lock_guard lock(m_mutex);
+	m_prepared_shader_states.insert(std::move(state));
+}
+
+bool PipelineLibraries::SpeculationCovered(const GraphicsPipelineKey& key, const Stages& stages, bool native) {
+	if (native) return false;
+	const auto state = LibraryShaderStateKey(key, stages);
+	std::lock_guard lock(m_mutex);
+	if (!m_prepared_shader_states.contains(state)) return false;
+	m_ahead_covered.fetch_add(1, std::memory_order_relaxed);
+	return true;
 }
 
 vk::PipelineLayout PipelineLibraries::LibraryLayout(const std::string& key, const GraphicsPipelineKey& pipeline_key,
@@ -307,14 +342,14 @@ bool PipelineLibraries::Link(PipelineCache::Pipeline& pipeline, const GraphicsPi
 		return false;
 	}
 	const bool native = pipeline.native_bindings;
-	const auto layout = LibraryLayout(LayoutKey(key, native), key, stages, native);
+	const auto layout = LibraryLayout(GraphicsLayoutKey(stages, native), key, stages, native);
 	if (layout == nullptr) {
 		return false;
 	}
 	m_last_link.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 	m_active.store(true, std::memory_order_relaxed);
 	const auto request = [&](PipelineLibraryPart part, vk::PipelineLayout part_layout) {
-		return Request(part, PartKey(part, key, stages, native), key, stages, native, part_layout, true, false);
+		return Request(part, PartKey(part, key, stages, layout), key, stages, native, part_layout, true, false);
 	};
 	const bool mesh              = stages[0]->info.stage == ShaderType::Mesh;
 	const auto pre_rasterization = request(PipelineLibraryPart::PreRasterization, layout);
@@ -360,7 +395,7 @@ bool PipelineLibraries::Link(PipelineCache::Pipeline& pipeline, const GraphicsPi
 		return false;
 	}
 	const auto started = std::chrono::steady_clock::now();
-	pipeline.pipeline  = LinkGraphicsPipeline(m_graphics, pipeline.pipeline_layout, linked);
+	pipeline.pipeline  = LinkGraphicsPipeline(m_graphics, pipeline.pipeline_layout, key, linked);
 	m_link_ns.fetch_add(Elapsed(started), std::memory_order_relaxed);
 	if (!pipeline.pipeline) {
 		m_failed.fetch_add(1, std::memory_order_relaxed);
@@ -372,15 +407,15 @@ bool PipelineLibraries::Link(PipelineCache::Pipeline& pipeline, const GraphicsPi
 }
 
 void PipelineLibraries::Prepare(const GraphicsPipelineKey& key, const Stages& stages, bool native) {
-	if (!Eligible(stages)) {
+	if (!Eligible(stages) || SpeculationCovered(key, stages, native)) {
 		return;
 	}
-	const auto layout = LibraryLayout(LayoutKey(key, native), key, stages, native);
+	const auto layout = LibraryLayout(GraphicsLayoutKey(stages, native), key, stages, native);
 	if (layout == nullptr) {
 		return;
 	}
 	for (const auto part: {PipelineLibraryPart::FragmentShader, PipelineLibraryPart::PreRasterization}) {
-		(void)Request(part, PartKey(part, key, stages, native), key, stages, native, layout, false, true);
+		(void)Request(part, PartKey(part, key, stages, layout), key, stages, native, layout, false, true);
 	}
 }
 
@@ -397,18 +432,18 @@ void PipelineLibraries::BuildIfQueued(const std::shared_ptr<Library>& library) {
 }
 
 void PipelineLibraries::PrepareNow(const GraphicsPipelineKey& key, const Stages& stages, bool native) {
-	if (!Eligible(stages)) {
+	if (!Eligible(stages) || SpeculationCovered(key, stages, native)) {
 		return;
 	}
-	const auto layout = LibraryLayout(LayoutKey(key, native), key, stages, native);
+	const auto layout = LibraryLayout(GraphicsLayoutKey(stages, native), key, stages, native);
 	if (layout == nullptr) {
 		return;
 	}
 	const auto fragment_shader = Request(PipelineLibraryPart::FragmentShader,
-	                                     PartKey(PipelineLibraryPart::FragmentShader, key, stages, native), key,
+	                                     PartKey(PipelineLibraryPart::FragmentShader, key, stages, layout), key,
 	                                     stages, native, layout, false, true);
 	const auto pre_rasterization = Request(PipelineLibraryPart::PreRasterization,
-	                                       PartKey(PipelineLibraryPart::PreRasterization, key, stages, native), key,
+	                                       PartKey(PipelineLibraryPart::PreRasterization, key, stages, layout), key,
 	                                       stages, native, layout, false, true);
 	BuildIfQueued(fragment_shader);
 	BuildIfQueued(pre_rasterization);
@@ -490,14 +525,14 @@ void PipelineLibraries::LogStats() {
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "[kyty-gpl] libraries built vi {} fo {} pr {} ({:.1f} ms avg) fs {} ({:.1f} ms avg); linked {} "
 	    "({:.3f} ms avg); waited {:.3f} s; ahead requested {} used {}; claimed {}; failed {}; whole in "
-	    "background {} ({:.1f} ms avg); built ahead {}\n",
+	    "background {} ({:.1f} ms avg); built ahead {}; ahead covered by prepared pipeline {}\n",
 	    built[0], built[3], built[1], avg_ms(build_ns[1], built[1]), built[2], avg_ms(build_ns[2], built[2]),
 	    linked, avg_ms(m_link_ns.load(std::memory_order_relaxed), linked),
 	    static_cast<double>(m_wait_ns.load(std::memory_order_relaxed)) / 1e9,
 	    m_ahead_requested.load(std::memory_order_relaxed), m_ahead_used.load(std::memory_order_relaxed),
 	    m_claimed.load(std::memory_order_relaxed), m_failed.load(std::memory_order_relaxed), optimized,
 	    avg_ms(m_optimized_ns.load(std::memory_order_relaxed), optimized),
-	    m_built_ahead.load(std::memory_order_relaxed)));
+	    m_built_ahead.load(std::memory_order_relaxed), m_ahead_covered.load(std::memory_order_relaxed)));
 }
 
 }

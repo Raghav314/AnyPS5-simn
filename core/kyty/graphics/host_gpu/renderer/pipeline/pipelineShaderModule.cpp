@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineShaderOptions.h"
 
 #include "common/debugCounters.h"
+#include "common/hackNotice.h"
 #if defined(ANYPS5_KYTY)
 #include "common/fallback.h"
 #endif
@@ -14,6 +15,8 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
+#include "graphics/shader/recompiler/ir/passes/RayQueryResults.h"
 #include "graphics/shader/shaderCompiler.h"
 
 #include <algorithm>
@@ -110,7 +113,6 @@ void SetShaderCompileOptions(ShaderRecompiler::CompileOptions& options, uint64_t
 	options.dump_ir            = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
 	options.native_ray_tracing = native;
-	options.ray_stats          = native && Config::RayTracingStatsEnabled();
 	options.rt_oracle          = native ? Config::RayTracingOracle() : 0u;
 	options.wave_lane_pairs    = lane_pairs;
 }
@@ -214,7 +216,23 @@ void PipelineCache::SetHostInput(ManifestModule& module) const {
 	}
 }
 
-ShaderModule PipelineCache::BuildModule(const ProgramKey&                                  key,
+uint32_t RayTracingModuleMode(ShaderBvh bvh, ShaderType stage, bool native, bool emulation, uint32_t oracle) {
+	if (bvh == ShaderBvh::None) return 0;
+	const uint32_t mode = emulation ? 0u : 1u;
+	if (!native || bvh == ShaderBvh::Bvh8Only) return mode;
+	using namespace ShaderRecompiler::IR;
+	if (stage == ShaderType::Pixel) {
+		if ((oracle & (OraclePixel | OracleRemaining)) != (OraclePixel | OracleRemaining)) return mode;
+	} else if (stage != ShaderType::Compute) {
+		return mode;
+	}
+	oracle &= ~OraclePixel;
+	if (!emulation && (oracle & OracleRemaining) != 0) oracle |= OracleResults;
+	return mode | 2u | (oracle << 2u);
+}
+
+
+std::optional<ShaderModule> PipelineCache::BuildModule(const ProgramKey&                                  key,
                                        const ShaderRecompiler::CompileOptions&            options,
                                        ShaderRecompiler::TranslateResult                  translated,
                                        const ShaderRecompiler::IR::ResourceSpecialization& specialization,
@@ -228,9 +246,20 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 	const auto profile         = SpirvProfile(m_graphics);
 	auto       compile_options = options;
 	compile_options.profile    = &profile;
+	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	compile_options.sampler_limit = std::min(limits.maxPerStageDescriptorSamplers, limits.maxDescriptorSetSamplers);
 	compile_options.plain_mip_stats_variant = key.stage == ShaderType::Pixel;
+	const auto bvh = translated.bvh;
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), compile_options,
 	                                               specialization, push_data_cursor);
+	if (result.required_samplers > compile_options.sampler_limit) {
+		const auto reason = fmt::format("{} sampler descriptors exceed the device limit of {}",
+		                                result.required_samplers, compile_options.sampler_limit);
+		Common::HackNotice::Report("shader exceeds sampler descriptor budget", "PipelineCache::BuildModule",
+		                           key.hash, result.required_samplers, reason);
+		if (table_refusal != nullptr) *table_refusal = reason;
+		return {};
+	}
 	if (compile_options.table_mode && result.spirv.empty()) {
 		if (table_refusal != nullptr) *table_refusal = std::move(result.table_refusal);
 		return {};
@@ -241,6 +270,10 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
 	                            info.bindings.push_data_start_dword, specialization);
 	inputs.Raw(function_code.data(), function_code.size_bytes());
+	if (bvh != ShaderBvh::None) {
+		const auto digest = [](std::span<const uint32_t> words) { return XXH3_64bits(words.data(), words.size_bytes()); };
+		ShaderRecompiler::IR::IoAll(inputs, info, digest(result.spirv), digest(result.spirv_plain));
+	}
 	const auto id = XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
@@ -248,11 +281,16 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
 	ShaderModule module {
 	    .id             = id,
-	    .module         = CompileSPV(result.spirv, m_graphics.device),
 	    .info           = std::move(info),
 	    .specialization = specialization,
 	    .function_code  = {function_code.begin(), function_code.end()},
+	    .guest_traversal = key.guest_traversal,
+	    .bvh             = bvh,
+	    .rt_mode         = RayTracingModuleMode(bvh, key.stage, options.native_ray_tracing, options.rt_emulation, options.rt_oracle),
 	};
+	const std::array<const ShaderModule*, 1> stages {&module};
+	if (!SampledDescriptorBudgetFits(stages)) return {};
+	module.module = CompileSPV(result.spirv, m_graphics.device);
 	module.spirv_words = static_cast<uint32_t>(result.spirv.size());
 	if (key.stage == ShaderType::Vertex || key.stage == ShaderType::Local) {
 		module.vertex_formats = VertexInputFormats(*options.input_info.vertex, module.info);
@@ -261,8 +299,6 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
 	} else if (key.stage == ShaderType::Mesh) {
 		module.mesh_task = options.input_info.vertex->indirect_draw;
-	} else if (key.stage == ShaderType::Compute) {
-		module.guest_traversal = RayTracing::NativeTraversals() && !options.native_ray_tracing;
 	}
 	if (!result.spirv_plain.empty()) {
 		ValidateShaderSpirv(stage, key.hash, result.spirv_plain, profile.maintenance8);

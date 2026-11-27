@@ -73,7 +73,7 @@ DescriptorHeap::DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master
 
 DescriptorHeap::~DescriptorHeap() {
 	m_graphics.device.destroyDescriptorPool(m_current_pool.pool, nullptr);
-	for (const auto pool: m_persistent_pools) {
+	for (const auto& [set, pool]: m_persistent_pools) {
 		m_graphics.device.destroyDescriptorPool(pool, nullptr);
 	}
 	for (const auto& [pool, tick]: m_pending_pools) {
@@ -135,14 +135,34 @@ vk::DescriptorSet DescriptorHeap::CommitPersistent(vk::DescriptorSetLayout layou
 	vk::DescriptorPool pool;
 	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &pool) !=
 	        vk::Result::eSuccess);
-	m_persistent_pools.push_back(pool);
 	vk::DescriptorSetAllocateInfo allocate {};
 	allocate.descriptorPool     = pool;
 	allocate.descriptorSetCount = 1;
 	allocate.pSetLayouts        = &layout;
 	vk::DescriptorSet set;
 	EXIT_IF(m_graphics.device.allocateDescriptorSets(&allocate, &set) != vk::Result::eSuccess);
+	m_persistent_pools.emplace(set, pool);
 	return set;
+}
+
+void DescriptorHeap::ReleasePersistent(vk::DescriptorSet set) {
+	if (set) {
+		const auto pool = m_persistent_pools.find(set);
+		EXIT_IF(pool == m_persistent_pools.end());
+		m_graphics.device.destroyDescriptorPool(pool->second, nullptr);
+		m_persistent_pools.erase(pool);
+	}
+}
+
+void DescriptorHeap::TrimCompletedPools() {
+	if (m_pending_pools.size() < 2) {
+		return;
+	}
+	m_master_semaphore.Refresh();
+	while (m_pending_pools.size() > 1 && m_master_semaphore.IsFree(m_pending_pools[1].second)) {
+		m_graphics.device.destroyDescriptorPool(m_pending_pools.front().first.pool, nullptr);
+		m_pending_pools.pop_front();
+	}
 }
 
 const std::vector<vk::DescriptorPoolSize>&

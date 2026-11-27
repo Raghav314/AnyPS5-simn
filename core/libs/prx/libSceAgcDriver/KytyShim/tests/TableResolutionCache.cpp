@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/tableResolutionCache.h"
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -284,7 +285,56 @@ void RebuildsPerFrame() {
 	      "frames: the default cache holds 200 programs, each rebuilt once");
 }
 
+void StageTableVisits() {
+	PreparedBindings vertex;
+	PreparedBindings pixel;
+	std::array<uint64_t, 3> vertex_marks {};
+	std::array<uint64_t, 2> pixel_marks {};
+	constexpr uint64_t stamp = (uint64_t {1} << 32) + 1;
+	vertex.MarkTableElement(vertex_marks, stamp, 2);
+	pixel.MarkTableElement(pixel_marks, stamp, 0);
+	vertex.MarkTableElement(vertex_marks, stamp, 2);
+	vertex.MarkTableElement(vertex_marks, stamp, 1);
+	pixel.MarkTableElement(pixel_marks, stamp, 0);
+	Check(vertex.table_visits == std::vector<uint32_t> {2, 1}, "vertex rebind keeps its prepared visits");
+	Check(pixel.table_visits == std::vector<uint32_t> {0}, "pixel rebind keeps its prepared visits");
+	pixel.table_visits.clear();
+	pixel.MarkTableElement(pixel_marks, stamp + 1, 0);
+	Check(pixel.table_visits == std::vector<uint32_t> {0}, "pixel visit repeats on the next stamp");
+	Check(vertex.table_visits == std::vector<uint32_t> {2, 1}, "next pixel stamp leaves vertex visits intact");
+}
+
+void RecycledImageSlot() {
+	struct Owner {
+		uint64_t serial;
+		uint32_t levels;
+	};
+	Common::SlotVector<Owner> images;
+	const auto id = images.insert(Owner {1, 5});
+	TextureBinding binding;
+	binding.image_id = id;
+	binding.table_serial = images[id].serial;
+	binding.desc.view_info.base_level = 1;
+	binding.desc.view_info.level_count = 4;
+	const auto end = binding.desc.view_info.base_level + binding.desc.view_info.level_count;
+	const auto original = binding.TableImage();
+	Check(end <= images[id].levels, "original image contains the full mip range");
+	Check(original.Get(images) == &images[id], "table finds its original image");
+	images.erase(id);
+	Check(original.Get(images) == nullptr, "released image is no longer available");
+	const auto replacement = images.insert(Owner {2, 3});
+	Check(replacement == id && end > images[replacement].levels,
+	      "replacement reuses the slot with a shorter mip chain");
+	Check(original.Get(images) == nullptr, "recycled slot cannot serve the original image");
+	binding.image_id = replacement;
+	binding.table_serial = images[replacement].serial;
+	Check(binding.TableImage() != original && binding.TableImage().Get(images) == &images[replacement],
+	      "new resolution identifies the replacement owner");
+}
+
 int CacheTests() {
+	StageTableVisits();
+	RecycledImageSlot();
 	EvictionKeepsOtherStates();
 	EvictionBetweenPrepareAndFinish();
 	RewrittenTableInvalidatesItsStates();

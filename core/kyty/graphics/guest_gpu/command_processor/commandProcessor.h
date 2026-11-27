@@ -117,8 +117,8 @@ public:
 	void PrepareCpuFlip(uint64_t request_id);
 	void DeferEopInterrupt(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
-	                    uint32_t mode);
-	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
+	                    uint32_t mode, std::span<const uint32_t> packet = {});
+	void DispatchIndirect(uint64_t args_addr, uint32_t mode, std::span<const uint32_t> packet = {});
 	void WaitFlipDone(const uint64_t* label);
 	void ProcessPssr(const Pssr::Request& request);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);

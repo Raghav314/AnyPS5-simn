@@ -458,7 +458,7 @@ KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 	uint32_t thread_group_z = buffer[2];
 	uint32_t mode           = buffer[3];
 
-	cp.DispatchDirect(thread_group_x, thread_group_y, thread_group_z, mode);
+	cp.DispatchDirect(thread_group_x, thread_group_y, thread_group_z, mode, {buffer - 1, 5});
 
 	return KYTY_PM4_LEN(cmd_id) - 1;
 }
@@ -469,13 +469,13 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
 
 	if (cmd_id == 0xc0021600) {
-		cp.DispatchIndirect(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u), buffer[2]);
+		cp.DispatchIndirect(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u), buffer[2], {buffer - 1, 4});
 		return 3;
 	}
 
 	const auto base_addr = cp.GetDispatchIndirectArgsBaseAddress();
 	EXIT_NOT_IMPLEMENTED(base_addr == 0);
-	cp.DispatchIndirect(base_addr + buffer[0], buffer[1]);
+	cp.DispatchIndirect(base_addr + buffer[0], buffer[1], {buffer - 1, 3});
 
 	return 2;
 }

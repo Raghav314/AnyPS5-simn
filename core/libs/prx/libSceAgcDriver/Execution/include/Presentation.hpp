@@ -16,6 +16,8 @@ namespace AgcDriver {
 
 class FrameTiming;
 
+using PresentationIdle = void (*)(bool (*flipReady)(void*), void* context);
+
 struct PresentationWindow {
     void* context;
     std::span<const char* const> extensions;
@@ -24,6 +26,9 @@ struct PresentationWindow {
     std::uint32_t width;
     std::uint32_t height;
     std::shared_ptr<FrameTiming> timing;
+    PresentationIdle* idle = nullptr;
+    void (*pumpEvents)() = nullptr;
+    bool (*recentFlip)() = nullptr;
 };
 
 }

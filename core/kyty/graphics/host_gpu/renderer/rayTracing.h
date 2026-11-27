@@ -6,6 +6,8 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/RayQuery.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <array>
 #include <atomic>
@@ -77,6 +79,7 @@ public:
 	                                         TlasSource& source) noexcept;
 	[[nodiscard]] static bool FindGuestTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
 	                                              TlasSource& source) noexcept;
+	[[nodiscard]] static TlasSource ExtraTlasSource(const ShaderRecompiler::IR::RayQueryExtraSource& extra) noexcept;
 
 	using GuestTlas = RayTracingGuestTlas;
 	[[nodiscard]] GuestTlas ReadGuestTlas(uint64_t header, const TlasSource& source,
@@ -88,7 +91,8 @@ public:
 
 	void Prepare(const CommandRecorder& command, uint64_t user_pointer, const TlasSource& source,
 	             const vk::DescriptorBufferInfo& flattened_srt, uint64_t frame, uint64_t shader_hash,
-	             bool count_rays = false, bool per_lane = false);
+	             bool count_rays = false, bool per_lane = false, uint32_t context = 0);
+	void InvalidateContext(const CommandRecorder& command, uint32_t context);
 
 	struct Preparation {
 		uint64_t                tick         = 0;
@@ -168,7 +172,7 @@ public:
 	[[nodiscard]] uint64_t LastPreparation() const noexcept { return m_preparations.load(std::memory_order_acquire); }
 	[[nodiscard]] std::optional<PreparationOutcome> Outcome(uint64_t preparation) const;
 
-	static constexpr uint32_t MaxContexts = 4;
+	static constexpr uint32_t MaxContexts = 32;
 	static constexpr uint64_t EvictFrames = 1800;
 
 private:
@@ -296,7 +300,13 @@ private:
 
 	void CreatePipelines();
 	void CreateBuffers();
+	struct TlasObject {
+		std::unique_ptr<Buffer>      storage;
+		vk::AccelerationStructureKHR handle  = nullptr;
+		vk::DeviceAddress            address = 0;
+	};
 	void CreateTlas(uint32_t capacity);
+	void CreateTlasObject(TlasObject& tlas, uint32_t capacity);
 	bool CreateSlot(const PendingSlot& pending);
 	uint32_t CreateHostSlot(uint64_t blas_va, const SlotSizes& sizes);
 	[[nodiscard]] uint32_t FindHostSlotIndex(uint64_t blas_va) const;
@@ -345,16 +355,14 @@ private:
 	std::unique_ptr<Buffer> m_jobs;
 	std::unique_ptr<Buffer> m_layouts;
 	std::unique_ptr<Buffer> m_build_scratch;
-	std::unique_ptr<Buffer> m_tlas_storage;
 	std::unique_ptr<StreamBuffer> m_upload;
-	vk::AccelerationStructureKHR m_tlas         = nullptr;
-	vk::DeviceAddress            m_tlas_address = 0;
+	std::array<TlasObject, MaxContexts> m_tlases;
 	uint64_t                     m_tlas_scratch_size = 0;
 	uint32_t                     m_tlas_capacity     = 0;
 	uint64_t                     m_context_address   = 0;
 	Arena                        m_arena;
 
-	std::array<Readback, 32> m_readbacks;
+	std::array<Readback, 32 + MaxContexts> m_readbacks;
 	Preparation              m_reuse {};
 	bool                     m_reusable = false;
 	std::atomic<uint64_t>    m_generation {0};

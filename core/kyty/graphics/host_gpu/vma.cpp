@@ -20,8 +20,14 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <string_view>
+#include <charconv>
+#include <atomic>
+#include <array>
 #include <cinttypes>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -143,6 +149,59 @@ void DestroyRecycledImages(VmaAllocator allocator) {
 
 }
 
+static uint64_t MemoryBudgetCap() {
+	static const uint64_t cap = []() -> uint64_t {
+		const char* value = std::getenv("KYTY_MEMORY_BUDGET_MB");
+		if (value == nullptr || value[0] == '\0') {
+			return UINT64_MAX;
+		}
+		const std::string_view text(value);
+		uint64_t               mib = 0;
+		const auto [end, error]    = std::from_chars(text.data(), text.data() + text.size(), mib, 10);
+		if (error != std::errc() || end != text.data() + text.size() || mib == 0 || mib > (UINT64_MAX >> 20u)) {
+			std::fprintf(stderr, "KYTY_MEMORY_BUDGET_MB: '%s' is not a positive number of MiB; the automatic limit applies\n",
+			             value);
+			return UINT64_MAX;
+		}
+		return mib << 20u;
+	}();
+	return cap;
+}
+
+static std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> HeapSizeLimits(const GraphicContext& graphics) {
+	constexpr uint64_t DesktopReserve = 3072ull << 20u;
+	constexpr uint64_t LargeHeap      = 4ull << 30u;
+	std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> limits {};
+	limits.fill(VK_WHOLE_SIZE);
+	if (graphics.physical_device_properties.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) {
+		return limits;
+	}
+	vk::PhysicalDeviceMemoryBudgetPropertiesEXT budgets {};
+	vk::PhysicalDeviceMemoryProperties2         memory {};
+	if (graphics.memory_budget_ext_enabled) {
+		memory.pNext = &budgets;
+	}
+	graphics.physical_device.getMemoryProperties2(&memory);
+	const auto& heaps = memory.memoryProperties;
+	for (uint32_t heap = 0; heap < heaps.memoryHeapCount; heap++) {
+		const uint64_t size = heaps.memoryHeaps[heap].size;
+		if (!(heaps.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) || size < LargeHeap) {
+			continue;
+		}
+		const uint64_t available = graphics.memory_budget_ext_enabled && budgets.heapBudget[heap] != 0
+		                               ? std::min<uint64_t>(budgets.heapBudget[heap], size)
+		                               : size;
+		const uint64_t forced  = MemoryBudgetCap();
+		const uint64_t reserve = std::min(DesktopReserve, available / 4);
+		const uint64_t limit   = forced != UINT64_MAX ? std::min(forced, size) : available - reserve;
+		limits[heap] = limit;
+		std::fprintf(stderr, "Vulkan memory: device-local heap %u of %" PRIu64 " MiB limited to %" PRIu64 " MiB (%s)\n",
+		             heap, size >> 20u, limit >> 20u,
+		             forced != UINT64_MAX ? "KYTY_MEMORY_BUDGET_MB" : "budget less the desktop reserve");
+	}
+	return limits;
+}
+
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(instance == nullptr || physical_device == nullptr || device == nullptr ||
@@ -163,11 +222,22 @@ bool GraphicContext::CreateAllocator() {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
 	info.preferredLargeHeapBlockSize = 64ull * 1024 * 1024;
+	const auto heap_limits = HeapSizeLimits(*this);
+	info.pHeapSizeLimit    = heap_limits.data();
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
+	}
+	if (std::any_of(heap_limits.begin(), heap_limits.end(), [](VkDeviceSize limit) { return limit != VK_WHOLE_SIZE; })) {
+		info.pHeapSizeLimit = nullptr;
+		const auto spill    = static_cast<vk::Result>(vmaCreateAllocator(&info, &spill_allocator));
+		if (spill != vk::Result::eSuccess) {
+			std::fprintf(stderr, "Vulkan memory: no spill allocator (%s): an allocation past the heap limits fails\n",
+			             vk::to_string(spill).c_str());
+			spill_allocator = nullptr;
+		}
 	}
 	return true;
 }
@@ -179,6 +249,10 @@ void GraphicContext::DestroyAllocator() {
 	DestroyRecycledImages(allocator);
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
+	if (spill_allocator != nullptr) {
+		vmaDestroyAllocator(spill_allocator);
+		spill_allocator = nullptr;
+	}
 }
 
 void GraphicContext::LogMemoryBudget() const {
@@ -266,14 +340,51 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 		}
 	}
 	if (discrete) {
-		return budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
+		return std::min(budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024), MemoryBudgetCap());
 	}
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
 	const auto         available      = budget > usage ? budget - usage : uint64_t {0};
-	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
+	return std::min(std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0}),
+	                MemoryBudgetCap());
 }
 
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
+	return CreateImage(image_info, image, false);
+}
+
+static uint32_t BindlessImageSpillTypes(const GraphicContext& graphics) {
+	if (graphics.spill_allocator == nullptr) {
+		return 0;
+	}
+	const VkPhysicalDeviceMemoryProperties* limited = nullptr;
+	vmaGetMemoryProperties(graphics.allocator, &limited);
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(graphics.allocator, budgets);
+	const auto& physical = graphics.physical_device_memory_properties;
+	bool pressure = false;
+	for (uint32_t heap = 0; heap < limited->memoryHeapCount; ++heap) {
+		const auto limit = limited->memoryHeaps[heap].size;
+		if (limit < physical.memoryHeaps[heap].size &&
+		    budgets[heap].statistics.blockBytes >= limit - limit / 4) {
+			pressure = true;
+			break;
+		}
+	}
+	if (!pressure) {
+		return 0;
+	}
+	uint32_t types = 0;
+	for (uint32_t type = 0; type < limited->memoryTypeCount; ++type) {
+		const auto heap = limited->memoryTypes[type].heapIndex;
+		if (!(limited->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) {
+			types |= uint32_t {1} << type;
+		}
+	}
+	return types;
+}
+
+bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image,
+                                 bool bindless) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
@@ -296,14 +407,54 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		}
 	}
 	if (native_image == VK_NULL_HANDLE) {
-		auto result = static_cast<vk::Result>(vmaCreateImage(
-		    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &alloc_info,
-		    &native_image, &image.allocation, nullptr));
+		const auto* create = static_cast<const vk::ImageCreateInfo::NativeType*>(image_info);
+		auto result = vk::Result::eErrorOutOfDeviceMemory;
+		if (const uint32_t types = bindless ? BindlessImageSpillTypes(*this) : 0; types != 0) {
+			VmaAllocationCreateInfo spill_info {};
+			spill_info.flags          = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+			spill_info.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			spill_info.memoryTypeBits = types;
+			result = static_cast<vk::Result>(vmaCreateImage(
+			    spill_allocator, create, &spill_info, &native_image, &image.allocation, nullptr));
+			image.spilled = result == vk::Result::eSuccess;
+		}
+		if (result != vk::Result::eSuccess) {
+			result = static_cast<vk::Result>(vmaCreateImage(
+			    allocator, create, &alloc_info, &native_image, &image.allocation, nullptr));
+		}
 		if (result != vk::Result::eSuccess) {
 			DestroyRecycledImages(allocator);
 			result = static_cast<vk::Result>(vmaCreateImage(
-			    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-			    &alloc_info, &native_image, &image.allocation, nullptr));
+			    allocator, create, &alloc_info, &native_image, &image.allocation, nullptr));
+		}
+		if (result != vk::Result::eSuccess && spill_allocator != nullptr) {
+			VmaAllocationCreateInfo spill_info {};
+			spill_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			result           = static_cast<vk::Result>(vmaCreateImage(
+			    spill_allocator, create, &spill_info, &native_image, &image.allocation, nullptr));
+			if (result == vk::Result::eSuccess) {
+				image.spilled = true;
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+					LOGF("Vulkan memory: an image of %ux%u past the heap limit is placed by the spill allocator\n",
+					     image_info.extent.width, image_info.extent.height);
+				}
+			}
+		}
+		if (result != vk::Result::eSuccess && spill_allocator != nullptr) {
+			VmaAllocationCreateInfo spill_info {};
+			spill_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			result           = static_cast<vk::Result>(vmaCreateImage(
+                spill_allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &spill_info,
+                &native_image, &image.allocation, nullptr));
+			if (result == vk::Result::eSuccess) {
+				image.spilled = true;
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+					LOGF("Vulkan memory: an image of %ux%u past the heap limit is placed by the spill allocator\n",
+					     image_info.extent.width, image_info.extent.height);
+				}
+			}
 		}
 		if (result != vk::Result::eSuccess) {
 			image.image = native_image;
@@ -320,7 +471,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	image.mip_levels = image_info.mipLevels;
 	image.samples    = static_cast<uint32_t>(image_info.samples);
 	image.usage      = image_info.usage;
-	image.recyclable = Recyclable(image_info);
+	image.recyclable = Recyclable(image_info) && !image.spilled;
 	image.flags      = image_info.flags;
 	image.state      = {.layout = image_info.initialLayout};
 	image.subresource_states.clear();
@@ -357,10 +508,11 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 			g_recycled.erase(g_recycled.begin());
 		}
 	} else {
-		Graveyard().Push(allocator, image.image, image.allocation);
+		Graveyard().Push(image.spilled ? spill_allocator : allocator, image.image, image.allocation);
 	}
 	image.image      = nullptr;
 	image.allocation = nullptr;
+	image.spilled    = false;
 }
 
 void GraphicContext::TrimRecycledImages() {

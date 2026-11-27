@@ -52,6 +52,11 @@ uint64_t WidthMask(uint32_t width) {
 
 class Store {
 public:
+	void Unbounded(uint32_t form) {
+		if (std::ranges::find(m_unbounded, form) == m_unbounded.end()) m_unbounded.push_back(form);
+	}
+	[[nodiscard]] const std::vector<uint32_t>& UnboundedBases() const { return m_unbounded; }
+
 	uint32_t Atomic(Kind kind, uint32_t width, Key args, const Inst* inst = nullptr) {
 		Key key {static_cast<uint64_t>(kind), width, reinterpret_cast<uintptr_t>(inst)};
 		key.insert(key.end(), args.begin(), args.end());
@@ -202,6 +207,7 @@ private:
 	}
 
 	std::vector<Atom>             m_atoms;
+	std::vector<uint32_t>         m_unbounded;
 	std::map<Key, uint32_t>       m_atom_ids;
 	std::vector<Form>             m_forms;
 	std::map<Form, uint32_t>      m_form_ids;
@@ -588,6 +594,104 @@ public:
 		return result;
 	}
 
+	static bool Low16(Value value) {
+		value = value.Resolve();
+		if (const auto word = ImmediateU32(value)) return *word <= 0xffffu;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return false;
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::BitwiseAnd32:
+				return (ImmediateU32(inst->Arg(0)) && *ImmediateU32(inst->Arg(0)) <= 0xffffu) ||
+				       (ImmediateU32(inst->Arg(1)) && *ImmediateU32(inst->Arg(1)) <= 0xffffu);
+			case ValueOpcode::ShiftRightLogical32: {
+				const auto shift = ImmediateU32(inst->Arg(1));
+				return shift && *shift >= 16u && *shift < 32u;
+			}
+			default: return false;
+		}
+	}
+
+	Choices LoadedBufferAddress(const Inst& load) {
+		const auto& memory = m_program.memory_info[load.Flags<MemoryFlags>().index];
+		const auto* buffer = ProducerOf(load.Arg(0), ValueOpcode::GetBufferResource);
+		if (buffer == nullptr || memory.typed || memory.formatted || memory.data_bits != 32u) return {};
+		if (const auto word3 = ImmediateU32(buffer->Arg(3)); !word3 || (*word3 & (1u << 23u)) != 0u) return {};
+		Value          high   = buffer->Arg(1).Resolve();
+		uint32_t       stride = 0;
+		bool           known  = false;
+		bool           proven = true;
+		if (const auto word = ImmediateU32(high)) {
+			if ((*word >> 30u) != 0u) return {};
+			known  = true;
+			stride = *word >> 16u & 0x3fffu;
+			high   = Value(*word & 0xffffu);
+		} else if (const auto* merged = ProducerOf(high, ValueOpcode::BitwiseOr32)) {
+			for (uint32_t side = 0; side < 2; ++side) {
+				const auto bits = ImmediateU32(merged->Arg(side));
+				if (!bits || (*bits & 0xffffu) != 0u || (*bits >> 30u) != 0u) continue;
+				known  = true;
+				proven = Low16(merged->Arg(1 - side));
+				stride = *bits >> 16u & 0x3fffu;
+				high   = merged->Arg(1 - side);
+				break;
+			}
+		}
+		if (!known || (memory.idxen && stride == 0u)) return {};
+		Choices offsets {m_store.Constant(64, memory.offset)};
+		const auto add_words = [&](Value value, uint64_t scale) {
+			if (ImmediateU32(value) == 0u) return;
+			Choices next;
+			for (const auto offset: offsets) {
+				for (const auto word: Word(value)) next.push_back(m_store.Add(offset, m_store.Scale(m_store.Widen(word), scale)));
+			}
+			Cap(next);
+			offsets = std::move(next);
+		};
+		if (memory.idxen) add_words(load.Arg(1), stride);
+		if (memory.offen) add_words(load.Arg(2), 1);
+		add_words(load.Arg(3), 1);
+		Choices result;
+		for (const auto base: Pair(buffer->Arg(0), high)) {
+			if (!proven) m_store.Unbounded(base);
+			for (const auto offset: offsets) result.push_back(m_store.Add(base, offset));
+		}
+		Cap(result);
+		return result;
+	}
+
+	Choices LoadedBufferWord(const Inst& load, uint32_t component) {
+		Choices result;
+		for (const auto address: LoadedBufferAddress(load)) {
+			result.push_back(m_store.Of(m_store.Atomic(Kind::Load, 32, {m_store.Add(address, m_store.Constant(64, component * 4u)), 4}), 32));
+		}
+		return result;
+	}
+
+	[[nodiscard]] static bool LoadsBufferWords(const Inst& inst) {
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::LoadBufferU32:
+			case ValueOpcode::LoadBufferU32x2:
+			case ValueOpcode::LoadBufferU32x3:
+			case ValueOpcode::LoadBufferU32x4: return true;
+			default: return false;
+		}
+	}
+
+	[[nodiscard]] static const Inst* BufferWordRead(Value value) {
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst == nullptr) return nullptr;
+		if (inst->GetOpcode() == ValueOpcode::LoadBufferU32) return inst;
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::CompositeExtractU32x2:
+			case ValueOpcode::CompositeExtractU32x3:
+			case ValueOpcode::CompositeExtractU32x4: {
+				const auto* load = inst->Arg(0).Resolve().TryInstruction();
+				return load != nullptr && LoadsBufferWords(*load) ? inst : nullptr;
+			}
+			default: return nullptr;
+		}
+	}
+
 	std::vector<FForm> Float(Value value, const World& world, uint32_t depth = 0) {
 		value = value.Resolve();
 		if (depth > 48) return {};
@@ -595,7 +699,8 @@ public:
 			if (std::ranges::find(world[k], value) != world[k].end()) return {Single(k, One)};
 		}
 		if (const auto* read = value.TryInstruction();
-		    read != nullptr && (read->GetOpcode() == ValueOpcode::ReadConstBuffer || read->GetOpcode() == ValueOpcode::LoadAddressU32)) {
+		    read != nullptr && (read->GetOpcode() == ValueOpcode::ReadConstBuffer || read->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+		                        BufferWordRead(value) != nullptr)) {
 			const auto words = Word(value);
 			for (uint32_t k = 0; k < 6 && words.size() == 1; ++k) {
 				for (const auto other: world[k]) {
@@ -603,6 +708,21 @@ public:
 					if (same == nullptr || same == read || same->GetOpcode() != read->GetOpcode()) continue;
 					const auto theirs = Word(other);
 					if (theirs.size() == 1 && theirs.front() == words.front()) return {Single(k, One)};
+				}
+			}
+		}
+		if (const auto mine = SignedRead(value)) {
+			const auto* read  = mine->first.TryInstruction();
+			const auto  words = Word(mine->first);
+			for (uint32_t k = 0; k < 6; ++k) {
+				for (const auto other: world[k]) {
+					const auto theirs = SignedRead(other);
+					if (!theirs || theirs->second != mine->second) continue;
+					const auto* same_read = theirs->first.TryInstruction();
+					if (same_read == read) return {Single(k, One)};
+					if (same_read->GetOpcode() != read->GetOpcode() || words.size() != 1) continue;
+					const auto same = Word(theirs->first);
+					if (same.size() == 1 && same.front() == words.front()) return {Single(k, One)};
 				}
 			}
 		}
@@ -619,6 +739,27 @@ public:
 		auto result = FloatOf(*inst, value, world, depth);
 		m_floats[inst] = result;
 		return result;
+	}
+
+	std::optional<std::pair<Value, bool>> SignedRead(Value value) {
+		bool negated = false;
+		for (uint32_t depth = 0; depth < 8; ++depth) {
+			value            = value.Resolve();
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr) return std::nullopt;
+			switch (inst->GetOpcode()) {
+				case ValueOpcode::BitCastF32U32:
+				case ValueOpcode::BitCastU32F32: value = inst->Arg(0); continue;
+				case ValueOpcode::FPNeg32:
+					negated = !negated;
+					value   = inst->Arg(0);
+					continue;
+				case ValueOpcode::ReadConstBuffer:
+				case ValueOpcode::LoadAddressU32: return std::pair {value, negated};
+				default: return BufferWordRead(value) != nullptr ? std::optional {std::pair {value, negated}} : std::nullopt;
+			}
+		}
+		return std::nullopt;
 	}
 
 	std::vector<FForm> FloatOf(const Inst& node, Value value, const World& world, uint32_t depth) {
@@ -1047,6 +1188,19 @@ private:
 				for (const auto address: BufferAddress(inst)) result.push_back(m_store.Of(m_store.Atomic(Kind::Load, 32, {address, 4}), 32));
 				return result.empty() ? Choices {Opaque(inst, 32)} : result;
 			}
+			case ValueOpcode::LoadBufferU32: {
+				auto result = LoadedBufferWord(inst, 0);
+				return result.empty() ? Choices {Opaque(inst, 32)} : result;
+			}
+			case ValueOpcode::CompositeExtractU32x2:
+			case ValueOpcode::CompositeExtractU32x3:
+			case ValueOpcode::CompositeExtractU32x4: {
+				const auto* load      = inst.Arg(0).Resolve().TryInstruction();
+				const auto  component = ImmediateU32(inst.Arg(1));
+				if (load == nullptr || !component || !LoadsBufferWords(*load)) return {Opaque(inst, 32)};
+				auto result = LoadedBufferWord(*load, *component);
+				return result.empty() ? Choices {Opaque(inst, 32)} : result;
+			}
 			case ValueOpcode::BitwiseAnd32:
 			case ValueOpcode::BitwiseOr32:
 			case ValueOpcode::BitwiseXor32:
@@ -1427,7 +1581,9 @@ std::vector<std::pair<Value, uint32_t>> NodeSources(const Evaluator& ev, const s
 				break;
 			case ValueOpcode::LoadAddressU32:
 			case ValueOpcode::ReadConstBuffer: found.emplace_back(value, distance); break;
-			default: break;
+			default:
+				if (Evaluator::BufferWordRead(value) != nullptr) found.emplace_back(value, distance);
+				break;
 		}
 	}
 	return found;
@@ -1728,23 +1884,72 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	std::vector<uint32_t> keys;
 	std::vector<std::pair<uint32_t, uint64_t>> inlined;
 	std::optional<bool>   packed;
-	for (const auto& site: sites) {
-		for (const auto& blas: site.blases) {
-			const auto record = RecordOf(store, blas.address, header);
-			if (!record) continue;
-			if (packed && *packed != blas.packed) return Refuse("the BLAS address is read two ways");
-			packed = blas.packed;
-			if (record->indexed) {
-				if (indexed && (indexed->base != record->base || indexed->stride != record->stride || indexed->offset != record->offset)) {
-					return Refuse("several instance record arrays");
+	std::vector<bool> accepted(named_sources.size(), false);
+	for (size_t named = 0; named < named_sources.size(); ++named) {
+		auto                                        own_indexed = indexed;
+		auto                                        own_packed  = packed;
+		std::vector<uint32_t>                       own_keys;
+		std::vector<std::pair<uint32_t, uint64_t>> own_inlined;
+		const char*                                 conflict = nullptr;
+		for (const auto& site: sites) {
+			for (const auto& blas: site.blases) {
+				const auto record = RecordOf(store, blas.address, std::get<1>(named_sources[named]));
+				if (!record) continue;
+				if (own_packed && *own_packed != blas.packed) conflict = "the BLAS address is read two ways";
+				own_packed = blas.packed;
+				if (record->indexed) {
+					if (own_indexed && (own_indexed->base != record->base || own_indexed->stride != record->stride ||
+					                    own_indexed->offset != record->offset)) {
+						conflict = "several instance record arrays";
+					}
+					if (!own_indexed) own_indexed = record;
+					own_keys.push_back(record->key);
+				} else {
+					own_inlined.emplace_back(record->key, record->offset);
 				}
-				if (!indexed) indexed = record;
-				keys.push_back(record->key);
-			} else {
-				inlined.emplace_back(record->key, record->offset);
 			}
 		}
+		if (conflict != nullptr) {
+			if (named == 0) return Refuse(conflict);
+			continue;
+		}
+		accepted[named] = true;
+		indexed         = own_indexed;
+		packed          = own_packed;
+		keys.insert(keys.end(), own_keys.begin(), own_keys.end());
+		inlined.insert(inlined.end(), own_inlined.begin(), own_inlined.end());
 	}
+	const auto record_of = [&](uint32_t address) {
+		for (size_t named = 0; named < named_sources.size(); ++named) {
+			if (!accepted[named]) continue;
+			if (auto record = RecordOf(store, address, std::get<1>(named_sources[named]))) return record;
+		}
+		return std::optional<Record> {};
+	};
+	const auto tied = [&](const Form& form, uint32_t named) {
+		const auto top  = store.F(named);
+		auto       rest = form.terms;
+		for (const auto& term: top.terms) {
+			const auto at = std::ranges::find(rest, term);
+			if (at == rest.end()) return false;
+			rest.erase(at);
+		}
+		if (top.terms.empty() || form.constant < top.constant || form.constant - top.constant > 0xffffu) return false;
+		if (rest.empty()) return true;
+		if (rest.size() != 1 || rest[0].second != 1) return false;
+		const auto& offset = store.A(rest[0].first);
+		if (offset.kind != Kind::Load || offset.args[1] != 8) return false;
+		const auto address = static_cast<uint32_t>(offset.args[0]);
+		return store.Strip(address) == store.Strip(named) && indexed && store.F(address).constant == top.constant + indexed->base;
+	};
+	const auto bounded = [&](uint32_t base) {
+		auto form = store.F(base);
+		if (std::ranges::any_of(named_sources, [&](const auto& named) { return tied(form, std::get<1>(named)); })) return true;
+		if (form.constant > 0xffffu) return false;
+		form.constant = 0;
+		return BlasOf(store, store.Make(form)).has_value();
+	};
+	if (!std::ranges::all_of(store.UnboundedBases(), bounded)) return Refuse("a buffer descriptor's high word is not proven to leave the stride bits clear");
 	if (!indexed) return Refuse("no intersection reads an instance record");
 	if (indexed->offset % 4u != 0) return Refuse("the BLAS address is not a record dword");
 	Fields fields {.indexed_keys = keys};
@@ -1862,7 +2067,10 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 		for (auto* block: program.blocks) {
 			for (auto& inst: *block) {
 				const auto op = inst.GetOpcode();
-				if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) continue;
+				if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer &&
+				    Evaluator::BufferWordRead(Value(&inst)) == nullptr) {
+					continue;
+				}
 				const bool number = std::ranges::any_of(inst.Uses(), [](const Use& use) {
 					return use.user->GetOpcode() == ValueOpcode::BitCastF32U32;
 				});
@@ -2067,7 +2275,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 				for (auto& inst: *block) {
 					if (inst.GetOpcode() != ValueOpcode::LoadAddressU32) continue;
 					const bool blas = std::ranges::any_of(ev.Address(inst), [&](uint32_t address) {
-						const auto record = RecordOf(store, address, header);
+						const auto record = record_of(address);
 						return record && (record->indexed ? record->offset == indexed->offset && record->stride == indexed->stride
 						                                  : record->key == fields.inline_key && !inlined.empty() && record->offset == inlined.front().second);
 					});
@@ -2088,14 +2296,34 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	}
 	OracleWalks walks;
 	std::vector<std::pair<uint32_t, uint32_t>> reach;
+	std::vector<uint32_t> listed(named_sources.size(), UINT32_MAX);
+	for (size_t named = 0; named < named_sources.size(); ++named) {
+		if (!accepted[named]) continue;
+		const auto& source = std::get<0>(named_sources[named]);
+		listed[named]      = static_cast<uint32_t>(walks.headers.size());
+		walks.headers.push_back({source.user_sgpr, source.header_offset, source.header_vsharp, 0, {}});
+	}
 	for (const auto& site: sites) {
 		if (!site.top) continue;
 		Block* header_block = OutermostLoop(program, site.bvh->Parent());
 		if (header_block == nullptr) return Refuse("a top-level intersection is not in a natural loop");
-		if (std::ranges::any_of(walks.loops, [&](const auto& loop) { return loop.first == header_block; })) continue;
-		Block* latch = nullptr;
-		if (!Reach(program, header_block, reach, latch)) return Refuse("the walk has no code range");
-		walks.loops.emplace_back(header_block, latch);
+		const auto known = std::ranges::find_if(walks.loops, [&](const auto& loop) { return loop.first == header_block; });
+		auto       at    = static_cast<size_t>(known - walks.loops.begin());
+		if (known == walks.loops.end()) {
+			Block* latch = nullptr;
+			if (!Reach(program, header_block, reach, latch)) return Refuse("the walk has no code range");
+			walks.loops.emplace_back(header_block, latch);
+			walks.loop_headers.emplace_back();
+			at = walks.loops.size() - 1;
+		}
+		for (const auto base: site.bases) {
+			const auto named = SourceOf(store, base);
+			if (!named) continue;
+			const auto found = std::ranges::find_if(named_sources, [&](const auto& entry) { return std::get<0>(entry) == *named; });
+			const auto index = listed[static_cast<size_t>(found - named_sources.begin())];
+			auto&      list  = walks.loop_headers[at];
+			if (index != UINT32_MAX && std::ranges::find(list, index) == list.end()) list.push_back(index);
+		}
 	}
 	for (const auto& site: sites) {
 		if (std::ranges::none_of(walks.loops, [&](const auto& loop) {
@@ -2111,6 +2339,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 	}
 	std::vector<std::array<size_t, 5>> picks;
 	for (size_t source = 0; source < named_sources.size(); ++source) {
+		if (!accepted[source]) continue;
 		for (size_t count = 0; count < node_counts.size(); ++count) {
 			for (size_t tlas_root = 0; tlas_root < tops.size(); ++tlas_root) {
 				for (size_t root = 0; root < candidates.size() && picks.size() < 4096; ++root) {

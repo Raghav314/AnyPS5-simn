@@ -15,6 +15,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <utility>
 #include <vector>
@@ -27,6 +28,19 @@ class TileManager;
 struct ImageTestAccess;
 
 using ImageId = Common::SlotId;
+
+struct TableImageRef {
+	ImageId  id;
+	uint64_t serial = 0;
+
+	bool operator==(const TableImageRef&) const = default;
+
+	template<class Images>
+	[[nodiscard]] auto Get(Images& images) const {
+		auto* image = images.try_get(id);
+		return image != nullptr && image->serial == serial ? image : nullptr;
+	}
+};
 
 struct CachedImageView {
 	ImageViewInfo info;
@@ -51,10 +65,14 @@ struct ImageBinding {
 class Image final {
 public:
 	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info,
+	      bool bindless);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
 
-	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
+	[[nodiscard]] vk::ImageView FindView(
+	    const ImageViewInfo& view_info,
+	    std::source_location caller = std::source_location::current());
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,

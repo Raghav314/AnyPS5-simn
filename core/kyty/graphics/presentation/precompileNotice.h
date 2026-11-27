@@ -20,6 +20,8 @@ struct PrecompileNotice {
 	uint32_t shaders  = 0;
 	uint32_t waited_pipelines = 0;
 	uint32_t seconds_waited   = 0;
+	uint64_t waiting_hash     = 0;
+	uint32_t waiting_seconds  = 0;
 };
 
 void ShowPrecompileNotice(const PrecompileNotice& notice);
@@ -30,6 +32,9 @@ struct ManifestProgress {
 	uint32_t total     = 0;
 	uint32_t pipelines = 0;
 	uint32_t shaders   = 0;
+	uint64_t cached     = 0;
+	uint64_t translated = 0;
+	uint64_t compiled   = 0;
 };
 
 void ShowManifestProgress(const ManifestProgress& progress);

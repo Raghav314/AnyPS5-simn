@@ -165,6 +165,17 @@ void TestOpus(std::uint32_t context, std::uint32_t mappingFamily = 0) {
     Require(sceAjmBatchStart(context, &info, SCE_AJM_PRIORITY_MIN, &error, &id) == 0 && sceAjmBatchWait(context, id, 0, &error) == 0);
     Require(initResult[0] == 0);
 
+    std::uint32_t batched = 0;
+    Require(sceAjmInstanceCreate(context, 24, 0, &batched) == 0);
+    Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+    Require(sceAjmBatchJobInitialize(&info, batched, parameters, sizeof(parameters), initResult) == 0);
+    Require(sceAjmBatchStart(context, &info, SCE_AJM_PRIORITY_MIN, &error, &id) == 0 && sceAjmBatchWait(context, id, 0, &error) == 0);
+    std::vector<std::int16_t> batchPcm(3 * 960 * 2);
+    DecodeSideband batchResult{};
+    RunDecode(context, batched, OPUS_STEREO, sizeof(OPUS_STEREO), batchPcm.data(), batchPcm.size() * sizeof(std::int16_t), batchResult);
+    Require(batchResult.result == 0 && batchResult.outputWritten == static_cast<std::int32_t>(batchPcm.size() * sizeof(std::int16_t)));
+    Require(sceAjmInstanceDestroy(context, batched) == 0);
+
     std::vector<std::int16_t> pcm(960 * 2);
     std::size_t offset = 0;
     std::int16_t peak = 0;
@@ -177,8 +188,10 @@ void TestOpus(std::uint32_t context, std::uint32_t mappingFamily = 0) {
         if (packet > 0) {
             for (const std::int16_t sample : pcm) peak = std::max<std::int16_t>(peak, static_cast<std::int16_t>(std::abs(sample)));
         }
+        Require(std::equal(pcm.begin(), pcm.end(), batchPcm.begin() + packet * pcm.size()));
         offset += static_cast<std::size_t>(sideband.inputConsumed);
     }
+    Require(static_cast<std::size_t>(batchResult.inputConsumed) == offset);
     Require(peak > 900 && peak < 1200);
 
     std::vector<std::int16_t> small(512 * 2);

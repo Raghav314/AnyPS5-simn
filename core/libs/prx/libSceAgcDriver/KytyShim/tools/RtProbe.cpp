@@ -35,7 +35,6 @@ struct Settings {
 	bool     dump      = false;
 	bool     emit      = false;
 	bool     disabled  = false;
-	bool     stats     = false;
 	bool     pixel     = false;
 	uint32_t inputs    = 8;
 	uint32_t oracle    = 0;
@@ -161,7 +160,6 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 	options.dump_ir               = settings.dump;
 	options.profile               = &profile;
 	options.native_ray_tracing    = !settings.disabled;
-	options.ray_stats             = settings.stats && !settings.disabled;
 	options.rt_oracle             = settings.disabled ? 0u : settings.oracle;
 	options.user_data             = user_data;
 	options.input_info.compute    = &compute;
@@ -203,6 +201,12 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 		std::printf("%s: hypothesis %zu/%zu user_sgpr=%u header=0x%x vsharp=0x%x root=0x%x layout=%08x,%08x,%08x,%08x\n", label, at,
 		            translated.oracle_sources.size(), hypothesis.user_sgpr, hypothesis.header_offset, hypothesis.header_vsharp,
 		            hypothesis.root, hypothesis.layout[0], hypothesis.layout[1], hypothesis.layout[2], hypothesis.layout[3]);
+	}
+	for (size_t at = 0; at < info.ray_query_extra_sources.size(); ++at) {
+		const auto& extra = info.ray_query_extra_sources[at];
+		std::printf("%s: extra source %zu/%zu user_sgpr=%u header=0x%x vsharp=0x%x root=0x%x layout=%08x,%08x,%08x,%08x\n", label, at,
+		            info.ray_query_extra_sources.size(), extra.user_sgpr, extra.header_offset, extra.header_vsharp, extra.root, extra.layout[0],
+		            extra.layout[1], extra.layout[2], extra.layout[3]);
 	}
 	for (size_t at = 0; at < translated.oracle_improvements.size(); ++at) {
 		const auto& improvement = translated.oracle_improvements[at];
@@ -369,7 +373,7 @@ int main(int argc, char** argv) {
 		} else if (arg == "--robust") {
 			settings.robust = true;
 		} else if (arg == "--stats") {
-			settings.stats = true;
+			continue;
 		} else if (arg == "--off") {
 			settings.disabled = true;
 		} else if (arg == "--replay-check") {

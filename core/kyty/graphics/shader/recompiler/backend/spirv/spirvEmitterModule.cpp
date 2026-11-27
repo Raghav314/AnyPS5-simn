@@ -381,7 +381,7 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
+	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma || state.program.loop_guards != 0;
 	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt && !table;
 	bindings.flattened_srt_uniform =
 	    counts[static_cast<size_t>(Kind::FlattenedSrt)] != 0 && FlattenedSrtFitsUniform(state.program);
@@ -408,12 +408,13 @@ void DefineDescriptors(EmitterState& state) {
 		bindings.stride_count = counts[static_cast<size_t>(Kind::Buffers)];
 	}
 	bindings.table_block_dwords = table ? 2u : 0u;
+	bindings.clip_plane_dwords = 4u * std::bit_width(state.user_clip_planes);
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
-	    state.object_primitive_id_variable != 0 || state.user_clip_planes != 0) {
+	    state.object_primitive_id_variable != 0) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -1069,7 +1070,7 @@ void DefineModule(EmitterState& state) {
 	    state.quad_lanes) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.program.info.subgroup_ballot || state.ray_stats ||
+	if (state.lane_count == 2 || state.program.info.subgroup_ballot || state.program.info.ray_query_sites != 0 ||
 	    state.quad_lanes) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}

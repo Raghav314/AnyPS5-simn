@@ -1,3 +1,4 @@
+#include "graphics/presentation/window/surfaceCopy.h"
 #include "prx/libSceAgcDriver/Execution/include/UpscaleMode.hpp"
 
 #include <algorithm>
@@ -154,6 +155,26 @@ void TestUpscaleModeSelection() {
         Require(Refused([value] { static_cast<void>(SelectUpscaleMode("rcas", value)); }), (std::string("ANYPS5_FSR_SHARPNESS accepted ") + value).c_str());
         Require(Refused([value] { static_cast<void>(SelectUpscaleMode("cmaa2", value)); }), (std::string("ANYPS5_FSR_SHARPNESS accepted ") + value).c_str());
     }
+}
+
+void TestPresentationCopy() {
+    using Libs::Graphics::PresentationCopy;
+    const auto check = [](vk::Extent2D surface, vk::Extent3D backing, uint32_t level,
+                          uint32_t layer, vk::Extent3D expected) {
+        const auto copy = PresentationCopy(surface, backing, level, layer);
+        Require(copy.srcSubresource == vk::ImageSubresourceLayers{vk::ImageAspectFlagBits::eColor, level, layer, 1},
+                "the copy reads a different subresource from the resolved surface");
+        Require(copy.dstSubresource == vk::ImageSubresourceLayers{vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                "the copy does not target the prepared frame");
+        Require(copy.extent == expected && copy.srcOffset == vk::Offset3D{} && copy.dstOffset == vk::Offset3D{},
+                "the prepared area does not fit the registered surface and backing mip");
+    };
+    check({8, 5}, {8, 5, 1}, 0, 0, {8, 5, 1});
+    check({7, 4}, {8, 5, 1}, 0, 0, {7, 4, 1});
+    check({8, 5}, {8, 5, 1}, 0, 3, {8, 5, 1});
+    check({5, 3}, {9, 7, 1}, 1, 2, {4, 3, 1});
+    check({1, 1}, {8, 1, 1}, 3, 0, {1, 1, 1});
+    check({4, 3}, {8, 6, 4}, 1, 0, {4, 3, 1});
 }
 
 void TestFitAspectAndUpscaleDecisions() {
@@ -319,6 +340,7 @@ void TestSlotRotationInvariants() {
 
 int main() {
     TestUpscaleModeSelection();
+    TestPresentationCopy();
     TestFitAspectAndUpscaleDecisions();
     TestCmaa2MorphologicalEdgeMath();
     TestCmaa2BilateralEdgeSearch();

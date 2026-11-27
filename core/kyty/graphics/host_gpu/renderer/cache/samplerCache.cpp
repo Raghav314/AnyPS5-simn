@@ -14,8 +14,8 @@ SamplerCache::~SamplerCache() {
 	}
 }
 
-vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border) {
-	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], integer_border};
+vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border, bool depth_compare) {
+	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], integer_border, depth_compare};
 	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
 		return iter->second;
 	}
@@ -127,7 +127,7 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
     );
 	sampler_info.anisotropyEnable        = (aniso ? VK_TRUE : VK_FALSE);
 	sampler_info.maxAnisotropy           = aniso_ratio;
-	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);
+	sampler_info.compareEnable           = depth_compare;
 	sampler_info.compareOp               = static_cast<vk::CompareOp>(r.DepthCompareFunc());
 	sampler_info.minLod                  = min_lod;
 	sampler_info.maxLod                  = max_lod;

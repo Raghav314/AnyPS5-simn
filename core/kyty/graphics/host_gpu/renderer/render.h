@@ -202,6 +202,8 @@ public:
 	                             bool async_compute);
 	RayTracingCheck& RtCheck();
 	WaveSplitCheck&  SplitCheck();
+	bool BeginGenericCheck(const ShaderComputeInputInfo& exact, const CommandBuffer& buffer,
+	                       ShaderComputeInputInfo& generic, ShaderRecompiler::IR::ResourceSnapshot& aligned);
 
 	struct ResolvedDraw;
 	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context&    context,
@@ -314,11 +316,15 @@ private:
 		std::array<uint32_t, 8> dwords {};
 		TableElementResolution* element = nullptr;
 		uint32_t                version_slot = UINT32_MAX;
+		uint32_t                run_end      = 0;
 	};
 	struct TableResolution {
 		ShaderRecompiler::IR::ImageResource root;
 		uint64_t                            last_use   = 0;
 		uint64_t                            generation = 0;
+		uint64_t                            slots_id = 0;
+		uint32_t                            matching_slots = 0;
+		uint32_t                            grouped_slots = 0;
 		TableElements                       elements;
 		std::vector<TableSlot>              slots;
 	};
@@ -336,6 +342,7 @@ private:
 		uint64_t layout       = 0;
 		uint64_t left_renewed = 0;
 		uint64_t left_size    = 0;
+		uint64_t retired_bindings = 0;
 		uint64_t resets       = 0;
 		uint64_t window_ns    = 0;
 		bool     idle_logged  = false;
@@ -343,7 +350,8 @@ private:
 	void ConfigureTableResolutions();
 	void RetireTableResolution(TableResolution& table);
 	void TrimTableResolutions();
-	void LogTableSummary();
+	[[nodiscard]] size_t TrimTableBindings();
+	void LogTableSummary(size_t binding_slots);
 
 	[[nodiscard]] TableElementResolution&
 	ResolveTableElement(TableResolution& table, const ShaderRecompiler::IR::DescriptorValue& value,
@@ -370,7 +378,7 @@ private:
 			TableResolution*                      table      = nullptr;
 			ShaderRecompiler::IR::DescriptorValue source;
 			uint32_t                              root = 0;
-			ImageId                               pinned;
+			TableImageRef                         pinned;
 			bool always            = false;
 			bool unchecked_backing = false;
 			GuestRange span_range;
@@ -389,7 +397,6 @@ private:
 		std::vector<vk::DescriptorImageInfo> slot_infos;
 		std::vector<uint32_t>                element_slot_begin;
 		std::vector<uint32_t>                element_slots;
-		std::vector<uint32_t>                element_of_version;
 		std::vector<PageSpan>                spans;
 		uint64_t                             max_span = 0;
 		std::vector<uint32_t>                always;
@@ -397,6 +404,7 @@ private:
 		bool                                 compute = false;
 		std::vector<uint64_t>                marks;
 		uint64_t                             mark_stamp = 0;
+		uint64_t                             last_prepared = 0;
 		struct Checked {
 			static constexpr uint32_t None      = UINT32_MAX;
 			static constexpr uint32_t NullImage = UINT32_MAX - 1;
@@ -429,17 +437,16 @@ private:
 	                                      const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
 	                                      TableBindingState& state, uint64_t stamp,
 	                                      PreparedBindings& prepared);
-	void MarkTableChanges(TableBindingState& state);
-	void MarkTableElement(TableBindingState& state, uint32_t element);
-	void MarkTablePages(TableBindingState& state, uint64_t address, uint64_t size);
+	void MarkTableChanges(TableBindingState& state, PreparedBindings& prepared);
+	void MarkTablePages(TableBindingState& state, PreparedBindings& prepared, uint64_t address, uint64_t size);
 	void RebuildTableSpans(TableBindingState& state);
 	static void AddTableSpans(TableBindingState& state, uint32_t element);
 	void MergeTableSpans(TableBindingState& state, size_t sorted);
 	static void IndexTableSlots(TableBindingState& state);
 	void PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 	                     const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
-	                     TableBindingState& state, uint64_t stamp);
-	void DropUnusedTableElements(TableBindingState& state);
+	                     TableBindingState& state, PreparedBindings& prepared, uint64_t stamp);
+	void DropUnusedTableElements(TableBindingState& state, PreparedBindings& prepared);
 	void FinishTableBindings(TableBindingState& state, const PreparedBindings& prepared);
 	void UnpinTableBindings(TableBindingState& state);
 	void RebindReusedTables(PreparedBindings& prepared);
@@ -519,6 +526,7 @@ private:
 	struct SamplerMemoEntry {
 		std::array<uint32_t, 4> fields {};
 		bool                    integer_border = false;
+		bool                    depth_compare  = false;
 		vk::Sampler             sampler        = nullptr;
 	};
 	std::array<SamplerMemoEntry, 256> m_sampler_memo {};
@@ -600,6 +608,7 @@ private:
 	PreparedBindings                     m_compute_bindings;
 	std::shared_ptr<RayTracingCheck>     m_rt_check;
 	std::shared_ptr<WaveSplitCheck>      m_split_check;
+	std::shared_ptr<WaveSplitCheck>      m_generic_check;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
@@ -621,7 +630,6 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_table_image_infos;
 	std::unordered_map<const void*, TableBindingState> m_table_states;
 	std::vector<std::pair<uint64_t, uint64_t>>         m_table_changes;
-	std::vector<uint32_t>                              m_table_marked;
 	std::vector<TableBindingState::PageSpan>           m_table_spans;
 	std::vector<uint32_t>                              m_table_remap;
 	struct ChangedTableSlot {
@@ -635,6 +643,7 @@ private:
 	std::vector<uint32_t>                              m_table_checks;
 	std::vector<uint8_t>                               m_table_flags;
 	std::vector<uint32_t>                              m_table_element_versions;
+	std::vector<uint32_t>                              m_table_patch_indices;
 	std::vector<uint32_t>                              m_free_table_element_versions;
 	std::vector<uint64_t>                              m_bound_image_marks;
 	uint64_t                                           m_bound_image_stamp = 0;

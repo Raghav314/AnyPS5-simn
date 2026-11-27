@@ -40,7 +40,6 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
                                   const Profile& profile               = DefaultProfile,
                                   bool           emit_debug_info       = false,
                                   bool           mip_stats_records     = true,
-                                  bool           ray_stats             = false,
                                   SplitHints*    split_hints           = nullptr);
 
 [[nodiscard]] bool UsesMipStats(const IR::Program& program);

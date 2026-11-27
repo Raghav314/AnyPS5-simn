@@ -757,12 +757,21 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const bool always_guest = (geometry_opacity || no_leaf) && !s.ray_query_alpha_sites[site] && !opaque_only;
 	const auto has_context = always_guest ? ConstantBool(s, false)
 	                                      : Binary(s, spv::OpINotEqual, b, context, ConstantU64(s, 0));
-	const auto host = EmitValueOrDefaultIfCondition(s, has_context, b, ConstantBool(s, false), [&] {
+	const auto matches = [&](uint32_t entry_address) {
 		const auto valid = Binary(s, spv::OpINotEqual, b,
-		                          LoadAddressU32(s, AddressPlus(s, context, ContextValid)), U32(s, 0));
-		const auto same = Equal(s, LoadAddressU64(s, AddressPlus(s, context, ContextHeader)), header);
+		                          LoadAddressU32(s, AddressPlus(s, entry_address, ContextValid)), U32(s, 0));
+		const auto same = Equal(s, LoadAddressU64(s, AddressPlus(s, entry_address, ContextHeader)), header);
 		return LogicalAnd(s, valid, same);
-	});
+	};
+	const auto sources = static_cast<uint32_t>(1 + s.program.info.ray_query_extra_sources.size());
+	auto       chosen  = context;
+	auto       host    = ConstantBool(s, false);
+	if (sources == 1) {
+		host = EmitValueOrDefaultIfCondition(s, has_context, b, ConstantBool(s, false), [&] { return matches(context); });
+	} else {
+		chosen = PickContext(s, has_context, context, header, sources);
+		host = Binary(s, spv::OpINotEqual, b, chosen, ConstantU64(s, 0));
+	}
 	const auto& allow   = inst.Arg(14);
 	const bool  allow_all = allow.IsImmediate() && allow.U1();
 	const auto  native  = allow_all ? host : LogicalAnd(s, host, ctx.Arg(inst, 14));
@@ -772,7 +781,7 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                                        "the host does not run; they stay exact and emulated\n",
 		                                        s.program.shader_hash, site, always_guest ? "all its" : "some of its"));
 	}
-	if (s.ray_stats) {
+	{
 		const auto guest  = LogicalAnd(s, exec, LogicalNot(s, native));
 		const auto ballot = s.builder.AllocateId();
 		s.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(s, 4), ballot,
@@ -802,10 +811,10 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 	Store(s, lane.state, Or(s, traversal, Select(s, u, lane_ok, U32(s, 0), U32(s, DoneBit))));
 	ClearKeys(s, lane);
 	EmitIfCondition(s, lane_ok, [&] {
-		const auto tlas = LoadAddressU64(s, AddressPlus(s, context, ContextTlas));
-		Store(s, lane.nodes, LoadAddressU64(s, AddressPlus(s, context, ContextInstanceNodes)));
-		Store(s, lane.slots, LoadAddressU64(s, AddressPlus(s, context, ContextSlots)));
-		Store(s, lane.base, LoadAddressU64(s, AddressPlus(s, context, ContextInstanceBase)));
+		const auto tlas = LoadAddressU64(s, AddressPlus(s, chosen, ContextTlas));
+		Store(s, lane.nodes, LoadAddressU64(s, AddressPlus(s, chosen, ContextInstanceNodes)));
+		Store(s, lane.slots, LoadAddressU64(s, AddressPlus(s, chosen, ContextSlots)));
+		Store(s, lane.base, LoadAddressU64(s, AddressPlus(s, chosen, ContextInstanceBase)));
 		if (const auto inline_layout = ProgramInlineLayout(s); inline_layout.valid) {
 			Store(s, lane.inline_record, AddressPlus(s, header, inline_layout.offset));
 		}

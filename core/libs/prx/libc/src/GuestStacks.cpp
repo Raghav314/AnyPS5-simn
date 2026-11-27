@@ -1,9 +1,18 @@
 #include "prx/libc/include/GuestStacks.hpp"
+#include "prx/libc/include/Shutdown.hpp"
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <string_view>
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 
 #ifdef _WIN32
 #include "prx/libc/include/GuestArena.hpp"
 #include <atomic>
-#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -61,6 +70,39 @@ bool HostBounds(std::uintptr_t stackPointer, StackBounds& bounds) {
 }
 #endif
 
+}
+
+void PrepareGuestEntry_nid_no_patch() noexcept {
+#if defined(_WIN32) || defined(__linux__)
+    using WarmPipelines = void (*)();
+    constexpr char symbol[] = "VideoOutWarmPipelinesBeforeGuest_nid_no_patch";
+#ifdef _WIN32
+    const auto module = GetModuleHandleW(L"libSceVideoOut.prx");
+    const auto warm = module == nullptr ? nullptr : reinterpret_cast<WarmPipelines>(GetProcAddress(module, symbol));
+#else
+    const auto warm = reinterpret_cast<WarmPipelines>(dlsym(RTLD_DEFAULT, symbol));
+#endif
+    if (warm != nullptr) {
+        try {
+            warm();
+        } catch (const ProcessShutdown&) {
+            LibcAwaitExit_nid_postfix();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[kyty-startup] preparing pipelines failed: %s\n", error.what());
+        } catch (...) {
+            std::fprintf(stderr, "[kyty-startup] preparing pipelines failed\n");
+        }
+    }
+    const char* shaderLog = std::getenv("KYTY_SHADER_VARIANT_LOG");
+    const char* driverAudit = std::getenv("KYTY_PIPELINE_COMPILE_AUDIT");
+    if (shaderLog != nullptr && std::string_view(shaderLog) == "1" &&
+        driverAudit != nullptr && std::string_view(driverAudit) == "1") {
+        std::fputs("[kyty-startup] precook_audit shader_variants=1 driver_pipeline=1\n", stderr);
+    }
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    std::fprintf(stderr, "[kyty-startup] guest_entry monotonic_ns=%lld\n",
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()));
+#endif
 }
 
 void GuestStackRegister_nid_no_patch(const void* pointer, std::size_t bytes) {
@@ -129,6 +171,7 @@ void APS5_VABI GuestStackSwitch_nid_no_patch(std::uintptr_t stackPointer) {
     context.Rdi = reinterpret_cast<DWORD64>(arguments);
     context.Rip = reinterpret_cast<DWORD64>(entry);
     *reinterpret_cast<std::uintptr_t*>(context.Rsp) = 0;
+    PrepareGuestEntry_nid_no_patch();
     ApplyBounds({low + capacity, low, reinterpret_cast<std::uintptr_t>(allocation)});
     RtlRestoreContext(&context, nullptr);
     std::abort();

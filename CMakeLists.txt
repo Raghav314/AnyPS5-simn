@@ -999,9 +999,27 @@ if(BUILD_TESTING)
         add_test(NAME kyty_pipeline_stalls COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kyty_pipeline_stalls.py)
         set_tests_properties(kyty_pipeline_stalls PROPERTIES TIMEOUT 30)
+        add_test(NAME kyty_precook_audit COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kyty_precook_audit.py)
+        set_tests_properties(kyty_precook_audit PROPERTIES TIMEOUT 30)
+        add_test(NAME kyty_precache_selection COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_precache_selection.py)
+        set_tests_properties(kyty_precache_selection PROPERTIES TIMEOUT 30)
+        add_test(NAME kyty_elf_shader_bindings COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kyty_elf_shader_bindings.py)
+        set_tests_properties(kyty_elf_shader_bindings PROPERTIES TIMEOUT 30)
         add_test(NAME kyty_manifest_float_modes COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kyty_manifest_float_modes.py)
         set_tests_properties(kyty_manifest_float_modes PROPERTIES TIMEOUT 30)
+        add_test(NAME kyty_collect_queued_recipes COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kyty_collect_queued_recipes.py)
+        set_tests_properties(kyty_collect_queued_recipes PROPERTIES TIMEOUT 30)
+        add_test(NAME kyty_shader_bundle COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kyty_shader_bundle.py)
+        set_tests_properties(kyty_shader_bundle PROPERTIES TIMEOUT 30)
+        add_test(NAME kyty_sampler_candidates COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kyty_sampler_candidates.py)
+        set_tests_properties(kyty_sampler_candidates PROPERTIES TIMEOUT 30)
         add_test(NAME kyty_pgo COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kyty_pgo.py)
         set_tests_properties(kyty_pgo PROPERTIES TIMEOUT 30)

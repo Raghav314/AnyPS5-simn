@@ -100,7 +100,7 @@ public:
 	[[nodiscard]] uint32_t Load(uint64_t page) const {
 		if (page / BucketPages >= BucketCount) return 0;
 		const auto* entries = m_buckets[page / BucketPages].load(std::memory_order_acquire);
-		return entries != nullptr ? entries[page % BucketPages].load(std::memory_order_relaxed) : 0;
+		return entries != nullptr ? entries->pages[page % BucketPages].load(std::memory_order_relaxed) : 0;
 	}
 
 	[[nodiscard]] uint32_t LoadBacking(uint64_t page) const {
@@ -108,26 +108,48 @@ public:
 		return entry == PrivateEntry ? 0 : entry;
 	}
 
+	[[nodiscard]] bool AllBacked(uint64_t first, uint64_t end) const {
+		if (end > BucketCount * BucketPages) return false;
+		for (auto page = first; page < end;) {
+			const auto* bucket = m_buckets[page / BucketPages].load(std::memory_order_acquire);
+			if (bucket == nullptr) return false;
+			const auto stop = std::min(end, (page | uint64_t {63}) + 1);
+			const auto mask = PageMaskForWord(page, stop);
+			const auto bits = bucket->backed[(page % BucketPages) / 64].load(std::memory_order_acquire);
+			if ((bits & mask) != mask) return false;
+			page = stop;
+		}
+		return true;
+	}
+
 	void Store(uint64_t vaddr, uint64_t size, uint32_t first, bool step) {
-		const auto end = vaddr + size;
+		const auto end = (vaddr + size) >> PageBits;
 		auto entry = first;
-		for (auto page = vaddr >> PageBits; page < end >> PageBits; ++page) {
-			auto& bucket = m_buckets[page / BucketPages];
-			auto* entries = bucket.load(std::memory_order_acquire);
-			if (entries == nullptr) {
+		for (auto page = vaddr >> PageBits; page < end;) {
+			auto& slot = m_buckets[page / BucketPages];
+			auto* bucket = slot.load(std::memory_order_acquire);
+			if (bucket == nullptr) {
 				if (first == 0) {
-					page = (page / BucketPages + 1u) * BucketPages - 1u;
+					page = (page / BucketPages + 1) * BucketPages;
 					continue;
 				}
-				auto* created = new std::atomic<uint32_t>[BucketPages] {};
-				if (bucket.compare_exchange_strong(entries, created, std::memory_order_acq_rel)) {
-					entries = created;
+				auto* created = new Bucket {};
+				if (slot.compare_exchange_strong(bucket, created, std::memory_order_acq_rel)) {
+					bucket = created;
 				} else {
-					delete[] created;
+					delete created;
 				}
 			}
-			entries[page % BucketPages].store(entry, std::memory_order_relaxed);
-			if (step) ++entry;
+			const auto stop = std::min(end, (page | uint64_t {63}) + 1);
+			const auto mask = PageMaskForWord(page, stop);
+			auto& bits = bucket->backed[(page % BucketPages) / 64];
+			const bool backed = first != 0 && first != PrivateEntry;
+			if (!backed) bits.fetch_and(~mask, std::memory_order_acq_rel);
+			for (; page < stop; ++page) {
+				bucket->pages[page % BucketPages].store(entry, std::memory_order_relaxed);
+				if (step) ++entry;
+			}
+			if (backed) bits.fetch_or(mask, std::memory_order_release);
 		}
 	}
 
@@ -246,7 +268,7 @@ public:
 		for (uint64_t bucket = 0; bucket < BucketCount; ++bucket) {
 			const auto* entries = m_buckets[bucket].load(std::memory_order_acquire);
 			for (uint64_t index = 0; index < BucketPages; ++index) {
-				const bool mapped = entries != nullptr && entries[index].load(std::memory_order_relaxed) != 0;
+				const bool mapped = entries != nullptr && entries->pages[index].load(std::memory_order_relaxed) != 0;
 				const auto address = (bucket * BucketPages + index) << PageBits;
 				if (mapped && !open) {
 					start = address;
@@ -268,7 +290,14 @@ private:
 		return static_cast<unsigned>(((host >> 12u) & 3u) * 2u);
 	}
 
-	std::array<std::atomic<std::atomic<uint32_t>*>, BucketCount> m_buckets {};
+	struct Bucket {
+		std::array<std::atomic<uint32_t>, BucketPages> pages {};
+		std::array<std::atomic<uint64_t>, BucketPages / 64> backed {};
+	};
+	static constexpr uint64_t PageMaskForWord(uint64_t first, uint64_t end) {
+		return (UINT64_MAX << (first % 64)) & (UINT64_MAX >> (63 - ((end - 1) % 64)));
+	}
+	std::array<std::atomic<Bucket*>, BucketCount> m_buckets {};
 	std::array<std::atomic<std::atomic<uint8_t>*>, BucketCount> m_exec {};
 	std::array<std::atomic<std::atomic<uint8_t>*>, BucketCount> m_probe {};
 };
@@ -839,11 +868,7 @@ bool ReleaseHostWrite(std::uintptr_t address, std::size_t bytes) {
 
 bool IsBacked(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size)) return false;
-	const auto& pages = Pages();
-	for (auto page = vaddr >> PageBits; page <= (vaddr + size - 1u) >> PageBits; ++page) {
-		if (pages.LoadBacking(page) == 0) return false;
-	}
-	return true;
+	return Pages().AllBacked(vaddr >> PageBits, ((vaddr + size - 1u) >> PageBits) + 1);
 }
 
 bool InGuestSpace(uint64_t vaddr, uint64_t size) {

@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_GPU_OPERATION_H
 
 #include "common/inlineFunction.h"
+#include "graphics/guest_gpu/command_processor/computeDispatchOrigin.h"
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <cstdint>
@@ -59,6 +60,7 @@ struct GpuDispatchArgs {
 	uint32_t thread_group_z = 0;
 	uint32_t mode           = 0;
 	uint64_t args_addr      = 0;
+	ComputeDispatchOrigin origin;
 };
 
 struct GpuGuestWrite {

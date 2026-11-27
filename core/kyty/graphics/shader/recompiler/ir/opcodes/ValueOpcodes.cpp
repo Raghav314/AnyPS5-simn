@@ -109,7 +109,8 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::RayQueryResult:
 		case ValueOpcode::RayQueryMark:
 		case ValueOpcode::RayQueryAlpha:
-		case ValueOpcode::RayQueryAlphaDistance: return true;
+		case ValueOpcode::RayQueryAlphaDistance:
+		case ValueOpcode::LoopGuardMark: return true;
 		default: return false;
 	}
 }

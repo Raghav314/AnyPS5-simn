@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/rayTracing.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "gpu_tiler_shaders/hle_blas_refit_spv.h"
 #include "gpu_tiler_shaders/hle_tlas_spv.h"
@@ -70,6 +71,7 @@ constexpr uint32_t JobStride      = 80;
 constexpr uint32_t SlotStride     = 64;
 constexpr uint32_t TableStride    = 16;
 constexpr uint32_t ContextStride  = 128;
+constexpr uint32_t ContextValidAt = 36;
 constexpr uint32_t InstanceStride = 64;
 
 constexpr uint32_t ModeCount  = 0;
@@ -359,6 +361,7 @@ std::string RtShader(uint64_t shader_hash) {
 }
 
 void SummarizeRayTracing() {
+	if (!Config::RayTracingStatsEnabled()) return;
 	auto&      stats = g_rt_stats;
 	const auto now   = std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::steady_clock::now().time_since_epoch())
@@ -478,6 +481,7 @@ void RayTracing::NoteOracle(uint64_t shader_hash, const OracleCounts& counts) {
 	if (counts.returned != 0) {
 		stats.last_oracle_returned.store(shader_hash, std::memory_order_relaxed);
 	}
+	SummarizeRayTracing();
 }
 
 void RayTracing::NoteGuestRays(uint64_t shader_hash, uint64_t rays) {
@@ -524,6 +528,26 @@ uint64_t RayTracing::UserPointer(const TlasSource& source, uint64_t pointer,
 	return uint64_t {vsharp[0]} | (uint64_t {vsharp[1] & 0xffffu} << 32u);
 }
 
+static_assert(ShaderRecompiler::IR::MaxRayQuerySources <= RayTracing::MaxContexts);
+
+void RayTracing::InvalidateContext(const CommandRecorder& command, uint32_t context) {
+	if (!m_enabled || context == 0 || context >= MaxContexts || m_context_table == nullptr) {
+		return;
+	}
+	MemoryBarrier(command, vk::PipelineStageFlagBits2::eAllCommands,
+	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+	              vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+	command.fillBuffer(m_context_table->Handle(), uint64_t {context} * ContextStride + ContextValidAt, sizeof(uint32_t), 0);
+	MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+	              vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+}
+
+RayTracing::TlasSource RayTracing::ExtraTlasSource(const ShaderRecompiler::IR::RayQueryExtraSource& extra) noexcept {
+	return {extra.user_sgpr, extra.header_offset, extra.root, extra.layout,
+	        {ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot, ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot},
+	        extra.header_vsharp};
+}
+
 bool RayTracing::FindGuestTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
                                            TlasSource& source) noexcept {
 	if (FindTlasSource(info, source)) {
@@ -549,9 +573,10 @@ RayTracing::GuestTlas RayTracing::ReadGuestTlas(
 			return tlas;
 		}
 	}
-	constexpr uint64_t HeaderSize = 256;
+	constexpr uint64_t HeaderSize   = 256;
+	constexpr uint64_t AddressLimit = uint64_t {1} << 48u;
 	constexpr uint64_t MaxExtent = uint64_t {64} * 1024 * 1024;
-	if (header > UINT64_MAX - MaxExtent || !readable(header, HeaderSize)) {
+	if (header > AddressLimit - 2 * MaxExtent || !readable(header, HeaderSize)) {
 		return {};
 	}
 	const auto load = [](uint64_t address, auto& value) {
@@ -621,7 +646,7 @@ RayTracing::GuestTlas RayTracing::ReadGuestTlas(
 		const auto blas = ((layout[1] >> 24u) & 1u) != 0
 		                      ? (uint64_t {words[0]} | (uint64_t {words[1] & 0x3fffffu} << 32u)) << 3u
 		                      : uint64_t {words[0]} | (uint64_t {words[1]} << 32u);
-		if (blas != 0 && (blas & 255u) == 0) {
+		if (blas != 0 && (blas & 255u) == 0 && blas <= AddressLimit - MaxExtent) {
 			blas_list.push_back(blas);
 		}
 	};
@@ -812,8 +837,10 @@ void RayTracing::DestroySlots() {
 			device.destroyAccelerationStructureKHR(retired.handle);
 		}
 	}
-	if (m_tlas) {
-		device.destroyAccelerationStructureKHR(m_tlas);
+	for (auto& tlas: m_tlases) {
+		if (tlas.handle) {
+			device.destroyAccelerationStructureKHR(tlas.handle);
+		}
 	}
 	device.destroyPipeline(m_tlas_pipeline);
 	device.destroyPipeline(m_blas_pipeline);
@@ -877,7 +904,7 @@ void RayTracing::CreateBuffers() {
 	};
 	m_walk_state          = make(StateSize, DataFlags, "RT state");
 	m_queue          = make(uint64_t {QueueCapacity} * 4, DataFlags, "RT queue");
-	m_instance_nodes = make(uint64_t {InstanceCapacity} * 4, DataFlags, "RT instance nodes");
+	m_instance_nodes = make(uint64_t {InstanceCapacity} * 4 * MaxContexts, DataFlags, "RT instance nodes");
 	m_instances      = make(uint64_t {InstanceCapacity} * InstanceStride, AsFlags, "RT instances");
 	m_table          = make(uint64_t {TableEntries + HostTableEntries} * TableStride, DataFlags, "RT BLAS table");
 	m_slots          = make(uint64_t {SlotCapacity} * SlotStride, DataFlags, "RT slots");
@@ -916,6 +943,10 @@ vk::Buffer RayTracing::ContextBuffer() const noexcept {
 }
 
 void RayTracing::CreateTlas(uint32_t capacity) {
+	CreateTlasObject(m_tlases[0], capacity);
+}
+
+void RayTracing::CreateTlasObject(TlasObject& tlas, uint32_t capacity) {
 	auto device = m_graphics.device;
 	vk::AccelerationStructureGeometryKHR geometry {};
 	geometry.geometryType                       = vk::GeometryTypeKHR::eInstances;
@@ -930,17 +961,17 @@ void RayTracing::CreateTlas(uint32_t capacity) {
 	vk::AccelerationStructureBuildSizesInfoKHR sizes {};
 	device.getAccelerationStructureBuildSizesKHR(vk::AccelerationStructureBuildTypeKHR::eDevice, &info,
 	                                             &capacity, &sizes);
-	m_tlas_storage = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
-	                                          AsFlags, sizes.accelerationStructureSize);
+	tlas.storage = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+	                                        AsFlags, sizes.accelerationStructureSize);
 	vk::AccelerationStructureCreateInfoKHR create {};
-	create.buffer = m_tlas_storage->Handle();
+	create.buffer = tlas.storage->Handle();
 	create.size   = sizes.accelerationStructureSize;
 	create.type   = vk::AccelerationStructureTypeKHR::eTopLevel;
-	RequireVulkanSuccess(device.createAccelerationStructureKHR(&create, nullptr, &m_tlas),
+	RequireVulkanSuccess(device.createAccelerationStructureKHR(&create, nullptr, &tlas.handle),
 	                     "create native TLAS");
 	vk::AccelerationStructureDeviceAddressInfoKHR address_info {};
-	address_info.accelerationStructure = m_tlas;
-	m_tlas_address      = device.getAccelerationStructureAddressKHR(address_info);
+	address_info.accelerationStructure = tlas.handle;
+	tlas.address        = device.getAccelerationStructureAddressKHR(address_info);
 	m_tlas_scratch_size = sizes.buildScratchSize;
 	m_tlas_capacity     = capacity;
 	EXIT_IF(m_tlas_scratch_size > BuildScratchSize);
@@ -1491,9 +1522,14 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 
 void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
                                const TlasSource& source, const vk::DescriptorBufferInfo& flattened_srt,
-                               uint64_t frame, uint64_t shader_hash, bool count_rays, bool per_lane) {
-	if (!m_enabled) {
+                               uint64_t frame, uint64_t shader_hash, bool count_rays, bool per_lane,
+                               uint32_t context) {
+	if (!m_enabled || context >= MaxContexts) {
 		return;
+	}
+	auto& tlas_object = m_tlases[context];
+	if (tlas_object.handle == nullptr) {
+		CreateTlasObject(tlas_object, m_tlas_capacity);
 	}
 	m_reusable = false;
 	g_rt_stats.native.Add();
@@ -1734,13 +1770,13 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	    .user_ptr_va       = user_pointer,
 	    .state             = m_walk_state->BufferDeviceAddress(),
 	    .queue             = m_queue->BufferDeviceAddress(),
-	    .instance_nodes    = m_instance_nodes->BufferDeviceAddress(),
+	    .instance_nodes    = m_instance_nodes->BufferDeviceAddress() + uint64_t {context} * InstanceCapacity * 4,
 	    .instances         = m_instances->BufferDeviceAddress(),
 	    .table             = m_table->BufferDeviceAddress(),
 	    .slots             = m_slots->BufferDeviceAddress(),
 	    .missing           = m_missing->BufferDeviceAddress(),
-	    .context           = m_context_address,
-	    .tlas_address      = m_tlas_address,
+	    .context           = m_context_address + uint64_t {context} * ContextStride,
+	    .tlas_address      = tlas_object.address,
 	    .verify_list       = m_verify_list->BufferDeviceAddress(),
 	    .header_offset     = header_in_state ? HeaderInState : source.header_offset,
 	    .root              = source.root,
@@ -1780,7 +1816,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	command.dispatchIndirect(m_walk_state->Handle(), StateVerify);
 
 	{
-		const auto handle    = m_tlas;
+		const auto handle    = tlas_object.handle;
 		const auto instances = m_instances->BufferDeviceAddress();
 		const auto scratch   = m_build_scratch->BufferDeviceAddress();
 		command.Custom([handle, instances, scratch, tlas_count](vk::CommandBuffer c) {

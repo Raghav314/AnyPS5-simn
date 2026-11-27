@@ -498,8 +498,9 @@ std::int32_t dialogInnerWidth(const ModalDialogView& view, const std::vector<std
     return width;
 }
 
-std::int32_t dialogHeight(std::size_t lines) {
-    return DialogMetrics::Padding * 2 + static_cast<std::int32_t>(lines) * DialogMetrics::LineHeight + DialogMetrics::MessageGap + DialogMetrics::ButtonHeight;
+std::int32_t dialogHeight(std::size_t lines, bool hasButtons) {
+    const auto buttonRow = hasButtons ? DialogMetrics::MessageGap + DialogMetrics::ButtonHeight : 0;
+    return DialogMetrics::Padding * 2 + static_cast<std::int32_t>(lines) * DialogMetrics::LineHeight + buttonRow;
 }
 
 }
@@ -507,7 +508,7 @@ std::int32_t dialogHeight(std::size_t lines) {
 std::int32_t DialogScale(VkExtent2D extent, const ModalDialogView& view) {
     const auto lines = dialogLines(view);
     const auto width = dialogInnerWidth(view, lines) + 2 * DialogMetrics::Padding;
-    const auto height = dialogHeight(lines.size());
+    const auto height = dialogHeight(lines.size(), !view.buttons.empty());
     auto scale = std::max<std::int32_t>(1, static_cast<std::int32_t>(extent.height / KeyboardMetrics::LinesPerScale));
     while (scale > 1 && (static_cast<std::int64_t>(width) * scale > extent.width || static_cast<std::int64_t>(height) * scale > extent.height)) --scale;
     return scale;
@@ -515,11 +516,11 @@ std::int32_t DialogScale(VkExtent2D extent, const ModalDialogView& view) {
 
 OverlayLayout LayOutDialog(const ModalDialogView& view, VkExtent2D extent) {
     Graphics::Require(extent.width != 0 && extent.height != 0, "the system dialog needs a destination");
-    Graphics::Require(!view.buttons.empty() && view.buttons.size() <= ModalDialogMaxButtons, "the system dialog needs one to three buttons");
+    Graphics::Require(view.buttons.size() <= ModalDialogMaxButtons, "the system dialog supports up to three buttons");
     const auto lines = dialogLines(view);
     const auto inner = dialogInnerWidth(view, lines);
     const auto width = inner + 2 * DialogMetrics::Padding;
-    const auto height = dialogHeight(lines.size());
+    const auto height = dialogHeight(lines.size(), !view.buttons.empty());
     OverlayLayout layout;
     const auto scale = DialogScale(extent, view);
     layout.scale = scale;

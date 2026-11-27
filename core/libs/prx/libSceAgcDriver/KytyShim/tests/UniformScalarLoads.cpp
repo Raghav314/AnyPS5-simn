@@ -493,7 +493,7 @@ void RuntimeOffsetDescriptors(RecordIndex index) {
 		auto selected_image = snapshot.images.at(0);
 		uint32_t selected_sampler = 0;
 		if (wave_record) {
-			const auto& table = snapshot.image_tables.at(specialization.images.at(0).table);
+			const auto& table = *snapshot.image_tables.at(specialization.images.at(0).table);
 			selected_image = table.slots.at(table.mapping.at(1u + image));
 			const auto offset = specialization.samplers.at(0).indirect_mapping_offset;
 			const auto& mapping = snapshot.flattened_srt;

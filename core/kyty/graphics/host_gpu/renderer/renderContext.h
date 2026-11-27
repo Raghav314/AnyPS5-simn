@@ -49,6 +49,7 @@ public:
 	KYTY_CLASS_NO_COPY(RenderContext);
 
 	[[nodiscard]] GraphicContext&           GetGraphics() const noexcept { return m_graphics; }
+	void NoteFirstGuestCommand(bool compute);
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	void                                    ShutdownGpu();
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
@@ -109,6 +110,7 @@ public:
 	bool               CacheSelfSizedBuffers(const ShaderStageRuntime& runtime);
 	[[nodiscard]] bool SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages);
 	void               PrepareBda(bool may_write, bool full_sync = true);
+	void               PrepareHackMarks();
 	void               RunGarbageCollector();
 	void NoteHleTlas(uint64_t header, uint64_t size, std::vector<uint64_t> blases);
 	void ForgetHleTlas(uint64_t header);
@@ -120,6 +122,7 @@ public:
 
 private:
 	void CacheTlasMemory(const ShaderStageRuntime& runtime);
+	void CacheTlasMemory(const ShaderStageRuntime& runtime, const RayTracing::TlasSource& source, bool note_instances);
 	[[nodiscard]] bool SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages);
 	[[nodiscard]] bool AddRecordReach(const ShaderStageRuntime& runtime);
 	[[nodiscard]] bool AddRayTracingReach(const ShaderStageRuntime& runtime);
@@ -148,6 +151,7 @@ private:
 	TextureCache              m_texture_cache;
 	ImageHeap                 m_image_heap;
 	PipelineCache             m_pipeline_cache;
+	std::atomic<uint8_t>      m_first_guest_commands {0};
 	StrictWatch               m_strict_watch {m_page_manager};
 	IndirectWriteTables       m_indirect_write_tables {*this};
 	OcclusionQueries          m_occlusion_queries {*this};
@@ -204,6 +208,7 @@ private:
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+	bool                      m_hack_marks_pending    = false;
 	bool                      m_use_scan_pending      = false;
 	uint32_t                  m_use_scan_countdown    = 0;
 

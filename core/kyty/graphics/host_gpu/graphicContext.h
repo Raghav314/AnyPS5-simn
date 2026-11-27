@@ -28,6 +28,7 @@ struct GraphicContext {
 	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties     = {};
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
+	VmaAllocator                       spill_allocator                       = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               partial_buffers_enabled               = false;
 	bool                               host_import_enabled                   = false;
@@ -36,6 +37,7 @@ struct GraphicContext {
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	bool                               present_fences_enabled                = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               shader_resource_min_lod_enabled       = false;
 	bool                               robust_buffer_access_enabled          = false;
@@ -143,6 +145,8 @@ struct GraphicContext {
 	};
 	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image,
+	                                   bool bindless);
 	void                   DeleteImage(VulkanImage& image);
 	void                   TrimRecycledImages();
 	[[nodiscard]] size_t   RecycledImageCount() const;
@@ -187,6 +191,7 @@ struct VulkanImage {
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
 	bool recyclable = false;
+	bool spilled    = false;
 };
 
 

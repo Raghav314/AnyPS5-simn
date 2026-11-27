@@ -9,6 +9,7 @@ namespace GuestStacks {
 
 extern "C" {
 
+void PrepareGuestEntry_nid_no_patch() noexcept;
 void GuestStackRegister_nid_no_patch(const void* pointer, std::size_t bytes);
 void APS5_VABI GuestStackSwitch_nid_no_patch(std::uintptr_t stackPointer);
 #ifdef _WIN32

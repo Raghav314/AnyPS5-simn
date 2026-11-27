@@ -85,7 +85,6 @@ inline void Run(std::span<const uint32_t> original, uint8_t mode, uint8_t shape,
 	options.dump_ir            = false;
 	options.emit_debug_info    = false;
 	options.native_ray_tracing = true;
-	options.ray_stats          = false;
 	options.profile            = device_profile != nullptr ? device_profile : &profile;
 	const std::vector<uint32_t> user_data(16u + (shape & 15u), 0u);
 	options.user_data = user_data;

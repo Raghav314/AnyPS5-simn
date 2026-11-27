@@ -23,6 +23,8 @@ public:
 
 	[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout layout);
 	[[nodiscard]] vk::DescriptorSet CommitPersistent(vk::DescriptorSetLayout layout);
+	void ReleasePersistent(vk::DescriptorSet set);
+	void TrimCompletedPools();
 
 	static void RegisterLayout(vk::DescriptorSetLayout                         layout,
 	                           std::span<const vk::DescriptorSetLayoutBinding> bindings);
@@ -30,6 +32,8 @@ public:
 	static constexpr uint32_t MaxSampledImages = 262144;
 
 private:
+	friend struct VramBudgetTestAccess;
+
 	static constexpr uint32_t DescriptorSetBatch = 32;
 
 	struct Batch {
@@ -55,7 +59,7 @@ private:
 	std::vector<vk::DescriptorPoolSize>                m_free;
 	uint32_t                                           m_free_sets = 0;
 	std::deque<std::pair<Pool, uint64_t>>              m_pending_pools;
-	std::vector<vk::DescriptorPool>                    m_persistent_pools;
+	std::unordered_map<vk::DescriptorSet, vk::DescriptorPool> m_persistent_pools;
 	std::unordered_map<vk::DescriptorSetLayout, Batch> m_sets;
 	std::unordered_map<vk::DescriptorSetLayout, std::vector<vk::DescriptorPoolSize>> m_layout_sizes;
 };

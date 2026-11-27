@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <list>
 #include <mutex>
+#include <string>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -232,6 +233,9 @@ public:
     VideoOutDriver();
     ~VideoOutDriver();
     void Shutdown();
+#if defined(ANYPS5_KYTY)
+    void WarmStartupPipelines();
+#endif
 
     VideoOutDriver(const VideoOutDriver&) = delete;
     VideoOutDriver& operator=(const VideoOutDriver&) = delete;
@@ -264,6 +268,10 @@ private:
     std::mutex mutex;
     std::mutex shutdownMutex;
     bool stopped = false;
+#if defined(ANYPS5_KYTY)
+    std::atomic<bool> startupTitleChanged{false};
+    std::string startupTitle;
+#endif
     std::array<std::shared_ptr<VideoOutConfig>, VIDEO_OUT_NUM_MAX> contexts;
     std::array<std::shared_ptr<AgcDriver::IVideoOutput>, VIDEO_OUT_NUM_MAX> outputs;
     std::shared_ptr<FlipQueue> flipQueue = std::make_shared<FlipQueue>();

@@ -213,7 +213,7 @@ None is needed: a game converted with the relinker starts and runs on the defaul
 |---|---|---|
 | `ANYPS5_FULLSCREEN` | `0`, `1`, `windowed`, `borderless` | Opens the window fullscreen |
 | `ANYPS5_DISPLAY_INDEX` | index of a connected display, `0` by default | Display the window opens on |
-| `APS5_OUTPUT_RESOLUTION` | `<width>x<height>` | Output resolution reported to the game; unset, it follows the display. A size below 3840x2160 reports a sub-4K display, and a game that adapts to the display then renders fewer pixels. On a weaker GPU with a 4K display, `2560x1440` is worth a try |
+| `APS5_OUTPUT_RESOLUTION` | `<width>x<height>` | Output resolution reported to the game; unset, it follows the display. A size at least 2560x1440 reports a 4K display, and any smaller size a 1080p one, on which a game that adapts to the display renders fewer pixels. On a weaker GPU, `1920x1080` is worth a try |
 | `ANYPS5_GPU` | part of a GPU name, any case; unset for AnyKyty's choice (default) | Runs on the first Vulkan device whose name contains it, as in AnyPS5's own driver: `ANYPS5_GPU=radeon` or `ANYPS5_GPU=geforce`. The GPU the game runs on is in the host report that prints at start. A text that matches no device stops the game with a message that lists the devices. `KYTY_GPU`, the index that Kyty used, is not read |
 | `KYTY_HDR` | `0`, `1` | Asks for an HDR10 output when the display offers it |
 | `KYTY_STRETCH` | `0`, `1` | Fills the window instead of keeping the game's aspect ratio |
@@ -221,6 +221,7 @@ None is needed: a game converted with the relinker starts and runs on the defaul
 | `ANYPS5_VBLANK_HZ` | 30 to 360 | Vblank rate. A game that paces on vblank runs at the display's rate (about 60 FPS); raising it, for example to `240`, lifts that cap |
 | `ANYPS5_FPS_LIMIT` | 0.5 or more, `0` for no limit | Most frames per second the game presents |
 | `KYTY_PRESENT_MODE` | `Fifo`, `Mailbox`, `Immediate` | Vulkan present mode (`Mailbox` by default): `Fifo` waits for the display, `Immediate` may tear |
+| `KYTY_STARTUP_WAIT_SECONDS` | Whole seconds, default `900` | Maximum time the startup screen waits for known shaders and pipelines before the title’s entry point. Set `0` to start immediately. The title also starts after 120 seconds without a completed job. Pending work continues in the background. On Linux, dependent ELF modules may initialize before the main entry point |
 | `KYTY_ASYNC_PIPELINES` | `0`, `1` (default), `2` | What a draw does while its pipeline is still compiling: with `1` it waits up to 20 ms and is then skipped, so an object can be missing for a few frames the first time it shows; `2` skips more draws and waits for no new pipeline, for fewer stutters on a first run; `0` always waits, which avoids missing objects and stalls longer on a first run |
 | `KYTY_NATIVE_RT` | unset (default), `0`, `1` | Unset: native ray tracing when the GPU supports it. `0`: ray tracing emulated in shaders, for a GPU or a driver that struggles with it. `1`: native, and a stop with a message when the GPU cannot |
 

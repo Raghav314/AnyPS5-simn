@@ -38,6 +38,7 @@ struct NativeTraversals {
 	uint32_t                                   root          = 0;
 	std::array<uint32_t, 4>                    layout {};
 	std::vector<std::pair<uint32_t, uint32_t>> reach;
+	std::vector<RayQueryExtraSource>           extra_sources;
 	std::vector<NativeTraversals>              oracle_sources;
 	std::vector<OracleImprovement>             oracle_improvements;
 };
@@ -46,8 +47,11 @@ struct NativeTraversalOptions {
 	uint32_t wave_size = 64;
 	bool rewrite = false;
 	uint32_t oracle = 0;
+	bool emulation = true;
 	const Decoder::Program* decoded = nullptr;
 };
+
+[[nodiscard]] bool CompatibleRecordLayouts(std::array<uint32_t, 4> a, std::array<uint32_t, 4> b);
 
 [[nodiscard]] NativeTraversals TraceNativeTraversals(Program&                      program,
                                                      const NativeTraversalOptions& options);

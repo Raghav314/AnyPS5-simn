@@ -36,8 +36,8 @@ uint64_t DrawResourceKey(std::span<const ShaderStageRuntime* const> stages) {
 		add_values(snapshot.samplers);
 		words.push_back(static_cast<uint32_t>(snapshot.image_tables.size()));
 		for (const auto& table: snapshot.image_tables) {
-			words.push_back(static_cast<uint32_t>(table.slots_id));
-			words.push_back(static_cast<uint32_t>(table.slots_id >> 32u));
+			words.push_back(static_cast<uint32_t>(table->slots_id));
+			words.push_back(static_cast<uint32_t>(table->slots_id >> 32u));
 		}
 	}
 	const auto key = XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));

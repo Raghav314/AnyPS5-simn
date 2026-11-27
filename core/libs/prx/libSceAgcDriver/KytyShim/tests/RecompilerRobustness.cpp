@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+bool TestFixedLoopTail();
+
 namespace {
 
 struct Case {
@@ -707,6 +709,14 @@ bool CorrelatedPhi() {
 
 int main(int argc, char** argv) {
 	bool found = argc < 2;
+	if (argc < 2 || std::string_view(argv[1]) == "fixed-loop-tail") {
+		found = true;
+		if (!TestFixedLoopTail()) {
+			std::printf("fixed-loop-tail: FAILED\n");
+			return 1;
+		}
+		std::printf("fixed-loop-tail: ok\n");
+	}
 	if (argc < 2 || std::string_view(argv[1]) == "float-mode-bits") {
 		found = true;
 		if (!FloatModeBits()) return 1;

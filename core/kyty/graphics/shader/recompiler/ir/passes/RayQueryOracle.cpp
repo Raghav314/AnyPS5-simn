@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
 
+#include "graphics/shader/recompiler/ir/passes/LoopGuard.h"
+
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
 
@@ -126,6 +128,88 @@ uint32_t MarkOracleWalk(std::span<Inst* const> walk) {
 		bvh->SetFlags(bvh->Flags<uint32_t>() | flags);
 	}
 	return walk.empty() ? 0u : flags;
+}
+
+namespace {
+
+size_t BlockAt(const Program& program, const Block* block) {
+	return static_cast<size_t>(std::ranges::find(program.blocks, block) - program.blocks.begin());
+}
+
+Block* InnermostLoop(const Program& program, const Block* block) {
+	const auto at = BlockAt(program, block);
+	for (auto header = at + 1; header-- > 0;) {
+		const auto& term = program.blocks[header]->terminator;
+		if (term.loop_header && term.continue_block != nullptr && term.merge_block != nullptr &&
+		    BlockAt(program, term.continue_block) >= at) {
+			return program.blocks[header];
+		}
+	}
+	return nullptr;
+}
+
+bool Unserved(const Inst& inst) {
+	const auto op = inst.GetOpcode();
+	if (op == ValueOpcode::Bvh8Intersect) return (inst.Flags<uint32_t>() & BvhIntersectEmpty) != 0;
+	return op == ValueOpcode::BvhIntersect &&
+	       (inst.Flags<uint32_t>() & (BvhIntersectEmpty | BvhIntersectNative)) == BvhIntersectEmpty;
+}
+
+bool NativeWork(const Inst& inst) {
+	const auto op = inst.GetOpcode();
+	return op == ValueOpcode::RayQueryProceed || op == ValueOpcode::RayQueryNext ||
+	       (op == ValueOpcode::BvhIntersect && (inst.Flags<uint32_t>() & BvhIntersectNative) != 0);
+}
+
+}
+
+size_t MarkWalksEmpty(Program& program) {
+	size_t marked = 0;
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			const auto flags = inst.Flags<uint32_t>();
+			if (inst.GetOpcode() == ValueOpcode::Bvh8Intersect) {
+				inst.SetFlags(flags | BvhIntersectEmpty);
+				++marked;
+				continue;
+			}
+			if (inst.GetOpcode() != ValueOpcode::BvhIntersect) continue;
+			inst.SetFlags((flags & ~BvhIntersectOracle & ~BvhIntersectOracleLane & ~BvhIntersectOracleMulti) | BvhIntersectEmpty | BvhIntersectStrict);
+			marked += (flags & (BvhIntersectNative | BvhIntersectEmpty)) == 0 ? 1u : 0u;
+		}
+	}
+	return marked;
+}
+
+EmptyWalkBounds BoundEmptyWalks(Program& program, uint32_t limit, uint32_t native_limit) {
+	EmptyWalkBounds     bounds;
+	std::vector<Block*> headers;
+	for (auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (!Unserved(inst)) continue;
+			if (program.dispatcher_fallback) {
+				++bounds.refused;
+				continue;
+			}
+			auto* header = InnermostLoop(program, block);
+			if (header != nullptr && std::ranges::find(headers, header) == headers.end()) headers.push_back(header);
+		}
+	}
+	for (auto* header: headers) {
+		const auto first  = BlockAt(program, header);
+		const auto last   = BlockAt(program, header->terminator.continue_block);
+		bool       native = false;
+		for (auto at = first; at <= last && !native; ++at) {
+			native = std::ranges::any_of(*program.blocks[at], NativeWork);
+		}
+		if (GuardLoop(program, *header, native ? native_limit : limit, LoopExit::EmptyWalk) == nullptr) {
+			++(native ? bounds.native : bounds.empty);
+			bounds.headers.push_back(header);
+		} else {
+			++bounds.refused;
+		}
+	}
+	return bounds;
 }
 
 size_t MarkEmptyWalk(const Program& program, std::span<Inst* const> intersections, const NativeTraversalOptions& options) {

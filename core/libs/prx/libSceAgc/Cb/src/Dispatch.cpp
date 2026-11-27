@@ -1,6 +1,7 @@
 #include "prx/libSceAgc/Cb/include/Dispatch.hpp"
 
 #include "prx/libSceAgc/Command/include/Packet.hpp"
+#include "prx/libSceAgc/Command/include/DispatchTrace.hpp"
 #include <cstdint>
 #include <cstddef>
 #include "SceTypes.hpp"
@@ -9,7 +10,9 @@
 extern "C" {
 
 std::uint32_t* APS5_VABI sceAgcCbDispatch(CommandBuffer* buf, std::uint32_t threadGroupX, std::uint32_t threadGroupY, std::uint32_t threadGroupZ, std::uint32_t modifier) {
-    return Agc::Command::Emit(buf, 0x15u, {threadGroupX, threadGroupY, threadGroupZ, (modifier & 0xa038u) | 0x41u}, __func__);
+    auto* packet = Agc::Command::Emit(buf, 0x15u, {threadGroupX, threadGroupY, threadGroupZ, (modifier & 0xa038u) | 0x41u}, __func__);
+    Agc::Command::TraceDispatch(packet, 5, __builtin_extract_return_addr(__builtin_return_address(0)));
+    return packet;
 }
 
 uint32_t APS5_VABI sceAgcCbDispatchGetSize(void) {

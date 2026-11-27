@@ -71,10 +71,6 @@
 
 namespace Libs::Graphics {
 
-namespace {
-uint32_t TableXprMode();
-}
-
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
 	auto     vertex_offset   = static_cast<int32_t>(index_offset);
@@ -483,13 +479,26 @@ static void PrepareDrawRayTracing(RenderContext& context, CommandBuffer& buffer,
 			preparation.header = uint64_t {words[source.header_slots[0]]} | uint64_t {words[source.header_slots[1]]} << 32u;
 		}
 	}
-	if (known && native_rt->Prepared(preparation)) {
+	const auto& extras = info.ray_query_extra_sources;
+	if (extras.empty() && known && native_rt->Prepared(preparation)) {
 		return;
 	}
 	buffer.EndRendering();
 	native_rt->Prepare(buffer.Handle(), pointer, source, bindings.flattened_srt, frame, module.info.shader_hash);
-	if (known) {
+	if (extras.empty() && known) {
 		native_rt->KeepPrepared(preparation);
+	}
+	for (uint32_t index = 0; index < extras.size(); index++) {
+		const auto extra = RayTracing::ExtraTlasSource(extras[index]);
+		if (extra.user_sgpr + 1 >= HW::UserSgprInfo::SGPRS_MAX) {
+			native_rt->InvalidateContext(buffer.Handle(), index + 1);
+			continue;
+		}
+		const auto extra_pointer = RayTracing::UserPointer(
+		    extra, uint64_t {user[extra.user_sgpr]} | (uint64_t {user[extra.user_sgpr + 1]} << 32u),
+		    [&](uint64_t address, uint64_t size) { return context.IsMapped(address, size); });
+		native_rt->Prepare(buffer.Handle(), extra_pointer, extra, bindings.flattened_srt, frame, module.info.shader_hash,
+		                   false, false, index + 1);
 	}
 }
 
@@ -519,6 +528,13 @@ struct RenderExecutor::ResolvedDraw {
 	std::atomic_bool       busy {false};
 	enum : uint8_t { Ready, Pending, Failed };
 	std::atomic<uint8_t> state {Ready};
+
+	void ReleaseLargeReadLog() {
+		constexpr size_t MaxRetainedBytes = 256 * 1024;
+		if (programs.reads.WordCount() >= MaxRetainedBytes / sizeof(uint32_t)) {
+			programs.reads = {};
+		}
+	}
 };
 
 struct RenderExecutor::ResolvedDrawRing {
@@ -560,6 +576,7 @@ void NoteFlatDefer(uint32_t words, uint32_t gpu_words) {
 
 void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {
 	(void)WaitResolvedDraw(resolved);
+	resolved->ReleaseLargeReadLog();
 	resolved->busy.store(false, std::memory_order_release);
 }
 
@@ -1605,6 +1622,7 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(
 	if (!ResolveDrawPrograms(draw, context, user_config, shaders, indirect_offsets, indirect_draw, context_id,
 	                         user_config_id)) {
 		NoteAheadRefusal(false, draw.programs.reads.Refusal());
+		draw.ReleaseLargeReadLog();
 		return nullptr;
 	}
 	draw.busy.store(true, std::memory_order_relaxed);
@@ -1706,6 +1724,7 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDispatchAhead(const HW::Con
 	if (slot.programs.reads.Failed() || slot.compute_module == nullptr) {
 		slot.compute_module = nullptr;
 		NoteAheadRefusal(true, slot.programs.reads.Refusal());
+		slot.ReleaseLargeReadLog();
 		return nullptr;
 	}
 	slot.busy.store(true, std::memory_order_relaxed);
@@ -1736,6 +1755,7 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveIndirectDispatchAhead(
 	if (slot.programs.reads.Failed() || slot.compute_module == nullptr) {
 		slot.compute_module = nullptr;
 		NoteAheadRefusal(true, slot.programs.reads.Refusal());
+		slot.ReleaseLargeReadLog();
 		return nullptr;
 	}
 	slot.busy.store(true, std::memory_order_relaxed);
@@ -2214,6 +2234,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		} else {
 			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
 		}
+		const auto& layout = state.vertex_info[i].stage.module->info.bindings;
+		if (layout.clip_plane_dwords != 0) {
+			const auto& planes = buffer.GetRegisters().GetUserClipPlanes();
+			EXIT_IF(layout.clip_plane_dwords > planes.size());
+			std::copy_n(planes.begin(), layout.clip_plane_dwords,
+			            bindings.vertex[i].shader_data.begin() + layout.ClipPlaneDword());
+		}
 		descriptor_stages[stage_count++] = &bindings.vertex[i];
 	}
 	if (state.ps_active) {
@@ -2357,12 +2384,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
 		                        draw_dwords * sizeof(uint32_t), draw_data.data());
 	}
-	if (const auto planes = vertex_stages.back().user_clip_planes; planes != 0) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
-		                        PushData::UserClipPlaneDword * sizeof(uint32_t),
-		                        std::bit_width(planes) * 4u * sizeof(uint32_t),
-		                        buffer.GetRegisters().GetUserClipPlanes().data());
-	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
 	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), m_draw_targets->depth,
@@ -2389,6 +2410,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	buffer.BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	m_context.NoteFirstGuestCommand(false);
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {

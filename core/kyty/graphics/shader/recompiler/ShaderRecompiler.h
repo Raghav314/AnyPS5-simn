@@ -28,17 +28,21 @@ struct CompileOptions {
 	bool                        emit_debug_info            = false;
 	const Spirv::Profile*       profile                    = &Spirv::DefaultProfile;
 	bool                        native_ray_tracing         = false;
-	bool                        ray_stats                  = false;
 	uint32_t                    rt_oracle                  = 0;
+	bool                        rt_emulation               = true;
 	bool                        table_mode                 = false;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
 	bool                        plain_mip_stats_variant    = false;
 	bool                        wave_lane_pairs            = false;
+	bool                        runtime_buffer_descriptors = false;
+	bool                        runtime_sampler_descriptors = false;
+	uint32_t                    sampler_limit              = UINT32_MAX;
 };
 
 struct TranslateResult {
+	ShaderBvh                          bvh = ShaderBvh::None;
 	IR::Program                        program;
 	std::string                        decoded_dump;
 	std::string                        cfg_dump;
@@ -49,6 +53,7 @@ struct TranslateResult {
 struct CompileResult {
 	std::vector<uint32_t>  spirv;
 	std::string            table_refusal;
+	uint64_t               required_samplers = 0;
 	std::vector<uint32_t>  spirv_plain;
 	std::string            decoded_dump;
 	std::string            ir_dump;

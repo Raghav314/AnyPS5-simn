@@ -62,6 +62,9 @@ struct TextureBinding {
 	TextureDescDerivation* lookup = nullptr;
 	bool                   reused   = false;
 	bool                   declined = false;
+	uint64_t               table_serial = 0;
+
+	[[nodiscard]] TableImageRef TableImage() const { return {image_id, table_serial}; }
 };
 
 struct PreparedBindings {
@@ -70,6 +73,12 @@ struct PreparedBindings {
 		uint64_t size    = 0;
 		BufferId id;
 	};
+	struct TableImageSource {
+		TableViewMemo*                              view;
+		const ShaderRecompiler::IR::DescriptorValue* descriptor;
+		uint32_t                                    root;
+		uint32_t                                    version;
+	};
 
 	const ShaderStageRuntime* runtime = nullptr;
 	std::vector<BufferSource>             buffer_sources;
@@ -77,10 +86,7 @@ struct PreparedBindings {
 	std::vector<vk::DescriptorBufferInfo> uniform_buffers;
 	std::vector<TextureBinding>           images;
 	std::vector<TextureBinding*>                        table_images;
-	std::vector<TableViewMemo*>                         table_views;
-	std::vector<ShaderRecompiler::IR::DescriptorValue> table_sources;
-	std::vector<uint32_t>                               table_roots;
-	std::vector<uint32_t>                               table_versions;
+	std::vector<TableImageSource>                       table_sources;
 	std::vector<uint32_t>                               table_slots;
 	void*                                               table_state   = nullptr;
 	bool                                                tables_reused = false;
@@ -103,6 +109,13 @@ struct PreparedBindings {
 	std::vector<TextureDescDerivation*>                image_descs;
 	const DrawTemplateStage* template_stage  = nullptr;
 	uint64_t                 template_images = 0;
+
+	void MarkTableElement(std::span<uint64_t> marks, uint64_t stamp, uint32_t element) {
+		if (marks[element] != stamp) {
+			marks[element] = stamp;
+			table_visits.push_back(element);
+		}
+	}
 };
 
 [[nodiscard]] vk::DescriptorType

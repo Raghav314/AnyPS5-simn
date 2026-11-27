@@ -178,6 +178,16 @@ void RawSlot(bool sharing) {
 	      "raw: a bound request never takes the module of an empty slot");
 	Check(IR::EmptyBuffersServe(program.plan, zero.snapshot, mixed, bound.specialization) == sharing,
 	      "raw: an empty request takes the module of the bound slot");
+	Check(IR::PopulatedBuffersCoverEmptySpecialization(program.plan, mixed, bound.specialization) == sharing,
+	      "raw: precook can cover a marked empty vector slot with the bound variant");
+	Check(!IR::PopulatedBuffersCoverEmptySpecialization(program.plan, bound.specialization, mixed),
+	      "raw: precook retains a bound variant even with an empty variant available");
+	Check(!IR::PopulatedBuffersCoverEmptySpecialization(program.plan, loaded_mixed, bound.specialization),
+	      "raw: a zero-stride descriptor with records still needs its own precook variant");
+	Check(!IR::PopulatedBuffersCoverEmptySpecialization(scalar.plan, mixed, bound.specialization),
+	      "raw: a mark on a scalar slot alone does not prove zero records");
+	Check(!IR::EmptyBuffersServe(program.plan, loaded.snapshot, mixed, bound.specialization),
+	      "raw: precook coverage cannot bypass the live record count check");
 	auto recorded = bound.specialization;
 	recorded.buffers[slot].zero_stride_oob = true;
 	recorded.buffers[slot].packed_stride   = 0;
@@ -223,6 +233,13 @@ void FormattedSlot(bool sharing) {
 		Check(IR::EmptyBuffersServe(program.plan, zero.snapshot, zero.specialization, bound.specialization) ==
 		          (sharing && test.served),
 		      name + ": the null slot takes the bound module only when every read component reads the same");
+		Check(IR::PopulatedBuffersCoverEmptySpecialization(program.plan, zero.specialization, bound.specialization) ==
+		          (sharing && test.served),
+		      name + ": precook keeps the null variant when a consumed component differs");
+		auto different_images = bound.specialization;
+		different_images.images.emplace_back();
+		Check(!IR::PopulatedBuffersCoverEmptySpecialization(program.plan, zero.specialization, different_images),
+		      name + ": precook coverage requires identical image forms");
 		Check(!IR::EmptyBuffersServe(program.plan, other.snapshot, other.specialization, bound.specialization),
 		      name + ": a bound slot of another format never takes the module");
 	}

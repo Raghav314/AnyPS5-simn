@@ -14,7 +14,7 @@ inline size_t ParallelThreads() {
 }
 
 template <typename Job>
-void ParallelFor(size_t count, const Job& job) {
+void ParallelFor(size_t count, const Job& job, size_t max_threads = ParallelThreads()) {
 	std::atomic_size_t next = 0;
 	const auto         work = [&] {
 		for (auto i = next++; i < count; i = next++) {
@@ -22,7 +22,7 @@ void ParallelFor(size_t count, const Job& job) {
 		}
 	};
 	std::vector<std::jthread> helpers;
-	for (auto i = std::min(count, ParallelThreads()); i > 1; i--) {
+	for (auto i = std::min(count, max_threads); i > 1; i--) {
 		helpers.emplace_back(work);
 	}
 	work();

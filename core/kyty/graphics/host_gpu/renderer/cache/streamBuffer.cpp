@@ -257,6 +257,21 @@ void Buffer::Create(vk::BufferUsageFlags flags) {
 		    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
 		                    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
 	}
+	m_allocator = graphics.allocator;
+	if (result != vk::Result::eSuccess && graphics.spill_allocator != nullptr) {
+		VmaAllocationCreateInfo spill_info = allocation_info;
+		spill_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+		if (usage == MemoryUsage::DeviceLocal) {
+			spill_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		}
+		result = static_cast<vk::Result>(
+		    vmaCreateBuffer(graphics.spill_allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &spill_info,
+		                    &native_buffer, &m_allocation, &allocation_result));
+		if (result == vk::Result::eSuccess) {
+			m_allocator = graphics.spill_allocator;
+			LOGF("Buffer allocation past the heap limit placed by the spill allocator: size=%" PRIu64 "\n", size);
+		}
+	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
 		EXIT("Buffer allocation failed: %s, size=%" PRIu64 ", memory_usage=%u, flags=0x%x\n",
@@ -273,7 +288,7 @@ void Buffer::Create(vk::BufferUsageFlags flags) {
 	}
 
 	VkMemoryPropertyFlags properties = 0;
-	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
+	vmaGetAllocationMemoryProperties(m_allocator, m_allocation, &properties);
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 #if defined(ANYPS5_KYTY)
 	m_device_local = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
@@ -307,7 +322,7 @@ Buffer::~Buffer() {
 	if (m_in_place) {
 		m_graphics->device.destroyBuffer(m_buffer);
 	} else {
-		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+		vmaDestroyBuffer(m_allocator, m_buffer, m_allocation);
 	}
 }
 
@@ -315,7 +330,7 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
-		    vmaFlushAllocation(m_graphics->allocator, m_allocation, offset, size);
+		    vmaFlushAllocation(m_allocator, m_allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
 }
@@ -324,7 +339,7 @@ void Buffer::Invalidate(uint64_t offset, uint64_t size) {
 	EXIT_IF(m_usage != MemoryUsage::Download || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
-		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
+		    vmaInvalidateAllocation(m_allocator, m_allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
 }

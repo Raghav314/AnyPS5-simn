@@ -1,7 +1,11 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineStoreFormat.h"
 
+#include "common/emulatorConfig.h"
+#include "common/logging/log.h"
 #include "common/parallelFor.h"
+#include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 
@@ -9,6 +13,8 @@
 #include <cstring>
 #include <xxhash.h>
 #if defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/pipeline/pipelineLinkedStore.h"
+#include <fstream>
 #include "kytyShaderStoreStamp.h"
 
 #include <cstdlib>
@@ -121,7 +127,9 @@ struct PipelineCache::StoreRecord {
 	ProgramKey                         key;
 	ShaderRecompiler::IR::ResourcePlan plan;
 	bool                               plan_loaded = false;
+	bool                               incompatible = false;
 	ShaderModule                       module;
+	uint32_t                           table_cursor = 0;
 	GraphicsPipelineKey                pipeline {};
 	uint64_t                           layout_key = 0;
 	ShaderTessellationInputInfo        layout;
@@ -146,19 +154,27 @@ size_t PipelineCache::RestoreStoreRecords(std::span<const uint8_t> bytes, std::s
 		}
 		std::vector<StoreRecord> loaded(frames.size());
 		std::vector<uint8_t>     read(frames.size());
-		Common::ParallelFor(frames.size(), [&](size_t i) { read[i] = ReadRecord(frames[i], loaded[i]) ? 1 : 0; });
+		Common::ParallelFor(frames.size(), [&](size_t i) { read[i] = ReadRecord(frames[i], loaded[i]) ? 1 : 0; },
+		                    Common::ParallelThreads());
 		size_t kept = 0;
 		while (kept < frames.size() && read[kept] != 0 && AddRecord(loaded[kept])) {
 			records = records.subspan(frames[kept].size());
 			kept++;
 		}
 		for (size_t i = kept + 1; i < frames.size(); i++) {
-			if (read[i] != 0 && loaded[i].type == Record::Module) {
-				DestroyModule(loaded[i].module);
+			const auto& entry = loaded[i];
+			if (read[i] != 0 && !entry.incompatible &&
+			    (entry.type == Record::Module || entry.type == Record::TableModule)) {
+				DestroyModule(entry.module);
 			}
 		}
 	}
 	return reusable ? bytes.size() - records.size() : 0;
+}
+
+static uint32_t StoredRayTracingMode(const ShaderModule& module) {
+	return RayTracingModuleMode(module.bvh, module.info.stage, RayTracing::NativeTraversals() && !module.guest_traversal,
+	                            Config::RayTracingEmulation(), Config::RayTracingOracle());
 }
 
 bool PipelineCache::ReadRecord(std::span<const uint8_t> frame_bytes, StoreRecord& record) const {
@@ -182,6 +198,15 @@ bool PipelineCache::ReadRecord(std::span<const uint8_t> frame_bytes, StoreRecord
 			if (!complete()) {
 				return false;
 			}
+			record.key.guest_traversal = module.guest_traversal;
+			const auto& info = module.info.info;
+			const bool legacy_rt = module.bvh == ShaderBvh::None && (info.bvh || info.bvh8 || info.ray_query);
+			if (legacy_rt || module.rt_mode != StoredRayTracingMode(module)) {
+				record.incompatible = true;
+				return true;
+			}
+			const std::array<const ShaderModule*, 1> stages {&module};
+			if (!SampledDescriptorBudgetFits(stages)) return false;
 			record.plan_loaded = ShaderRecompiler::IR::LoadResourcePlan(plan, record.plan);
 			module.module      = CompileSPV(spirv, m_graphics.device);
 			module.spirv_words = static_cast<uint32_t>(spirv.size());
@@ -194,7 +219,27 @@ bool PipelineCache::ReadRecord(std::span<const uint8_t> frame_bytes, StoreRecord
 			}
 			return true;
 		}
-		case Record::GraphicsPipeline: {
+		case Record::TableModule: {
+			auto& module = record.module;
+			std::vector<uint32_t> spirv, plain_spirv;
+			reader.allocation_budget = 64u << 20;
+			if (!DecodeTableModuleRecord(reader, record.key, record.table_cursor, module, spirv, plain_spirv)) return false;
+			const std::array<const ShaderModule*, 1> stages {&module};
+			if (!SampledDescriptorBudgetFits(stages)) return false;
+			module.module = CompileSPV(spirv, m_graphics.device);
+			if (module.module == nullptr) return false;
+			module.spirv_words = static_cast<uint32_t>(spirv.size());
+			if (!plain_spirv.empty()) {
+				module.plain = MakePlainModule(module, plain_spirv, m_graphics.device);
+				if (module.plain == nullptr) {
+					DestroyModule(module);
+					return false;
+				}
+			}
+			return true;
+		}
+		case Record::GraphicsPipeline:
+		case Record::NativeGraphicsPipeline: {
 			reader.Raw(&record.pipeline, sizeof(record.pipeline));
 			return complete();
 		}
@@ -209,6 +254,7 @@ bool PipelineCache::ReadRecord(std::span<const uint8_t> frame_bytes, StoreRecord
 bool PipelineCache::AddRecord(StoreRecord& record) {
 	switch (record.type) {
 		case Record::Module: {
+			if (record.incompatible) return true;
 			const auto [program, inserted] = m_program_cache.try_emplace(std::move(record.key));
 			if (inserted) {
 				if (!record.plan_loaded) {
@@ -222,8 +268,28 @@ bool PipelineCache::AddRecord(StoreRecord& record) {
 			program->second.modules.back().plan = &program->second.resource_plan;
 			break;
 		}
+		case Record::TableModule: {
+			auto& variants = m_table_programs[std::move(record.key)];
+			if (std::ranges::any_of(variants, [&](const TableVariant& variant) {
+				    return variant.push_data_cursor == record.table_cursor &&
+				           variant.specialization == record.module.specialization;
+			    })) {
+				DestroyModule(record.module);
+				break;
+			}
+			auto& variant = variants.emplace_back();
+			variant.specialization = record.module.specialization;
+			variant.push_data_cursor = record.table_cursor;
+			variant.done = true;
+			variant.module = std::move(record.module);
+			break;
+		}
 		case Record::GraphicsPipeline: {
 			m_graphics_pipelines.try_emplace(record.pipeline);
+			break;
+		}
+		case Record::NativeGraphicsPipeline: {
+			m_native_graphics_pipelines.try_emplace(record.pipeline);
 			break;
 		}
 		case Record::TessellationLayout: {
@@ -247,12 +313,30 @@ void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
 	}
 }
 
+void PipelineCache::StoreTableModule(const ProgramKey& key, uint32_t cursor, const ShaderModule& module,
+                                     const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain_spirv) {
+	if (!m_store) return;
+	std::vector<uint8_t> record;
+	if (EncodeTableModuleRecord(key, cursor, module, spirv, plain_spirv, record)) {
+		m_store.Append(std::move(record));
+	}
+}
+
 void PipelineCache::StorePipeline(const GraphicsPipelineKey& key) {
 	if (!m_store) {
 		return;
 	}
 	Writer record;
 	IoAll(record, Record::GraphicsPipeline);
+	record.Raw(&key, sizeof(key));
+	m_store.Append(std::move(record.bytes));
+}
+
+void PipelineCache::StoreNativePipeline(const GraphicsPipelineKey& key,
+                                        const std::array<const ShaderModule*, 4>& stages) {
+	if (!m_store || !ValidNativeGraphicsStages(key, stages)) return;
+	Writer record;
+	IoAll(record, Record::NativeGraphicsPipeline);
 	record.Raw(&key, sizeof(key));
 	m_store.Append(std::move(record.bytes));
 }

@@ -19,6 +19,7 @@
 
 #include "common/emulatorConfig.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/command_processor/computeDispatchOrigin.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -600,6 +601,21 @@ extern "C" void AgcDriverSuspendPoint_nid_postfix() try {
     LibcAwaitExit_nid_postfix();
 }
 
+extern "C" bool AgcDriverHasStartupPipelineData_nid_postfix() {
+    KytyShim::StartRuntime();
+    return Libs::Graphics::PipelineCache::HasStartupPipelineData();
+}
+
+extern "C" bool AgcDriverWaitForStartupManifest_nid_postfix(std::uint32_t* done, std::uint32_t* total, bool* memoryPaused) try {
+    auto& s = KytyShim::Entry::state();
+    std::shared_lock gate(s.gate);
+    KytyShim::Entry::CheckStopping();
+    auto& cache = KytyShim::Entry::Renderer().GetPipelineCache();
+    return cache.WaitForStartupManifest(std::chrono::milliseconds(250), *done, *total, *memoryPaused);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
+}
+
 extern "C" void AgcDriverWaitIdle_nid_postfix() try {
     KytyShim::Replay::RequireNotHeld("AgcDriverWaitIdle");
     auto& s = KytyShim::Entry::state();
@@ -736,6 +752,11 @@ extern "C" void* AgcDriverStaticTable_nid_postfix() {
 extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address, std::size_t bytes) {
     static_cast<void>(address);
     static_cast<void>(bytes);
+}
+
+extern "C" void AgcDriverRecordComputePacketOrigin_nid_no_patch(const std::uint32_t* packet, std::uint32_t count,
+                                                                std::uint64_t callerReturn) {
+    Libs::Graphics::ComputeDispatchTrace::Record(packet, count, callerReturn);
 }
 
 extern "C" void AgcDriverNoteCommandSegment_nid_no_patch(std::uint64_t address, std::size_t bytes) {

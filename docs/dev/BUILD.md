@@ -264,7 +264,7 @@ Use each runtime's full compiled AGC commit, not the current source checkout's c
 
 For Kyty, set `ANYPS5_GPU` in the shared environment too. The shared or per-arm environment also accepts
 `KYTY_GPU_PIPELINE`, `KYTY_GPU_SPIN_US`, `KYTY_NATIVE_RT`, `KYTY_PIPELINE_MANIFEST`, `KYTY_PRINTF_DIRECTION`,
-`KYTY_RT_CHECK`, `KYTY_RT_CHECK_PPM`, `KYTY_RT_CHECK_STRIKES`, `KYTY_RT_ORACLE`, `KYTY_RT_STATS` and
+`KYTY_RT_CHECK`, `KYTY_RT_CHECK_PPM`, `KYTY_RT_CHECK_STRIKES`, `KYTY_RT_EMULATION`, `KYTY_RT_ORACLE`, `KYTY_RT_STATS` and
 `KYTY76_LDS_SYNC`. Move these controls from shell exports into the recipe. The runner clears inherited `KYTY_*`
 and `KYTY76_LDS_SYNC` settings before inspection and replay. Strict replay controls `KYTY_FALLBACKS`.
 

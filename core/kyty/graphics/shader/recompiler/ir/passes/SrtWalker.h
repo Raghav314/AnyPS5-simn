@@ -51,6 +51,7 @@ struct ImageHeapList {
 	uint32_t                         resource = 0;
 	const ImageResource*             root     = nullptr;
 	std::span<const DescriptorValue> values;
+	const ImageTableSnapshot*        table = nullptr;
 };
 
 class ImageHeapSource {
