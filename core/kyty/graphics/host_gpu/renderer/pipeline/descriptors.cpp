@@ -1796,7 +1796,7 @@ void RenderExecutor::PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderI
 	const size_t sorted_spans = state.spans.size();
 	for (const auto& changed: m_table_changed_slots) {
 		auto&       range = state.ranges[changed.range];
-		const auto& table = snapshot.image_tables.at(range.table);
+		const auto& table = *snapshot.image_tables.at(range.table);
 		const auto& value = changed.index != 0u && changed.index < table.slots.size()
 		                        ? table.slots[changed.index]
 		                        : null_value;
@@ -1984,7 +1984,7 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 			same    = false;
 			return;
 		}
-		const auto& table = snapshot.image_tables.at(root.table);
+		const auto& table = *snapshot.image_tables.at(root.table);
 		if (table.slots_id != 0 && table.slots_id == cached.slots_id) {
 			slot_index += root.table_capacity;
 			return;
@@ -2371,7 +2371,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			return;
 		}
 		const auto& root  = program.info.images.at(root_index);
-		const auto& table = snapshot.image_tables.at(root.table);
+		const auto& table = *snapshot.image_tables.at(root.table);
 		const ShaderRecompiler::IR::DescriptorValue null_value {.dword_count = 8u};
 		auto& resolution = FindTableResolution(root);
 		table_state->ranges.push_back(

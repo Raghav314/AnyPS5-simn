@@ -1303,7 +1303,7 @@ bool MaterializeImageTable(const ResourcePlan& program,
                            const DescriptorValue& table_value, uint32_t image_index,
                            const SrtRuntime& runtime, ResourceSnapshot& snapshot,
                            ResourceSpecialization& specialization,
-                           std::vector<ImageTableSnapshot>& previous,
+                           const std::vector<ImageTableSnapshotPtr>& previous,
                            std::vector<uint32_t>& mapping_offsets) {
 	ShaderBufferResource table;
 	if (table_value.dword_count != 4u || !DecodeBufferDescriptor(table_value, table) ||
@@ -1317,40 +1317,29 @@ bool MaterializeImageTable(const ResourcePlan& program,
 	    {size > indirect.table_offset ? (size - indirect.table_offset) / 32u : 0u,
 	     uint64_t {entry_mask} + 1u, MaxIndirectDescriptorProbes});
 	const auto& root = program.info.images[image_index];
-	const auto same_table = [&](const ImageTableSnapshot& candidate) {
-		return candidate.Matches(base, size, indirect.table_offset, entry_mask, root.r128);
+	const auto same_table = [&](const ImageTableSnapshotPtr& candidate) {
+		return candidate && candidate->Matches(base, size, indirect.table_offset, entry_mask, root.r128);
 	};
 	auto found = std::ranges::find_if(snapshot.image_tables, same_table);
 	if (found == snapshot.image_tables.end()) {
-		ImageTableSnapshot next {.base = base, .size = size, .offset = indirect.table_offset,
-		                         .entry_mask = entry_mask, .r128 = root.r128};
 		static thread_local std::vector<uint32_t> words;
 		words.resize(static_cast<size_t>(entries) * 8u);
 		if (!words.empty() && !ReadScalarTable(base, size, indirect.table_offset, runtime, words)) {
 			return false;
 		}
-		const auto reusable = std::ranges::find_if(previous, [&](const ImageTableSnapshot& old) {
-			return same_table(old) && old.raw == words && !old.slots.empty();
-		});
-		static thread_local std::array<ImageTableSnapshot, 4> built;
-		static thread_local uint32_t                          built_next = 0;
-		const auto cached = reusable != previous.end()
-		                        ? built.end()
-		                        : std::ranges::find_if(built, [&](const ImageTableSnapshot& old) {
-			                          return same_table(old) && !old.slots.empty() &&
-			                                 old.raw == words;
-		                          });
-		if (reusable != previous.end()) {
-			next.raw      = std::move(reusable->raw);
-			next.slots    = std::move(reusable->slots);
-			next.mapping  = std::move(reusable->mapping);
-			next.slots_id = std::exchange(reusable->slots_id, 0);
-		} else if (cached != built.end()) {
-			next.raw.swap(words);
-			next.slots    = cached->slots;
-			next.mapping  = cached->mapping;
-			next.slots_id = cached->slots_id;
+		const auto unchanged = [&](const ImageTableSnapshotPtr& old) {
+			return same_table(old) && !old->slots.empty() && old->raw == words;
+		};
+		static thread_local std::array<ImageTableSnapshotPtr, 4> built;
+		static thread_local uint32_t built_next = 0;
+		ImageTableSnapshotPtr selected;
+		if (const auto old = std::ranges::find_if(previous, unchanged); old != previous.end()) {
+			selected = *old;
+		} else if (const auto cached = std::ranges::find_if(built, unchanged); cached != built.end()) {
+			selected = *cached;
 		} else {
+			ImageTableSnapshot next {.base = base, .size = size, .offset = indirect.table_offset,
+			                         .entry_mask = entry_mask, .r128 = root.r128};
 			static std::atomic<uint64_t> next_slots_id {0};
 			next.slots_id = ++next_slots_id;
 			next.raw.swap(words);
@@ -1375,11 +1364,14 @@ bool MaterializeImageTable(const ResourcePlan& program,
 				}
 				next.mapping[entry + 1u] = slot;
 			}
-			built[built_next++ % built.size()] = next;
+			next.raw.shrink_to_fit();
+			next.slots.shrink_to_fit();
+			selected = std::make_shared<const ImageTableSnapshot>(std::move(next));
+			built[built_next++ % built.size()] = selected;
 		}
-		snapshot.image_tables.push_back(std::move(next));
+		snapshot.image_tables.push_back(std::move(selected));
 		mapping_offsets.push_back(static_cast<uint32_t>(snapshot.flattened_srt.size()));
-		const auto& mapping = snapshot.image_tables.back().mapping;
+		const auto& mapping = snapshot.image_tables.back()->mapping;
 		snapshot.flattened_srt.insert(snapshot.flattened_srt.end(), mapping.begin(), mapping.end());
 		if (g_stable_indirect_layouts.load(std::memory_order_relaxed)) {
 			snapshot.flattened_srt.resize(
@@ -1387,18 +1379,19 @@ bool MaterializeImageTable(const ResourcePlan& program,
 		}
 		found = snapshot.image_tables.end() - 1;
 	}
+	const auto& slots = (*found)->slots;
 	const auto table_index     = static_cast<uint32_t>(found - snapshot.image_tables.begin());
 	auto&      image           = specialization.images[image_index];
 	image.table                = table_index;
-	image.table_capacity       = ImageTableCapacity(found->slots.size());
+	image.table_capacity       = ImageTableCapacity(slots.size());
 	image.table_mapping_offset = mapping_offsets[table_index];
 	image.table_entry_mask     = entry_mask;
 	snapshot.images[image_index] = {.dword_count = 8u};
 	for (const bool float_only: {true, false}) {
-		const auto exemplar = std::ranges::find_if(found->slots, [&](const DescriptorValue& slot) {
+		const auto exemplar = std::ranges::find_if(slots, [&](const DescriptorValue& slot) {
 			return TableExemplar(root, slot, float_only);
 		});
-		if (exemplar != found->slots.end()) {
+		if (exemplar != slots.end()) {
 			snapshot.images[image_index] = *exemplar;
 			break;
 		}
@@ -2880,7 +2873,7 @@ static bool MaterializeResourcesForViews(const ResourcePlan& program, const SrtR
 		const ImageTableSnapshot* captured = nullptr;
 		if (natural != nullptr && original != nullptr && i < views.size() && views[i].heap &&
 		    natural->images[i].table < original->image_tables.size()) {
-			captured = &original->image_tables[natural->images[i].table];
+			captured = original->image_tables[natural->images[i].table].get();
 		}
 		if ((use_table || !MaterializeImageTableHeap(program, indirect, table, i, observed, snapshot, specialization, captured)) &&
 		    !MaterializeImageTable(program, indirect, table, i, observed, snapshot, specialization,
@@ -3712,7 +3705,7 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 			auto view = specialization.images[index];
 			const auto& served = target.images[index];
 			if (view.table_capacity != 0 && view.table < snapshot.image_tables.size() &&
-			    served.table_capacity >= snapshot.image_tables[view.table].slots.size()) {
+			    served.table_capacity >= snapshot.image_tables[view.table]->slots.size()) {
 				view.table_capacity = served.table_capacity;
 			}
 			fits = view == served;

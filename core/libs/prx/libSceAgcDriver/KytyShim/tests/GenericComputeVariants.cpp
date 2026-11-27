@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -205,6 +206,64 @@ struct TestImageHeap final: IR::ImageHeapSource {
 	}
 };
 
+void CheckImageTableLifetime(IR::ResourcePlan& plan, IR::SrtRuntime runtime) {
+	std::vector<size_t> reads;
+	runtime.userdata = &reads;
+	runtime.read_specialization_memory = [](void* userdata, uint64_t address, std::span<uint32_t> words) {
+		if (address == TableAddress) static_cast<std::vector<size_t>*>(userdata)->push_back(words.size());
+		return ReadMemory(nullptr, address, words);
+	};
+
+	IR::ResourceSpecialization specialization;
+	IR::ResourceSnapshot snapshot;
+	const auto capture = [&] {
+		reads.clear();
+		const bool ok = IR::MaterializeResources(plan, runtime, snapshot, specialization);
+		Check(ok && snapshot.image_tables.size() == 1, "capture materializes one image table");
+		Check(reads == std::vector<size_t>{24}, "capture reads all three descriptors including their upper words");
+		return ok && snapshot.image_tables.size() == 1;
+	};
+
+	plan.info.images[0].r128 = true;
+	if (!capture()) return;
+	auto retained = snapshot;
+	const std::weak_ptr<const IR::ImageTableSnapshot> observed = retained.image_tables.front();
+	const auto& first = *retained.image_tables.front();
+	const auto initial_id = first.slots_id;
+	const auto original = first.raw[7];
+	const auto old_mapping = first.mapping;
+	const auto old_slots = first.slots;
+	if (!capture()) return;
+	Check(snapshot.image_tables.front() == retained.image_tables.front(), "unchanged table reuses the previous snapshot");
+	snapshot = {};
+	if (!capture()) return;
+	Check(snapshot.image_tables.front() == retained.image_tables.front(), "cache hit shares the retained image table");
+	{
+		auto unavailable = runtime;
+		unavailable.read_specialization_memory = [](void*, uint64_t address, std::span<uint32_t> words) {
+			return address != TableAddress && ReadMemory(nullptr, address, words);
+		};
+		auto previous = snapshot;
+		IR::ResourceSpecialization unused;
+		Check(!IR::MaterializeResources(plan, unavailable, previous, unused),
+		      "a cached table cannot hide a rejected guest read");
+	}
+	for (uint32_t change = 1; change <= 8; ++change) {
+		Poke(TableAddress + 7u * 4u, original ^ change);
+		if (!capture()) return;
+		const auto& current = *snapshot.image_tables.front();
+		Check(current.slots_id != initial_id && current.raw[7] == (original ^ change),
+		      "a mutation of an unused R128 word produces a fresh capture");
+		Check(current.mapping == old_mapping && current.slots == old_slots,
+		      "an unused R128 word preserves slots and entry order");
+	}
+	Check(first.raw[7] == original && first.mapping == old_mapping && first.slots == old_slots,
+	      "the retained snapshot survives mutation and cache eviction");
+	retained = {};
+	Check(observed.expired(), "evicted table is released with its last snapshot");
+	Poke(TableAddress + 7u * 4u, original);
+}
+
 void CheckImageTableWidths(IR::ResourcePlan& plan, const IR::SrtRuntime& runtime, TestImageHeap& heap, bool on) {
 	const auto original = plan.info.images.front();
 	const auto base = MakeTexture(TextureA, Format8888);
@@ -223,7 +282,7 @@ void CheckImageTableWidths(IR::ResourcePlan& plan, const IR::SrtRuntime& runtime
 		if (!output.ok || root >= output.specialization.images.size()) return false;
 		const auto& image = output.specialization.images[root];
 		if (image.table >= output.snapshot.image_tables.size()) return false;
-		const auto& table = output.snapshot.image_tables[image.table];
+		const auto& table = *output.snapshot.image_tables[image.table];
 		const std::vector<uint32_t> expected = short_view ? std::vector<uint32_t>{3,1,1,0} : std::vector<uint32_t>{3,0,1,2};
 		return table.mapping == expected && table.slots.size() == (short_view ? 2u : 3u) &&
 		       SameTexture(table.slots[1], short_view ? base : both) &&
@@ -260,6 +319,8 @@ void CheckImageTableWidths(IR::ResourcePlan& plan, const IR::SrtRuntime& runtime
 		first.ok = IR::MaterializeResources(plan, runtime, first.snapshot, first.specialization);
 		Check(check(first, 0, !first_short), "previous snapshot cannot provide slots of another width");
 	}
+
+	CheckImageTableLifetime(plan, runtime);
 
 	plan.info.images.push_back(original);
 	for (const bool first_short : {true,false}) {
@@ -331,7 +392,7 @@ void RebindTableAndHeap(bool on) {
 	                                             table.specialization, rebound);
 	Check(to_table == on, "heap dispatch can rematerialize compatible table bindings");
 	if (to_table) {
-		Check(rebound.image_tables.size() == 1 && rebound.image_tables[0].mapping == table.snapshot.image_tables[0].mapping &&
+		Check(rebound.image_tables.size() == 1 && rebound.image_tables[0]->mapping == table.snapshot.image_tables[0]->mapping &&
 		          rebound.flattened_srt == table.snapshot.flattened_srt,
 		      "table bridge preserves original descriptor lookup");
 	}

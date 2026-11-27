@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -49,6 +50,8 @@ struct ImageTableSnapshot {
 	}
 };
 
+using ImageTableSnapshotPtr = std::shared_ptr<const ImageTableSnapshot>;
+
 struct GpuFlatLoad {
 	uint64_t address = 0;
 	uint32_t slot    = 0;
@@ -60,7 +63,7 @@ struct ResourceSnapshot {
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;
 	std::vector<uint32_t>        flattened_srt;
-	std::vector<ImageTableSnapshot> image_tables;
+	std::vector<ImageTableSnapshotPtr> image_tables;
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
