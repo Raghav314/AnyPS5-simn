@@ -2336,10 +2336,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.last_images = snapshot.images;
 	}
 	prepared.table_images.clear();
-	prepared.table_views.clear();
 	prepared.table_sources.clear();
-	prepared.table_roots.clear();
-	prepared.table_versions.clear();
 	prepared.table_slots.clear();
 	prepared.table_state   = nullptr;
 	prepared.tables_reused = false;
@@ -2375,7 +2372,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 		const auto& root  = program.info.images.at(root_index);
 		const auto& table = *snapshot.image_tables.at(root.table);
-		const ShaderRecompiler::IR::DescriptorValue null_value {.dword_count = 8u};
+		static constexpr ShaderRecompiler::IR::DescriptorValue null_value {.dword_count = 8u};
 		auto& resolution = FindTableResolution(root);
 		table_state->ranges.push_back(
 		    {root, &resolution, root.table, root.table_capacity, table.slots_id, resolution.generation});
@@ -2386,10 +2383,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				element.prepared_index = static_cast<uint32_t>(prepared.table_images.size());
 				BindImage(element.texture.image_id, false);
 				prepared.table_images.push_back(&element.texture);
-				prepared.table_views.push_back(&element.view);
-				prepared.table_sources.push_back(value);
-				prepared.table_roots.push_back(root_index);
-				prepared.table_versions.push_back(element.version_slot);
+				prepared.table_sources.push_back({&element.view, &value, root_index, element.version_slot});
 				table_state->elements.push_back(
 				    {.resolution = &element, .table = &resolution, .source = value,
 				     .root = root_index});
@@ -2563,10 +2557,7 @@ void RenderExecutor::PrepareBindingsFromTemplate(const ShaderStageRuntime& runti
 		}
 	}
 	prepared.table_images.clear();
-	prepared.table_views.clear();
 	prepared.table_sources.clear();
-	prepared.table_roots.clear();
-	prepared.table_versions.clear();
 	prepared.table_slots.clear();
 	prepared.table_state   = nullptr;
 	prepared.tables_reused = false;
@@ -3093,24 +3084,24 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		binding.reused = false;
 	}
 	const auto tick = m_context.GetTextureCache().m_gc_tick;
-	EXIT_IF(prepared.table_versions.size() != prepared.table_images.size());
-	const auto element_changed = [&](size_t k) {
-		if (const auto slot = prepared.table_versions[k]; slot < m_table_element_versions.size()) {
+	EXIT_IF(prepared.table_sources.size() != prepared.table_images.size());
+	const auto element_changed = [&](uint32_t slot) {
+		if (slot < m_table_element_versions.size()) {
 			m_table_element_versions[slot]++;
 		}
 	};
 	for (size_t k = 0; k < prepared.table_images.size(); k++) {
+		const auto& source = prepared.table_sources[k];
 		auto& texture = *prepared.table_images[k];
-		auto& view    = *prepared.table_views[k];
+		auto& view    = *source.view;
 		if (stale_tables[k] || stale(texture)) {
 			if (auto* old_image = texture.TableImage().Get(texture_cache.m_slot_images)) {
 				old_image->binding = {};
 			}
-			texture = ResolveTableTexture(program.info.images.at(prepared.table_roots[k]),
-			                              prepared.table_sources[k]);
+			texture = ResolveTableTexture(program.info.images.at(source.root), *source.descriptor);
 			BindImage(texture.image_id, false);
 			view.valid = false;
-			element_changed(k);
+			element_changed(source.version);
 		}
 		if (!texture.image_id) {
 			view.valid = false;
@@ -3126,7 +3117,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		auto& image        = texture_cache.GetImage(texture.image_id);
 		view.state = ImageLookupState::Of(texture.image_id, image);
 		view.valid = TableViewKeepable(view.state, image);
-		element_changed(k);
+		element_changed(source.version);
 	}
 	if (prepared.tables_reused) {
 		RebindReusedTables(prepared);

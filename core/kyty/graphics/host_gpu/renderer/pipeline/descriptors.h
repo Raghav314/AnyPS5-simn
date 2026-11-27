@@ -73,6 +73,12 @@ struct PreparedBindings {
 		uint64_t size    = 0;
 		BufferId id;
 	};
+	struct TableImageSource {
+		TableViewMemo*                              view;
+		const ShaderRecompiler::IR::DescriptorValue* descriptor;
+		uint32_t                                    root;
+		uint32_t                                    version;
+	};
 
 	const ShaderStageRuntime* runtime = nullptr;
 	std::vector<BufferSource>             buffer_sources;
@@ -80,10 +86,7 @@ struct PreparedBindings {
 	std::vector<vk::DescriptorBufferInfo> uniform_buffers;
 	std::vector<TextureBinding>           images;
 	std::vector<TextureBinding*>                        table_images;
-	std::vector<TableViewMemo*>                         table_views;
-	std::vector<ShaderRecompiler::IR::DescriptorValue> table_sources;
-	std::vector<uint32_t>                               table_roots;
-	std::vector<uint32_t>                               table_versions;
+	std::vector<TableImageSource>                       table_sources;
 	std::vector<uint32_t>                               table_slots;
 	void*                                               table_state   = nullptr;
 	bool                                                tables_reused = false;
