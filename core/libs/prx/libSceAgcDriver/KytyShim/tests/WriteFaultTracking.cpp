@@ -11,6 +11,12 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#include "kernel/memory.h"
+#include "prx/libc/include/GuestArena.hpp"
+#include <windows.h>
+#endif
+
 namespace {
 
 using Libs::Graphics::CpuWriteConsumer;
@@ -41,6 +47,39 @@ void Check(bool condition, const char* where, const char* what) {
 	std::fprintf(stderr, "kyty_shim_write_fault_tracking: FAILED %s: %s\n", where, what);
 	g_failures++;
 }
+
+#ifdef _WIN32
+void ClampReadsCurrentHostProtection() {
+	namespace Memory = Libs::LibKernel::Memory;
+	constexpr auto Half = Block / 2;
+	auto* guest = static_cast<uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(Block, Block));
+	if (guest == nullptr) {
+		Check(false, "clamp", "could not reserve a range in the guest arena");
+		return;
+	}
+	GuestArena::GuestArenaCommit_nid_postfix(guest, Block, PAGE_READWRITE, Block);
+	const auto address = reinterpret_cast<uintptr_t>(guest);
+	const auto epoch = Memory::BackingEpoch();
+	Check(!Memory::IsBackingReadable(address, Block), "clamp", "fixture must have no recorded backing");
+	for (int i = 0; i < 4; ++i) {
+		Check(Memory::ClampRangeSize(address, Block) == Block, "clamp", "readable range was shortened");
+	}
+	DWORD previous = 0;
+	if (VirtualProtect(guest + Half, Half, PAGE_NOACCESS, &previous) != 0) {
+		for (int i = 0; i < 4; ++i) {
+			Check(Memory::ClampRangeSize(address, Block) == Half, "clamp", "cached a stale host protection");
+		}
+		DWORD ignored = 0;
+		Check(VirtualProtect(guest + Half, Half, previous, &ignored) != 0, "clamp", "could not restore guest protection");
+		Check(Memory::ClampRangeSize(address, Block) == Block, "clamp", "restored range was shortened");
+	} else {
+		Check(false, "clamp", "could not protect the second half of the range");
+	}
+	Check(Memory::BackingEpoch() == epoch, "clamp", "host protection unexpectedly changed recorded backing");
+	GuestArena::GuestArenaReset_nid_postfix(guest, Block);
+	GuestArena::GuestArenaRelease_nid_postfix(guest, Block);
+}
+#endif
 
 void UncontendedLockCountsNothing() {
 	(void)TrackingSpinLock::TakeContention(SpinLockClass::Tracker);
@@ -284,6 +323,9 @@ void AtomicBitsLoseNoConcurrentWrite() {
 }
 
 extern "C" int RunKytyWriteFaultTrackingTest() {
+#ifdef _WIN32
+	ClampReadsCurrentHostProtection();
+#endif
 	UncontendedLockCountsNothing();
 	ContentionIsCountedPerFamily();
 	PageManager   pages;
