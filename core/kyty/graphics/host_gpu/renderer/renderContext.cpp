@@ -407,6 +407,87 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendUrgentCommandSync(unmap);
 }
 
+void RenderContext::CacheIndexedBufferReads(const ShaderStageRuntime& runtime) {
+	constexpr uint64_t MaxBytes = uint64_t {256} << 20u;
+	const auto& buffers = runtime.resources->buffers;
+	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const auto alignment = std::max<uint64_t>(m_graphics.StorageMinAlignment(), limits.minUniformBufferOffsetAlignment);
+	const auto reliable = [&](const ShaderBufferResource& source) {
+		const auto base = source.Base48();
+		const auto size = source.GetSize();
+		return !base || !size || ((base & 3u) == 0 && (size & 3u) == 0 && source.NumRecords() != UINT32_MAX &&
+		                        size <= limits.maxStorageBufferRange - (alignment - 1) && IsMapped(base, size) &&
+		                        LibKernel::Memory::IsFullyMapped(base, size));
+	};
+	const auto pending = [&](uint64_t address, uint64_t size) {
+		return m_buffer_cache.DeferredLabelPending(address, size) || m_texture_cache.IsRegionGpuModified(address, size, true);
+	};
+	const auto read = [&](const ShaderBufferResource& source, uint64_t offset, std::span<uint32_t> words) {
+		std::ranges::fill(words, 0u);
+		const uint64_t start = offset & ~uint64_t {3};
+		const uint64_t size  = source.GetSize();
+		if (source.Base48() == 0 || start >= size || words.empty()) return true;
+		const auto bytes = std::min<uint64_t>(words.size_bytes(), size - start);
+		const auto address = source.Base48() + start;
+		return !pending(address, bytes) &&
+		       LibKernel::Memory::TryReadGpuCleanBacking(address, words.data(), bytes);
+	};
+	const auto deduplicate = [](auto& values) {
+		std::ranges::sort(values);
+		values.erase(std::unique(values.begin(), values.end()), values.end());
+	};
+	uint64_t probes = ShaderRecompiler::IR::MaxIndirectDescriptorProbes;
+	RangeSet children;
+	RangeSet pages;
+	for (const auto& plan: runtime.module->info.info.indexed_buffer_reads) {
+		if (std::max({plan.offsets, plan.keys, plan.descriptors.buffer}) >= buffers.size()) return;
+		const auto offsets = DecodeNativeDescriptor<ShaderBufferResource>(buffers[plan.offsets]);
+		const auto keys    = DecodeNativeDescriptor<ShaderBufferResource>(buffers[plan.keys]);
+		const auto records = DecodeNativeDescriptor<ShaderBufferResource>(buffers[plan.descriptors.buffer]);
+		if (!reliable(offsets) || !reliable(keys) || !reliable(records)) return;
+		const auto count = offsets.Base48() == 0 ? 0 : offsets.GetSize() / sizeof(uint32_t);
+		if (count >= probes) return;
+		probes -= count + 1;
+		std::vector<uint32_t> inputs(count + 1, 0);
+		if (!read(offsets, 0, std::span(inputs).first(count))) return;
+		deduplicate(inputs);
+		if (inputs.size() > probes) return;
+		probes -= inputs.size();
+		for (auto& input: inputs) {
+			if (!read(keys, uint64_t {input} + plan.key_offset, std::span(&input, 1))) return;
+		}
+		deduplicate(inputs);
+		if (inputs.size() > probes) return;
+		probes -= inputs.size();
+		for (const auto key: inputs) {
+			const uint32_t row = key * plan.descriptors.stride;
+			ShaderBufferResource child {};
+			if (!read(records, uint64_t {row} + plan.descriptors.offset, std::span(child.fields).first<3>())) return;
+			const auto address = child.Base48();
+			const auto size    = child.GetSize();
+			if (address == 0 || size == 0) continue;
+			if (size > MaxBytes || !IsMapped(address, size)) return;
+			children.Add(address, size);
+			const auto first = Common::AlignDown(address, BufferCache::CACHING_PAGESIZE);
+			const auto last  = Common::AlignUp(address + size, BufferCache::CACHING_PAGESIZE);
+			pages.Add(first, last - first);
+		}
+	}
+	uint64_t total = 0;
+	pages.ForEach([&](uint64_t first, uint64_t last) { total += last - first; });
+	if (total > MaxBytes) return;
+	bool pending_page = false;
+	pages.ForEach([&](uint64_t first, uint64_t last) {
+		if (!pending_page) pending_page = pending(first, last - first);
+	});
+	if (pending_page) return;
+	std::vector<std::pair<uint64_t, uint64_t>> spans;
+	children.ForEach([&](uint64_t first, uint64_t last) {
+		if (m_buffer_cache.FindBuffer(first, last - first)) spans.emplace_back(first, last);
+	});
+	if (!spans.empty()) m_buffer_cache.SynchronizeBuffersInSpans(spans);
+}
+
 void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 	const auto&      program   = runtime.module->info;
 	const auto&      user_data = runtime.resources->user_data;

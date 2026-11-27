@@ -10,7 +10,11 @@ using namespace ShaderStoreFormat;
 using ShaderRecompiler::IR::IoAll;
 using ShaderRecompiler::IR::Writer;
 
-struct LegacyWriter: Writer {
+struct NoIndexedReadsWriter: Writer {
+	static constexpr bool shader_info_has_indexed_buffer_reads = false;
+};
+
+struct LegacyWriter: NoIndexedReadsWriter {
 	static constexpr bool shader_info_has_relative_vgprs = false;
 };
 
@@ -40,6 +44,7 @@ void WriteModule(std::ostream& output, uint64_t hash, uint64_t id, ShaderType st
 	ShaderModule module;
 	module.id = id;
 	module.info.stage = stage;
+	module.info.info.indexed_buffer_reads.push_back({2, 3, 12, {4, 16, 0}});
 	const std::vector<uint8_t> plan;
 	IoAll(record, Record::Module);
 	IoStoreModule(record, key, module, plan, spirv, plain);
@@ -87,6 +92,11 @@ int main() {
 	WriteModule(previous, 0x102, 0x201, ShaderType::Vertex, vertex, {});
 	WriteModule(previous, 0x101, 0x201, ShaderType::Vertex, vertex, {});
 
+	std::ofstream no_indexed("no-indexed-reads.shaders", std::ios::binary);
+	Write(no_indexed, header.bytes);
+	WriteModule<NoIndexedReadsWriter>(no_indexed, 0x102, 0x201, ShaderType::Vertex, vertex, {});
+	WriteModule<NoIndexedReadsWriter>(no_indexed, 0x101, 0x201, ShaderType::Vertex, vertex, {});
+
 	std::ofstream malformed("malformed.shaders", std::ios::binary);
 	Write(malformed, header.bytes);
 	WriteModule(malformed, 0x101, 0x201, ShaderType::Vertex, vertex, {});
@@ -101,5 +111,5 @@ int main() {
 	WriteDump("plain.spv", plain);
 	WriteDump("missing.spv", missing);
 	WriteDump("invalid.spv", {0, 0, 0, 0, 0});
-	return !store || !legacy || !previous || !malformed || !bad_header;
+	return !store || !legacy || !previous || !no_indexed || !malformed || !bad_header;
 }

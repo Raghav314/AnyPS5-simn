@@ -2738,6 +2738,11 @@ void RenderExecutor::CommitTemplateBindings(CommandBuffer& buffer, const Pipelin
 
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool find_buffers) {
 	KYTY_PROFILER_FUNCTION();
+	for (const auto* stage: stages) {
+		if (!stage->runtime->module->info.info.indexed_buffer_reads.empty()) {
+			m_context.CacheIndexedBufferReads(*stage->runtime);
+		}
+	}
 	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
 		auto&       prepared = *stage;

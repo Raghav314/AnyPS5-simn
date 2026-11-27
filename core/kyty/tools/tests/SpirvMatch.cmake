@@ -21,6 +21,7 @@ string(CONCAT both "${vertex}"
 check_match(0 "${both}" "" fixture.shaders "モジュール.spv" plain.spv ps.spv)
 check_match(0 "${vertex}" "" legacy.shaders vs.spv)
 check_match(0 "${vertex}" "" previous.shaders vs.spv)
+check_match(0 "${vertex}" "" no-indexed-reads.shaders vs.spv)
 check_match(1 "${vertex}input=2 no match\n" "" fixture.shaders vs.spv missing.spv)
 check_match(2 "" "Invalid or unreadable SPIR-V input 2\n" fixture.shaders vs.spv invalid.spv)
 check_match(2 "" "Invalid or unreadable Kyty shader store header\n" bad-header.shaders vs.spv)

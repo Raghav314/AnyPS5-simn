@@ -525,6 +525,7 @@ public:
 		m_info.user_address_bases.clear();
 		m_info.dma_base_registers.clear();
 		m_info.vsharp_base_registers.clear();
+		m_info.indexed_buffer_reads.clear();
 		m_info.dma_windows.clear();
 		m_info.dma_tables.clear();
 		m_info.dma_record_tables.clear();
@@ -4850,7 +4851,7 @@ private:
 	}
 
 	bool MatchDmaRecordTable(const std::array<Value, 3>& dwords, ShaderInfo::DmaRecordTable& table,
-	                         uint32_t depth) const {
+	                         uint32_t depth, Value* selector = nullptr) const {
 		constexpr uint32_t MaxDepth = 4;
 		std::array<const Inst*, 3> phis {};
 		for (uint32_t dword = 0; dword < 3u; dword++) {
@@ -4927,7 +4928,38 @@ private:
 			return false;
 		}
 		table = {patch->resource, stride, first_offset};
+		if (selector != nullptr) {
+			*selector = scaled->Arg(scaled->Arg(0).Resolve().IsImmediate() ? 1u : 0u);
+		}
 		return true;
+	}
+
+	void NoteIndexedBufferReads(const Inst& handle) {
+		ShaderInfo::IndexedBufferRead plan {};
+		Value selector;
+		if (handle.NumArgs() != 4u ||
+			!MatchDmaRecordTable({handle.Arg(0), handle.Arg(1), handle.Arg(2)}, plan.descriptors, 0, &selector) || selector.IsEmpty()) {
+			return;
+		}
+		const auto scalar_read = [&](Value value, uint32_t& resource, uint32_t& offset) -> const Inst* {
+			const auto* read = value.Resolve().TryInstruction();
+			uint32_t index = 0;
+			if (read == nullptr || read->GetOpcode() != ValueOpcode::ReadConstBuffer) return nullptr;
+			const auto* memory = ScalarReadMemory(*read, index);
+			if (!memory || memory->kind != ResourceKind::ScalarBuffer || memory->data_dwords != 1u) return nullptr;
+			const auto* source = read->Arg(0).Resolve().TryInstruction();
+			const auto found = std::ranges::find(m_handle_patches, source, &HandlePatch::handle);
+			if (found == m_handle_patches.end()) return nullptr;
+			resource = found->resource;
+			offset = memory->offset;
+			return read;
+		};
+		const auto* key = scalar_read(selector, plan.keys, plan.key_offset);
+		uint32_t offset = 0;
+		if (!key || !scalar_read(key->Arg(1), plan.offsets, offset)) return;
+		if (std::ranges::find(m_info.indexed_buffer_reads, plan) == m_info.indexed_buffer_reads.end()) {
+			m_info.indexed_buffer_reads.push_back(plan);
+		}
 	}
 
 	static bool InReach(const std::vector<uint32_t>& pcs, uint32_t pc) {
@@ -5612,6 +5644,7 @@ private:
 					    "from a user-data base",
 					    ValueOpcodeName(op), memory.data_bits, memory.typed, memory.formatted));
 				}
+				if (handle && buffer == BufferAccess::Read) NoteIndexedBufferReads(*handle);
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_dma_tracked                           = true;
 				if (handle != nullptr) {

@@ -46,6 +46,7 @@ struct Reader {
 	bool                     ok = true;
 	size_t                   allocation_budget = std::numeric_limits<size_t>::max();
 	bool                     shader_info_has_relative_vgprs = true;
+	bool                     shader_info_has_indexed_buffer_reads = true;
 
 	void Raw(void* data, size_t size) {
 		ok = ok && size <= bytes.size();
@@ -180,12 +181,13 @@ KYTY_IO_FIELDS(StageOutput, a, b, c, d)
 KYTY_IO_FIELDS(ShaderInfo::DmaWindow, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo::DmaDescriptorTable, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo::DmaRecordTable, a, b, c)
+KYTY_IO_FIELDS(ShaderInfo::IndexedBufferRead, a, b, c, d)
 KYTY_IO_FIELDS(ShaderInfo::SelfSizedBuffer, a, b, c)
 template <class Stream, Is<ShaderInfo> Object>
 void Io(Stream& io, Object& object) {
 	auto& [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
 	       relative_vgprs, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X,
-	       Y, Z, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9] = object;
+	       Y, Z, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, indexed_buffer_reads] = object;
 	IoAll(io, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z);
 	if constexpr (requires { io.shader_info_has_relative_vgprs; }) {
 		if (io.shader_info_has_relative_vgprs) IoAll(io, relative_vgprs);
@@ -194,6 +196,12 @@ void Io(Stream& io, Object& object) {
 	}
 	IoAll(io, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, a0,
 	      a1, a2, a3, a4, a5, a6, a7, a8, a9);
+	if constexpr (requires { io.shader_info_has_indexed_buffer_reads; }) {
+		if (io.shader_info_has_indexed_buffer_reads) IoAll(io, indexed_buffer_reads);
+		else if constexpr (Reading<Stream>) indexed_buffer_reads.clear();
+	} else {
+		IoAll(io, indexed_buffer_reads);
+	}
 }
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows, a, b)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks, a, b, c)

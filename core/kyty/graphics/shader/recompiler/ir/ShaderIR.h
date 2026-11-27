@@ -739,6 +739,16 @@ struct ShaderInfo {
 	bool                            float64                       = false;
 	bool                            float16                       = false;
 
+	struct IndexedBufferRead {
+		uint32_t offsets;
+		uint32_t keys;
+		uint32_t key_offset;
+		DmaRecordTable descriptors;
+
+		bool operator==(const IndexedBufferRead&) const = default;
+	};
+	std::vector<IndexedBufferRead> indexed_buffer_reads;
+
 	bool operator==(const ShaderInfo& other) const = default;
 };
 

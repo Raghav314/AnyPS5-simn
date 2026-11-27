@@ -105,6 +105,7 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
+	void               CacheIndexedBufferReads(const ShaderStageRuntime& runtime);
 	bool               CacheSelfSizedBuffers(const ShaderStageRuntime& runtime);
 	[[nodiscard]] bool SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages);
 	void               PrepareBda(bool may_write, bool full_sync = true);

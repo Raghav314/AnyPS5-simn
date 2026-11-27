@@ -19,6 +19,13 @@ constexpr size_t MaxRecordBytes = 64 * 1024 * 1024;
 constexpr std::array Stages{"unknown", "vertex", "pixel", "compute", "mesh", "local",
                             "tessellation-control", "tessellation-evaluation"};
 
+struct ShaderInfoLayout {
+	bool relative_vgprs;
+	bool indexed_buffer_reads;
+};
+
+constexpr std::array<ShaderInfoLayout, 3> ShaderInfoLayouts {{{true, true}, {true, false}, {false, false}}};
+
 struct Dump {
 	std::vector<uint32_t> words;
 	std::set<std::tuple<ShaderType, uint64_t, uint64_t, bool>> matches;
@@ -75,7 +82,7 @@ bool ReadStoreHeader(std::istream& input) {
 }
 
 bool MatchShaderDump(std::span<const uint8_t> raw, std::span<Dump> dumps,
-                     std::optional<bool>& shader_info_layout) {
+                     std::optional<ShaderInfoLayout>& shader_info_layout) {
 	Reader reader{raw};
 	Record type{};
 	IoAll(reader, type);
@@ -94,9 +101,10 @@ bool MatchShaderDump(std::span<const uint8_t> raw, std::span<Dump> dumps,
 		default: return false;
 	}
 
-	const auto decode = [&](bool has_relative_vgprs) {
+	const auto decode = [&](ShaderInfoLayout layout) {
 		Reader module_reader{.bytes = reader.bytes, .allocation_budget = MaxRecordBytes,
-		                     .shader_info_has_relative_vgprs = has_relative_vgprs};
+		                     .shader_info_has_relative_vgprs = layout.relative_vgprs,
+		                     .shader_info_has_indexed_buffer_reads = layout.indexed_buffer_reads};
 		ShaderStoreFormat::Key key;
 		ShaderModule module;
 		std::vector<uint8_t> resource_plan;
@@ -115,9 +123,9 @@ bool MatchShaderDump(std::span<const uint8_t> raw, std::span<Dump> dumps,
 		return true;
 	};
 	if (shader_info_layout.has_value()) return decode(*shader_info_layout);
-	for (const bool has_relative_vgprs: {true, false}) {
-		if (decode(has_relative_vgprs)) {
-			shader_info_layout = has_relative_vgprs;
+	for (const auto layout: ShaderInfoLayouts) {
+		if (decode(layout)) {
+			shader_info_layout = layout;
 			return true;
 		}
 	}
@@ -132,7 +140,7 @@ bool ReadStore(const std::filesystem::path& path, std::span<Dump> dumps) {
 	}
 	std::vector<uint8_t> compressed;
 	std::vector<uint8_t> raw;
-	std::optional<bool> shader_info_layout;
+	std::optional<ShaderInfoLayout> shader_info_layout;
 	for (size_t index = 1; input.peek() != std::char_traits<char>::eof(); ++index) {
 		Frame frame;
 		if (Read(input, std::span(&frame, 1)) && frame.raw_size <= MaxRecordBytes &&

@@ -15,6 +15,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -36,6 +37,17 @@ constexpr std::uint32_t Rounds = 5;
 constexpr std::uint32_t Fill = 0xdeadbeefu;
 constexpr std::uint32_t Format32UInt = 20;
 constexpr std::uint32_t Wave64Dispatch = 0x41;
+constexpr std::uint64_t Table = GuestBase + 0x400000;
+constexpr std::uint32_t TableBytes = 0x120000;
+constexpr std::array<std::uint64_t, 2> Children {GuestBase + 0x5000000, GuestBase + 0xa000000};
+constexpr std::array<std::uint32_t, 2> Rows {12345, 54321};
+
+constexpr std::array<std::uint32_t, 17> IndexedReadCode {
+    0x7e280500, 0xf4200500, 0x28000000, 0xbf8cc07f, 0xf4200542, 0x28000004,
+    0xbf8cc07f, 0x8f158415, 0xf4280604, 0x2a000000, 0xbf8cc07f, 0xe0300000,
+    0x80060100, 0xbf8c3f70, 0xe0700000, 0x14030100, 0xbf810000,
+};
+
 
 constexpr std::array<std::uint32_t, 20> ChaseCode{
     0xf4040200u, 0xfa000000u, 0xbf8cc07fu, 0x7e080200u, 0x7e0a0201u, 0xdc308008u, 0x017d0004u, 0x7e0c0208u, 0x7e0e0209u, 0xdc308000u,
@@ -70,6 +82,26 @@ std::vector<std::uint32_t> dispatchWords(std::uint32_t round) {
     return words;
 }
 
+std::array<std::uint32_t, 4> indexedSharp(std::uint64_t address, std::uint32_t bytes) {
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), bytes, 0x31014fac};
+}
+
+std::vector<std::uint32_t> indexedDispatchWords() {
+    std::vector<std::uint32_t> words;
+    append(words, 0x76, {0x20c, static_cast<std::uint32_t>(ShaderCode >> 8u), static_cast<std::uint32_t>(ShaderCode >> 40u)});
+    append(words, 0x76, {0x212, 0u});
+    append(words, 0x76, {0x213, 16u << 1u});
+    append(words, 0x76, {0x207, 1u, 1u, 1u});
+    const auto offsets = indexedSharp(Root, 4);
+    const auto keys    = indexedSharp(Leaf, 64);
+    const auto table   = indexedSharp(Table, TableBytes);
+    const auto output  = indexedSharp(Output, Block);
+    append(words, 0x76, {0x240, offsets[0], offsets[1], offsets[2], offsets[3], keys[0], keys[1], keys[2], keys[3],
+                         table[0], table[1], table[2], table[3], output[0], output[1], output[2], output[3]});
+    append(words, 0x15, {1u, 1u, 1u, Wave64Dispatch});
+    return words;
+}
+
 void write(std::span<std::byte> memory, std::uint64_t address, const void* data, std::size_t bytes) {
     const auto offset = address - GuestBase;
     if (offset > memory.size() || bytes > memory.size() - offset) throw std::runtime_error("fixture memory write past the guest mapping");
@@ -82,7 +114,7 @@ std::vector<std::byte> bytesOf(std::uint32_t value) {
     return bytes;
 }
 
-void makeCapture(const std::filesystem::path& path) {
+void makeCapture(const std::filesystem::path& path, bool indexed) {
     using AgcDriver::FrameCallKind;
     auto memory = std::vector<std::byte>(GuestBytes);
     struct Header {
@@ -93,34 +125,58 @@ void makeCapture(const std::filesystem::path& path) {
     header.shader.file_header = 0x34333231;
     header.shader.version = 0x18;
     header.shader.header_size = sizeof(Header);
-    header.shader.shader_size = static_cast<std::uint32_t>(sizeof(ChaseCode));
+    const std::span<const std::uint32_t> code = indexed ? std::span<const std::uint32_t>(IndexedReadCode) : std::span<const std::uint32_t>(ChaseCode);
+    header.shader.shader_size = static_cast<std::uint32_t>(code.size_bytes());
     header.shader.code = reinterpret_cast<const void*>(ShaderCode);
     header.shader.type = 0;
     header.shader.user_data = reinterpret_cast<ShaderUserData*>(ShaderHeader + offsetof(Header, user));
     write(memory, ShaderHeader, &header, sizeof(header));
-    write(memory, ShaderCode, ChaseCode.data(), sizeof(ChaseCode));
+    write(memory, ShaderCode, code.data(), code.size_bytes());
     std::vector<std::size_t> commandWords;
     for (std::uint32_t round = 0; round < Rounds; ++round) {
-        const auto words = dispatchWords(round);
+        const auto words = indexed ? indexedDispatchWords() : dispatchWords(round);
         if (words.size() * sizeof(std::uint32_t) > CommandStride) throw std::runtime_error("command buffer larger than its slot");
         write(memory, Commands + round * CommandStride, words.data(), words.size() * sizeof(std::uint32_t));
         commandWords.push_back(words.size());
     }
-    const std::uint64_t leaf = Leaf;
-    write(memory, Root, &leaf, sizeof(leaf));
-    const auto root0 = rootValue(0);
-    const auto leaf0 = leafValue(0);
-    write(memory, Root + 8, &root0, sizeof(root0));
-    write(memory, Leaf, &leaf0, sizeof(leaf0));
+    if (indexed) {
+        const std::uint32_t first = 4;
+        write(memory, Root, &first, sizeof(first));
+        for (std::uint32_t round = 0; round < Rounds; ++round) {
+            const auto row = Rows[round % Rows.size()];
+            write(memory, Leaf + (round + 2) * sizeof(row), &row, sizeof(row));
+        }
+    } else {
+        const std::uint64_t leaf = Leaf;
+        write(memory, Root, &leaf, sizeof(leaf));
+        const auto root0 = rootValue(0);
+        const auto leaf0 = leafValue(0);
+        write(memory, Root + 8, &root0, sizeof(root0));
+        write(memory, Leaf, &leaf0, sizeof(leaf0));
+    }
     const std::vector<std::uint32_t> fill(Block / sizeof(std::uint32_t), Fill);
     write(memory, Output, fill.data(), Block);
 
     AgcDriver::FrameCaptureWriter writer(path);
     writer.WriteRange(GuestBase, memory.size(), AgcDriver::FrameRangeKind::Watched, 0, 7);
-    const auto snapshot = writer.WriteSnapshot(GuestBase, memory);
-    for (std::uint32_t round = 1; round < Rounds; ++round) {
-        writer.WriteDelta(round, 0, Root + 8, bytesOf(rootValue(round)));
-        writer.WriteDelta(round, 0, Leaf, bytesOf(leafValue(round)));
+    auto snapshot = writer.WriteSnapshot(GuestBase, memory);
+    if (indexed) {
+        writer.WriteRange(Table, TableBytes, AgcDriver::FrameRangeKind::Watched, 0, 7);
+        for (std::size_t i = 0; i < Children.size(); ++i) {
+            const auto descriptor = indexedSharp(Children[i], 4);
+            snapshot += writer.WriteSnapshot(Table + Rows[i] * sizeof(descriptor), std::as_bytes(std::span(descriptor)));
+            writer.WriteRange(Children[i], Block, AgcDriver::FrameRangeKind::Watched, 0, 7);
+            snapshot += writer.WriteSnapshot(Children[i], bytesOf(leafValue(0)));
+        }
+        for (std::uint32_t round = 1; round < Rounds; ++round) {
+            writer.WriteDelta(round, round, Root, bytesOf((round + 1) * 4));
+            writer.WriteDelta(round, round, Children[round % Children.size()], bytesOf(leafValue(round)));
+        }
+    } else {
+        for (std::uint32_t round = 1; round < Rounds; ++round) {
+            writer.WriteDelta(round, 0, Root + 8, bytesOf(rootValue(round)));
+            writer.WriteDelta(round, 0, Leaf, bytesOf(leafValue(round)));
+        }
     }
     std::uint64_t ordinal = 0;
     std::uint64_t windowCalls = 0;
@@ -146,13 +202,13 @@ void makeCapture(const std::filesystem::path& path) {
     flip();
     windowed({.kind = FrameCallKind::FrameStart, .values = {2}});
     for (std::uint32_t round = 1; round < Rounds; ++round) {
-        windowed({.kind = FrameCallKind::Memory, .values = {round}});
+        windowed({.kind = FrameCallKind::Memory, .completed = indexed ? round : 0, .values = {round}});
         submit(round);
     }
     flip();
     emit({.kind = FrameCallKind::End, .accepted = 2});
     writer.Finish("{\"magic\":\"aps5-frame-capture 1\",\"arena_base\":65536,\"arena_bytes\":1082331693056,"
-                  "\"start_boundary\":1,\"frames\":2,\"calls\":" + std::to_string(windowCalls) + ",\"prologue_calls\":3,\"ranges\":1,"
+                  "\"start_boundary\":1,\"frames\":2,\"calls\":" + std::to_string(windowCalls) + ",\"prologue_calls\":3,\"ranges\":" + std::to_string(indexed ? 4 : 1) + ","
                   "\"snapshot_bytes\":" + std::to_string(snapshot) +
                   ",\"unreadable_bytes\":0,\"host_only_sample_bytes\":0,\"warnings\":[]}\n");
 }
@@ -176,12 +232,13 @@ std::string hex(std::uint32_t value) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 2) throw std::runtime_error("usage: kyty_shim_bda_submission_sync_tests <agc_frame_replay>");
+        const bool indexed = argc == 3 && std::string_view(argv[2]) == "--indexed";
+        if (argc != 2 && !indexed) throw std::runtime_error("usage: kyty_shim_bda_submission_sync_tests <agc_frame_replay> [--indexed]");
         const std::filesystem::path tool = argv[1];
         const auto root = std::filesystem::temp_directory_path() /
                           ("kyty-bda-submission-sync-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(root);
-        makeCapture(root / "capture");
+        makeCapture(root / "capture", indexed);
         char address[32];
         std::snprintf(address, sizeof(address), "0x%llx", static_cast<unsigned long long>(Output));
         const auto log = root / "replay.log";
@@ -195,6 +252,7 @@ int main(int argc, char** argv) {
 #else
         const int status = std::system(command.c_str());
 #endif
+        if (indexed && std::getenv("VK_LOADER_DEBUG") != nullptr) std::cout << readFile(log);
         const auto raw = readFile(dump);
         if (status != 0 || raw.size() != DumpBytes) {
             const bool vulkanRequired = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
@@ -207,6 +265,14 @@ int main(int argc, char** argv) {
         std::memcpy(output.data(), raw.data(), output.size() * sizeof(std::uint32_t));
         int failures = 0;
         for (std::uint32_t round = 0; round < Rounds; ++round) {
+            if (indexed) {
+                const auto actual = output[round + 1];
+                if (actual != leafValue(round)) {
+                    std::cerr << "indexed round " << round << " read " << hex(actual) << ", expected " << hex(leafValue(round)) << '\n';
+                    ++failures;
+                }
+                continue;
+            }
             const auto* slot = output.data() + round * SlotBytes / sizeof(std::uint32_t);
             const bool fresh = slot[0] == rootValue(round) && slot[1] == leafValue(round) && slot[2] == static_cast<std::uint32_t>(Leaf);
             const bool unmapped = round == 0 && slot[0] == 0 && slot[1] == 0 && slot[2] == 0;

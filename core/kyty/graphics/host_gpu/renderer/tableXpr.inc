@@ -1516,6 +1516,15 @@ void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span
 		snapshot.flattened_srt.assign(table.blocks[st].begin(),
 		                              table.blocks[st].begin() + static_cast<std::ptrdiff_t>(program->table_plan.slots.size()));
 		table.runtimes[st] = {.module = pair.tables[st], .resources = &snapshot};
+		if (!program->info.indexed_buffer_reads.empty()) {
+			const auto& entries = table.entries[st];
+			snapshot.buffers.resize(entries.size());
+			for (size_t i = 0; i < entries.size(); ++i) {
+				snapshot.buffers[i].dword_count = 4;
+				std::ranges::copy(entries[i].first, snapshot.buffers[i].dwords.begin());
+			}
+			m_context.CacheIndexedBufferReads(table.runtimes[st]);
+		}
 		m_context.CacheDmaBases(table.runtimes[st]);
 		stages[count++] = &table.runtimes[st];
 	}
@@ -1727,6 +1736,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	const auto* scout = Scout::Running() && spec_state == nullptr
 	                        ? TableScoutTicket(pair, user_data, stages, m_context, static_cast<const Scout::Ticket*>(m_table_ticket))
 	                        : nullptr;
+	if (spec_state != nullptr && std::ranges::any_of(pair.programs, [](const auto* program) {
+		    return program != nullptr && !program->info.indexed_buffer_reads.empty();
+	    })) {
+		return Spec::Refuse("table: indexed buffer reads"), TableResult::Native;
+	}
 	if (scout != nullptr) {
 		TableScoutApply(table, pair, *scout, stages);
 	} else {
