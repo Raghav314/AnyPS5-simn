@@ -227,6 +227,14 @@ bool IsFmaskTextureFormat(BufferFormat format) {
 	return format >= BufferFormat::kFmask8_S2_F1 && format <= BufferFormat::kFmask64_S16_F8;
 }
 
+bool IsSupportedAtomicImageFormat(BufferFormat format, bool atomic64) {
+	if (atomic64) {
+		return !IsFmaskTextureFormat(format) && NumBytesPerElement(format) == 8u;
+	}
+	return format == BufferFormat::k32UInt || format == BufferFormat::k32SInt ||
+	       format == BufferFormat::k32Float;
+}
+
 bool IsSrgbFormat(BufferFormat format) {
 	return (format >= BufferFormat::k8Srgb && format <= BufferFormat::k8_8_8_8Srgb) ||
 	       format == BufferFormat::kBc1Srgb || format == BufferFormat::kBc2Srgb ||

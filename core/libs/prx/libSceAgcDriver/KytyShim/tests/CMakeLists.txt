@@ -80,6 +80,16 @@ target_link_libraries(kyty_shim_image_heap_variant_key_tests PRIVATE Kyty::gpu l
 add_test(NAME kyty_shim_image_heap_variant_key COMMAND kyty_shim_image_heap_variant_key_tests)
 set_tests_properties(kyty_shim_image_heap_variant_key PROPERTIES TIMEOUT 20)
 
+if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ImageAtomicFormats.cpp)
+    add_test_executable(kyty_shim_image_atomic_formats_tests ${CMAKE_CURRENT_SOURCE_DIR}/ImageAtomicFormatsMain.cpp)
+    configure_host_test_executable(kyty_shim_image_atomic_formats_tests)
+    target_link_libraries(kyty_shim_image_atomic_formats_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_image_atomic_formats COMMAND kyty_shim_image_atomic_formats_tests)
+    add_test(NAME kyty_shim_image_atomic_bindings COMMAND kyty_shim_image_atomic_formats_tests --bindings)
+    set_tests_properties(kyty_shim_image_atomic_formats kyty_shim_image_atomic_bindings PROPERTIES TIMEOUT 20)
+endif()
+
 add_test_executable(kyty_shim_replay_sampling_tests ${CMAKE_CURRENT_SOURCE_DIR}/ReplaySampling.cpp)
 configure_host_test_executable(kyty_shim_replay_sampling_tests)
 target_include_directories(kyty_shim_replay_sampling_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../tools)
