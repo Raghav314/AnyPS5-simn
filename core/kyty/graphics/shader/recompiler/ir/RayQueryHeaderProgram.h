@@ -31,12 +31,14 @@ enum class HeaderOp : uint32_t {
 	Record = 15,
 	UMin   = 16,
 	UMax   = 17,
+	ScalarBuffer = 18,
 };
 
 [[nodiscard]] constexpr uint32_t HeaderOpArgs(HeaderOp op) noexcept {
 	switch (op) {
 		case HeaderOp::User:
 		case HeaderOp::Load:
+		case HeaderOp::ScalarBuffer:
 		case HeaderOp::Shr:
 		case HeaderOp::Shl:
 		case HeaderOp::Mask: return 1;
@@ -54,7 +56,8 @@ enum class HeaderOp : uint32_t {
 		case HeaderOp::Mul:
 		case HeaderOp::Mask:
 		case HeaderOp::Hi: return 1;
-		case HeaderOp::Bfe: return 3;
+		case HeaderOp::Bfe:
+		case HeaderOp::ScalarBuffer: return 3;
 		case HeaderOp::Record: return 5;
 		default: return 2;
 	}
@@ -66,11 +69,11 @@ enum class HeaderOp : uint32_t {
 	uint32_t loads = 0;
 	for (size_t at = 0; at < program.size();) {
 		const auto op = static_cast<HeaderOp>(program[at]);
-		if (program[at] < static_cast<uint32_t>(HeaderOp::User) || program[at] > static_cast<uint32_t>(HeaderOp::UMax)) return false;
+		if (program[at] < static_cast<uint32_t>(HeaderOp::User) || program[at] > static_cast<uint32_t>(HeaderOp::ScalarBuffer)) return false;
 		const auto args = HeaderOpArgs(op);
 		if (program.size() - at - 1 < args) return false;
 		if (op == HeaderOp::User && program[at + 1] >= user_count) return false;
-		if (op == HeaderOp::Load && program[at + 1] != 4u && program[at + 1] != 8u) return false;
+		if ((op == HeaderOp::Load || op == HeaderOp::ScalarBuffer) && program[at + 1] != 4u && program[at + 1] != 8u) return false;
 		if ((op == HeaderOp::Shr || op == HeaderOp::Shl) && program[at + 1] != 32u && program[at + 1] != 64u) return false;
 		if (op == HeaderOp::Mask && (program[at + 1] == 0u || program[at + 1] > 64u)) return false;
 		if (op == HeaderOp::Load && ++loads > MaxRayQueryHeaderProgramLoads) return false;
@@ -142,6 +145,16 @@ template <class Read>
 				const auto offset = pop();
 				if (offset > 32u || count > 32u - offset) return std::nullopt;
 				value             = (pop() & 0xffffffffu) >> offset & HeaderMask(static_cast<uint32_t>(count));
+				break;
+			}
+			case HeaderOp::ScalarBuffer: {
+				const auto offset = pop();
+				const auto records = static_cast<uint32_t>(pop());
+				const auto descriptor = pop();
+				const auto stride = (descriptor >> 48u) & 0x3fffu;
+				const auto size = records * (stride == 0 ? 1u : stride);
+				if (offset > size || size - offset < arg(0)) return std::nullopt;
+				value = (descriptor & (HeaderMask(48) & ~uint64_t {3})) + offset;
 				break;
 			}
 			case HeaderOp::Record: {

@@ -26,6 +26,7 @@ constexpr uint64_t Zext          = 0x10000;
 constexpr uint64_t Base48        = 0x10001;
 constexpr uint64_t DwordBase     = 0x10002;
 constexpr uint64_t BufferRecord  = 0x10003;
+constexpr uint64_t ScalarBuffer  = 0x10004;
 constexpr uint32_t None          = 0xffffffffu;
 constexpr uint32_t One           = 0xfffffffeu;
 
@@ -96,9 +97,15 @@ public:
 	uint32_t Of(uint32_t atom, uint32_t width) { return Make({width, 0, {{atom, 1}}}); }
 	uint32_t Op(uint32_t width, Key args) { return Of(Atomic(Kind::Op, width, std::move(args)), width); }
 
-	uint32_t Load(uint32_t address, uint32_t bytes, bool descriptor_bounds = false) {
+	uint32_t Load(uint32_t address, uint32_t bytes, uint32_t checked_address = None) {
 		const uint32_t width = bytes * 8u;
-		return Of(Atomic(Kind::Load, width, {address, bytes, descriptor_bounds}), width);
+		return Of(Atomic(Kind::Load, width, {address, bytes, checked_address}), width);
+	}
+
+	uint32_t NextCheckedAddress(uint32_t address) {
+		if (address == None || address == One) return address;
+		const auto args = OpOf(address, ScalarBuffer)->args;
+		return Op(64, {ScalarBuffer, args[1], args[2], Add(static_cast<uint32_t>(args[3]), Constant(64, 4))});
 	}
 
 	uint32_t Add(uint32_t a, uint32_t b, uint64_t factor = 1) {
@@ -167,7 +174,7 @@ public:
 			if (atom.width == 32) return Constant(32, 0);
 			if (atom.kind == Kind::Pointer) return Of(Atomic(Kind::Word, 32, {atom.args[0] + 1u}), 32);
 			if (atom.kind == Kind::Load) {
-				return Load(Add(static_cast<uint32_t>(atom.args[0]), Constant(64, 4)), 4, atom.args[2] != 0);
+				return Load(Add(static_cast<uint32_t>(atom.args[0]), Constant(64, 4)), 4, NextCheckedAddress(static_cast<uint32_t>(atom.args[2])));
 			}
 			if (atom.kind == Kind::Join) return static_cast<uint32_t>(atom.args[1]);
 		}
@@ -186,7 +193,8 @@ public:
 			}
 			if (l.kind == Kind::Load && h.kind == Kind::Load && l.args[1] == 4 && h.args[1] == 4 &&
 			    h.args[0] == Add(static_cast<uint32_t>(l.args[0]), Constant(64, 4))) {
-				return Load(static_cast<uint32_t>(l.args[0]), 8, l.args[2] != 0 || h.args[2] != 0);
+				const auto checked = static_cast<uint32_t>(l.args[2]);
+				return Load(static_cast<uint32_t>(l.args[0]), 8, NextCheckedAddress(checked) == h.args[2] ? checked : One);
 			}
 			if (l.kind == Kind::Half && h.kind == Kind::Half && l.args[0] == h.args[0] && l.args[1] == 0 && h.args[1] == 1) {
 				return static_cast<uint32_t>(l.args[0]);
@@ -208,7 +216,7 @@ private:
 		if (atom.width == 32) return Of(id, 32);
 		switch (atom.kind) {
 			case Kind::Pointer: return Of(Atomic(Kind::Word, 32, {atom.args[0]}), 32);
-			case Kind::Load: return Load(static_cast<uint32_t>(atom.args[0]), 4, atom.args[2] != 0);
+			case Kind::Load: return Load(static_cast<uint32_t>(atom.args[0]), 4, static_cast<uint32_t>(atom.args[2]));
 			case Kind::Join: return static_cast<uint32_t>(atom.args[0]);
 			default: return Of(Atomic(Kind::Half, 32, {Of(id, 64), 0}), 32);
 		}
@@ -586,16 +594,21 @@ public:
 		return result;
 	}
 
-	Choices BufferAddress(const Inst& read) {
+	Choices ScalarBufferLoads(const Inst& read, uint32_t bytes) {
 		const auto& memory = m_program.memory_info[read.Flags<MemoryFlags>().index];
 		const auto* buffer = ProducerOf(read.Arg(0), ValueOpcode::GetBufferResource);
 		if (buffer == nullptr) return {};
+		const auto counts = Word(buffer->Arg(2));
 		Choices result;
 		for (const auto base: Pair(buffer->Arg(0), buffer->Arg(1))) {
 			const auto start = m_store.Op(64, {Base48, base});
 			for (const auto index: Word(read.Arg(1))) {
-				result.push_back(m_store.Add(m_store.Add(start, m_store.Widen(AlignDword(index))),
-				                             m_store.Constant(64, memory.offset & ~3u)));
+				const auto aligned = AlignDword(index);
+				const auto immediate = m_store.Constant(64, memory.offset & ~3u);
+				const auto offset = m_store.Add(m_store.Widen(aligned), immediate);
+				const auto exact_offset = m_store.Add(m_store.Op(64, {Zext, aligned}), immediate);
+				const auto checked = counts.size() == 1 ? m_store.Op(64, {ScalarBuffer, base, counts[0], exact_offset}) : One;
+				result.push_back(m_store.Load(m_store.Add(start, offset), bytes, checked));
 			}
 		}
 		Cap(result);
@@ -690,7 +703,7 @@ public:
 	Choices LoadedBufferWord(const Inst& load, uint32_t component) {
 		Choices result;
 		for (const auto address: LoadedBufferAddress(load)) {
-			result.push_back(m_store.Load(m_store.Add(address, m_store.Constant(64, component * 4u)), 4, true));
+			result.push_back(m_store.Load(m_store.Add(address, m_store.Constant(64, component * 4u)), 4, One));
 		}
 		return result;
 	}
@@ -1059,8 +1072,7 @@ private:
 				}
 				break;
 			case ValueOpcode::ReadConstBuffer:
-				for (const auto address: BufferAddress(*inst)) {
-					const auto wide = m_store.Load(address, 8, true);
+				for (const auto wide: ScalarBufferLoads(*inst, 8)) {
 					result.push_back({wide, m_store.Hi(wide), {}});
 				}
 				break;
@@ -1213,8 +1225,7 @@ private:
 				return result.empty() ? Choices {Opaque(inst, 32)} : result;
 			}
 			case ValueOpcode::ReadConstBuffer: {
-				Choices result;
-				for (const auto address: BufferAddress(inst)) result.push_back(m_store.Load(address, 4, true));
+				auto result = ScalarBufferLoads(inst, 4);
 				return result.empty() ? Choices {Opaque(inst, 32)} : result;
 			}
 			case ValueOpcode::LoadBufferU32: {
@@ -1308,8 +1319,8 @@ class HeaderProgramWriter {
 public:
 	explicit HeaderProgramWriter(const Store& store): m_store(store) {}
 
-	std::optional<std::vector<uint32_t>> Write(uint32_t form) {
-		if (!Form(form, 0) || !ValidHeaderProgram(m_program, 16)) return std::nullopt;
+	std::optional<std::vector<uint32_t>> Write(const IR::Atom& load) {
+		if (!Address(load, 0) || !ValidHeaderProgram(m_program, 16)) return std::nullopt;
 		return std::move(m_program);
 	}
 
@@ -1339,6 +1350,18 @@ private:
 		return true;
 	}
 
+	bool Address(const IR::Atom& load, uint32_t depth) {
+		const auto checked = static_cast<uint32_t>(load.args[2]);
+		if (checked == None) return Form(static_cast<uint32_t>(load.args[0]), depth);
+		if (checked == One) return false;
+		const auto& args = m_store.OpOf(checked, ScalarBuffer)->args;
+		for (size_t i = 1; i < args.size(); ++i) {
+			if (!Form(static_cast<uint32_t>(args[i]), depth)) return false;
+		}
+		Emit(HeaderOp::ScalarBuffer, {static_cast<uint32_t>(load.args[1])});
+		return true;
+	}
+
 	bool Operand(uint64_t arg, uint32_t depth) {
 		if ((arg & Literal) != 0) {
 			Constant(arg & ~Literal);
@@ -1357,8 +1380,7 @@ private:
 				Emit(HeaderOp::Join);
 				return true;
 			case Kind::Load:
-				if (a.args[2] != 0) return false;
-				if (!Form(static_cast<uint32_t>(a.args[0]), depth)) return false;
+				if (!Address(a, depth)) return false;
 				Emit(HeaderOp::Load, {static_cast<uint32_t>(a.args[1])});
 				return true;
 			case Kind::Half:
@@ -1468,8 +1490,8 @@ std::optional<Source> ProgramSourceOf(const Store& store, uint32_t form) {
 	const auto atom = store.AtomOf(form);
 	if (!atom) return std::nullopt;
 	const auto& a = store.A(*atom);
-	if (a.kind != Kind::Load || a.args[1] != 8 || a.args[2] != 0) return std::nullopt;
-	auto program = HeaderProgramWriter(store).Write(static_cast<uint32_t>(a.args[0]));
+	if (a.kind != Kind::Load || a.args[1] != 8) return std::nullopt;
+	auto program = HeaderProgramWriter(store).Write(a);
 	if (!program) return std::nullopt;
 	return Source {0, 0, RayQueryHeaderProgram, std::move(*program)};
 }
